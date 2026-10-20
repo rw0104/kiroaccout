@@ -17,11 +17,13 @@ extraResources:
 extraFiles:
   - from: ../LICENSE
     to: LICENSE.kiroaccout.txt
+  - from: ../THIRD_PARTY_NOTICES.md
+    to: THIRD_PARTY_NOTICES.md
 protocols:
   name: Kiro Auth
   schemes:
     - kiro
-copyright: Copyright 2026 Kiro
+copyright: Copyright 2026 kiroaccout contributors
 win:
   artifactName: ${name}-${version}-${arch}-windows.${ext}
   target:
@@ -31,7 +33,6 @@ win:
       arch: [x64]
   executableName: kiro-account-manager
   icon: resources/icon.ico
-  legalTrademarks: Copyright 2026 Kiro
   requestedExecutionLevel: asInvoker
 nsis:
   artifactName: ${name}-${version}-${arch}-setup.${ext}

@@ -20,7 +20,7 @@ Google/GitHub 两份样例能够通过现有 OIDC 批量入口的基本结构和
 | --- | --- |
 | 用户反馈版本 | 1.7.5，Builder ID 问题最严重，Google/GitHub 偶发 |
 | 用户版本源码标签 | `v1.7.5` → `56310443f73ea535836a51a7170e2e027d1df1ea` |
-| 本地仓库 | `D:\kiroaccout\Kiro-account-manager` |
+| 源码位置 | 当前 Git 检出目录；公开引用使用仓库相对路径 |
 | 拉取的 main | `8f11db50f64cc4faf3f9c0dff8eca543c01cdc15`，应用版本 1.7.6 |
 | 应用相对路径 | `Kiro-account-manager/`，不是仓库根目录 |
 | 分析环境 | Windows、Node.js 24.16.0，离线提取实际 TypeScript 函数执行 |
@@ -34,13 +34,13 @@ Google/GitHub 两份样例能够通过现有 OIDC 批量入口的基本结构和
 
 ## 3. 本地样例结构
 
-仅记录文件名、字段结构与数量，不记录账号邮箱、密码、Token 或其他身份值。
+仅记录匿名样例编号、字段结构与数量，不记录原始文件名、账号邮箱、密码、Token 或其他身份值。
 
 | 文件 | 数量与渠道 | 关键结构 | 现有文件入口 | 现有 OIDC 批量入口 |
 | --- | --- | --- | --- | --- |
-| `3个_PRO+.json` | 3 条 Github/social | 顶层数组；有 accessToken、refreshToken、provider、authMethod；无邮箱和 OIDC client 字段 | 账户管理拒绝；设置导入失败 | 基本识别正常，走 Social；不要求 OIDC client 是合理的 |
-| `kiro-accounts-2-2026-10-18.json` | 2 条 Google/social | 顶层数组；有邮箱、渠道、Token 及其他元数据；OIDC client 字段未构成有效三件套 | 账户管理拒绝；设置导入失败 | 基本识别正常，走 Social |
-| `黑咖-20261019-215245-pro-plus-4.json` | 4 条 Builder ID | 顶层数组；有邮箱、refreshToken、clientId、clientSecret；provider=`Builder ID`，无 authMethod | 账户管理拒绝；设置导入失败 | 能解析 4 条，但错误推导 social |
+| 样例 A（文件名已隐去） | 3 条 Github/social | 顶层数组；有 accessToken、refreshToken、provider、authMethod；无邮箱和 OIDC client 字段 | 账户管理拒绝；设置导入失败 | 基本识别正常，走 Social；不要求 OIDC client 是合理的 |
+| 样例 B（文件名已隐去） | 2 条 Google/social | 顶层数组；有邮箱、渠道、Token 及其他元数据；OIDC client 字段未构成有效三件套 | 账户管理拒绝；设置导入失败 | 基本识别正常，走 Social |
+| 样例 C（文件名已隐去） | 4 条 Builder ID | 顶层数组；有邮箱、refreshToken、clientId、clientSecret；provider=`Builder ID`，无 authMethod | 账户管理拒绝；设置导入失败 | 能解析 4 条，但错误推导 social |
 
 三份均无 BOM、无 `credentials` 嵌套。因此 BOM、包装解包和嵌套凭证问题是额外兼容性发现，不是这三份原始样例的共同原因。
 
@@ -65,8 +65,8 @@ node --disable-warning=ExperimentalWarning docs/2026-10-19-account-import-login/
 本机只读样例检查（仅输出结构/计数）：
 
 ```powershell
-node --disable-warning=ExperimentalWarning docs/2026-10-19-account-import-login/evidence/json-import-repro.mjs --source-ref v1.7.5 --samples D:/kiroaccout
-node --disable-warning=ExperimentalWarning docs/2026-10-19-account-import-login/evidence/oidc-batch-repro.mjs --samples
+node --disable-warning=ExperimentalWarning docs/2026-10-19-account-import-login/evidence/json-import-repro.mjs --source-ref v1.7.5 --samples .local/samples
+node --disable-warning=ExperimentalWarning docs/2026-10-19-account-import-login/evidence/oidc-batch-repro.mjs --ref v1.7.5 --samples .local/samples
 ```
 
 | 证据 | 来源 | 结果 | 证据边界 |

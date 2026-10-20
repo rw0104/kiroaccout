@@ -1,6 +1,6 @@
 # 开发与发布指南
 
-本文面向接续维护 `rw0104/kiroaccout` 的开发者，覆盖依赖安装、离线回归、导入和登录模块、Windows 安装包构建及 GitHub 预发布。仓库保留上游历史，许可证为 [AGPL-3.0](../LICENSE)。
+本文面向接续维护 `rw0104/kiroaccout` 的开发者，覆盖依赖安装、离线回归、导入和登录模块、Windows 安装包构建及 GitHub 发布。仓库保留上游历史，许可证为 [AGPL-3.0](../LICENSE)。
 
 **先读 [项目规则](../AGENTS.md) 和 [隔离执行规范](development-rules.md)。当前没有经过验证的运行时隔离模式；在用户正在运行 1.7.5 的 Windows 会话中，默认只做源码分析、离线测试、类型检查和构建。不要直接执行 `npm run dev`、`npm start`、`npm run test:e2e` 或运行打包客户端。**
 
@@ -52,11 +52,12 @@ npm run build
 | `npm run build` | 类型检查及 electron-vite 编译 | `out/`，不创建安装包、不启动应用 |
 | `npm run package:win` | Windows x64 NSIS 安装包和 ZIP | 只打包已有 `out/`，先执行 `build`；输出 `dist/`，显式 `--publish never`，不上传、不安装 |
 | `npm run verify:package` | 静态核验打包内容、版本、更新仓库、原生库和 x64 架构 | 仅检查文件，生成 `dist/package-verification.json`，不执行应用 |
-| `npm run release:checksums` | 为当前版本的精确 EXE 和 ZIP 生成 SHA256 | 写入 `dist/SHA256SUMS.txt`；附加 `-- --verify` 可复核已有清单 |
+| `npm run release:checksums` | 为当前版本的精确发布附件生成 SHA256，正式版包含更新元数据 | 写入 `dist/SHA256SUMS.txt`；附加 `-- --verify` 可复核已有清单 |
+| `npm run release:stage` | 汇集当前版本与渠道所需附件 | 写入 `dist/release-assets/<version>/`，拒绝混入其他文件 |
 | `npm run dev` / `npm start` | 启动 Electron | 当前会话默认禁止，必须先满足完整隔离条件 |
 | `npm run test:e2e` | 连接桌面代理的端到端测试 | 不属于离线回归，默认禁止连接运行中的生产代理 |
 
-[前一阶段实施记录](2026-10-19-account-import-login/05-implementation-status.md) 保留了当时 **85/85 项离线检查、类型检查和源码构建通过** 的结果。本轮发布准备新增 5 项版本比较回归，当前测试集为 **90 项**，覆盖 RC/稳定版本排序；发布检查以当前命令实际结果为准，不将历史数量当作每次检出的保证。Windows 安装包结果及校验值以对应 Release 的构建日志和附件为准。
+[前一阶段实施记录](2026-10-19-account-import-login/05-implementation-status.md) 保留了当时 **85/85 项离线检查、类型检查和源码构建通过** 的结果。2026-10-20 的 `1.7.6` 发布验证为 **105/105 项离线回归通过**，新增覆盖版本比较、更新状态、保存确认、异步安装器启动失败及更新清单校验。类型检查和源码构建也已通过；Windows 安装包结果及校验值以对应 Release 的构建日志和附件为准。
 
 ## 2. 定位导入问题
 
@@ -126,6 +127,9 @@ npm run build
 | `loginSessions.test.ts` | 注入 `fetch`、`openBrowser`、`notifySocial`、`now`、计时器；用 deferred Promise 控制迟到结果 |
 | `loginDialog.test.mjs` | 在 VM 中执行真实对话框处理函数，mock hooks、IPC 和 store，不启动窗口 |
 | `version.test.ts` | 覆盖预发布标记与稳定版的排序，避免将 RC 错当作稳定更新 |
+| `appUpdater.test.ts` | mock 更新引擎，检查稳定渠道、单次下载、保存确认、失败与重试、状态快照顺序 |
+| `updaterInstallAdapter.test.mjs` | 使用依赖实际退出逻辑，离线复现异步 NSIS 启动失败，验证阻止退出及恢复入口 |
+| `updateManifest.test.mjs` | 绑定更新清单的版本、文件名、大小与摘要，并区分 RC 和正式版附件 |
 
 登录 mock 的最小示例（放到应用根的 `test/unit/` 下）：
 
@@ -157,7 +161,7 @@ test('注册失败返回固定错误，不回显响应内容', async () => {
 
 ## 5. 保护正在运行的 1.7.5
 
-生产安装 `D:\kiro-account-manager`、`%APPDATA%\kiro-account-manager`、真实 `.aws/sso/cache`、CLI/IDE 数据及系统 `kiro://` 协议都属于保护边界。不同源码目录、窗口标题或单个 `--user-data-dir` 不能阻止共享缓存和协议写入。
+用户现有的生产安装目录、`%APPDATA%\kiro-account-manager`、真实 `.aws/sso/cache`、CLI/IDE 数据及系统 `kiro://` 协议都属于保护边界。不同源码目录、窗口标题或单个 `--user-data-dir` 不能阻止共享缓存和协议写入。
 
 当前允许的方式是“独立源码 + 不启动 Electron + 注入 mock”。运行桌面测试前必须满足 [完整隔离门槛](development-rules.md#2-启动-electron-前的必要条件)：在初始化/实例锁前隔离数据、凭证、日志、备份、缓存、更新及端口；禁用生产 watcher/同步、自动刷新、协议注册、系统代理/证书/机器标识写入；主进程 IPC 同样校验边界。
 
@@ -165,12 +169,12 @@ test('注册失败返回固定错误，不回显响应内容', async () => {
 
 **安装包只构建和分发，不在当前用户环境运行安装器或 `win-unpacked` 程序。** NSIS 中 `runAfterFinish: false` 只限制安装结束时启动，不构成安装和运行隔离。ZIP 解压后的程序仍会触及同样的账户数据、认证缓存和系统资源；ZIP 也不是隔离模式。
 
-## 6. 构建 Windows 预发布
+## 6. 构建 Windows 版本并发布
 
-本轮发布目标为 **`v1.7.6-rc.1` / Windows x64 预发布**，用于隔离环境验收。源码与离线验证完成不代表真实授权验收完成；在完成三个渠道、导入/保存/取消及协议归属验收前，不将 RC 当作稳定版结论。
+当前交付目标为 Windows x64 正式版本 `1.7.6`。正式版按稳定更新渠道分发；RC 是预发布渠道，两者的公开附件和 latest 标记不同。发布类别不能代替实际验收记录，不能把未执行的真实账号授权或隔离多开测试写成通过。
 
-1. 将源码、文档、版本与 lockfile 提交并审查；版本由应用 `package.json` 和 `package-lock.json` 同步声明。仓库根 `docs/releases/v1.7.6-rc.1.md` 保存该版本发布说明，不能缺失。
-2. 在 Windows x64 应用根执行检查与打包：
+1. 先检查代码、文档和版本。应用 `package.json` 与 `package-lock.json` 中的版本必须同步；仓库根 `docs/releases/v${version}.md` 必须有对应发布说明。
+2. 在 Windows x64 应用根执行：
 
 ```powershell
 npm ci
@@ -180,32 +184,38 @@ npm run package:win
 npm run verify:package
 npm run release:checksums
 npm run release:checksums -- --verify
+npm run release:stage
 ```
 
-`npm run build` 已包含类型检查。`package:win` **不重新编译源码**，其脚本为 `electron-builder --win nsis zip --x64 --publish never`；修改源码后必须重新执行 `build` 再打包，避免把旧 `out/` 当成新版本发布。本地打包与 GitHub 上传是分开的；不要在含上游发布配置的旧脚本上省略发布策略。构建可能下载 Electron、NSIS 及辅助工具，下载失败要记录失败阶段，不能把 `out/` 编译成功写成安装包已完成。
+`build` 包含 TypeScript 检查。`package:win` 不重新编译源码；修改源码后必须先运行 `build`，再由 electron-builder 生成 NSIS 安装器与 ZIP，并显式使用 `--publish never`。打包可能下载 Electron、NSIS 和辅助工具，不启动生成的应用或安装器。
 
-3. `verify:package` 静态检查 `app.asar` 顶层白名单、必需入口与依赖、版本、TLS DLL、随包 AGPL 许可证、更新仓库以及 Windows x64 PE 架构，不启动应用。报告只证明静态打包检查，不代替安装、启动和授权验收。`release:checksums` 根据当前 `package.json` 的版本生成精确两份产物的摘要，不通过目录通配符收集其他旧版本文件。RC 的公开附件仅为：
+`verify:package` 检查 ASAR 文件范围、必需入口与原生依赖、版本、TLS DLL、随包许可证、更新仓库和 Windows x64 架构。`release:checksums` 根据当前版本生成精确发布附件的摘要，拒绝缺失或旧版本产物。静态检查与摘要通过不等于安装、启动或真实授权验收通过。
 
-- `kiro-account-manager-1.7.6-rc.1-x64-setup.exe`
-- `kiro-account-manager-1.7.6-rc.1-x64-windows.zip`
-- `SHA256SUMS.txt`
+| 发布类别 | 公开附件 | GitHub 标记与更新渠道 |
+| --- | --- | --- |
+| 正式版，例如 `1.7.6` | `kiro-account-manager-1.7.6-x64-setup.exe`、`kiro-account-manager-1.7.6-x64-windows.zip`、安装器同名 `.blockmap`、`latest.yml`、`SHA256SUMS.txt` | 非 prerelease；设为 latest；允许本仓库稳定客户端发现更新 |
+| RC，例如 `1.7.6-rc.1` | 对应版本的 EXE、ZIP、`SHA256SUMS.txt` | prerelease；不设 latest；不上传 `latest.yml` 或稳定更新元数据 |
 
-仅打包 Windows x64 不表示生成了 macOS、Linux 或 ARM64 版本。不要上传 `win-unpacked/`、blockmap、`latest.yml`、`rc.yml` 或本地验证报告；ZIP 仅提供解压分发，同样需要独立环境运行。
+ZIP 仅提供解压分发，不是隔离模式。仅构建 Windows x64 不能宣称生成或验收了其他平台。不要把 `win-unpacked/`、本地验证报告或调试文件上传为 Release 附件。
 
-4. 发布前执行 `node scripts/release-version.mjs`，检查应用版本与 lockfile 的两处版本一致、版本格式有效、对应发布说明存在；由 tag 触发时还检查 tag 与 `v${version}` 一致。该脚本只验证元数据，不创建 tag。
-5. 使用 [.github/workflows/build.yml](../.github/workflows/build.yml) 发布。支持推送 `v*` 标签或在 GitHub Actions 手动运行；从欲发布的提交触发，先核对版本及目标提交。构建任务使用 Windows、Node 24.16.0，依次校验版本、`npm ci`、`test:unit`、`build`、`package:win`、`verify:package`、`release:checksums`，再上传精确三份附件。
-6. 发布任务下载附件后再次校验 SHA256，通过 GitHub CLI 在 `rw0104/kiroaccout` 为同一提交创建 **draft** 并上传完整附件，随后才公开。含 `-rc.1` 的版本标记 **prerelease**，设置 `--latest=false`；Release 已存在时中止，避免覆盖既有附件。失败时检查工作流日志与 draft 状态，不能将附件缺失的草稿作为成功交付。
+3. 运行 `node scripts/release-version.mjs`，检查包与 lockfile 的版本、版本格式和发布说明；由 tag 触发时还检查 tag 与 `v${version}` 一致。已有 tag 不得悄悄指向另一提交。
+4. 使用 [.github/workflows/build.yml](../.github/workflows/build.yml)。工作流支持推送 `v*` 标签或在欲发布的提交上手动运行，依次执行依赖安装、离线回归、类型检查、构建、打包、包内容检查和摘要生成。
+5. 发布任务下载构建附件并复核摘要后，在 `rw0104/kiroaccout` 先创建 draft、上传完整附件，再按版本类别公开。发布后核对 tag、目标提交、附件名、大小和摘要；缺附件或构建失败不能作为成功交付。
 
-Release 正文说明 JSON/认证修复范围、执行的检查、未执行的真实桌面验收，以及仅在隔离环境安装验证的边界；上传后复核附件名和摘要。RC 不发布稳定或 RC 自动更新元数据，不给运行中 1.7.5 安排升级。稳定渠道的更新归属必须经单独核验；打包配置里的 publish owner/repo 和应用自身更新查询逻辑均需检查，不能仅修改 Git remote。
+`latest.yml` 中的安装器文件名、URL、大小与 SHA-512 必须与实际 EXE 匹配，blockmap 必须来自同一份安装器。新增正式版本的 EXE、blockmap 和元数据需要一起发布；只上传 EXE 不足以提供软件内自动更新。`SHA256SUMS.txt` 用于用户下载核对，不能代替更新器所需的元数据。
 
-验证下载的文件时，在下载目录执行：
+更新逻辑由 `src/main/appUpdater.ts` 管理，`src/main/index.ts` 负责更新引擎和 IPC 适配，`src/renderer/src/lib/updateClient.ts` 按 revision 接收快照，`UpdateDialog.tsx` 提供用户确认。默认启动及每六小时检查，下载和安装均需用户操作。安装前以随机 requestId 和渲染进程身份确认保存成功；异步安装器启动失败时阻止排定的退出，并要求重启应用后重试或手动安装，避免依赖内部安装闩锁导致界面假重试。
+
+下载后在下载目录使用 PowerShell 检查：
 
 ```powershell
-Get-FileHash -LiteralPath ./kiro-account-manager-1.7.6-rc.1-x64-setup.exe -Algorithm SHA256
-Get-FileHash -LiteralPath ./kiro-account-manager-1.7.6-rc.1-x64-windows.zip -Algorithm SHA256
+Get-FileHash -LiteralPath ./kiro-account-manager-1.7.6-x64-setup.exe -Algorithm SHA256
+Get-FileHash -LiteralPath ./kiro-account-manager-1.7.6-x64-windows.zip -Algorithm SHA256
 ```
 
-将结果与该 Release 的 `SHA256SUMS.txt` 比较。构建成功、SHA256 一致、Windows 签名、安装启动和真实授权是不同检查；没有执行的项目标注未验收。未配置签名证书的构建不能宣称已完成 Windows 代码签名。
+将摘要与该 Release 的清单比较。没有配置签名证书的包不能宣称已签名；构建、校验、安装启动和真实授权是分别记录的检查。
+
+旧上游 1.7.5 仍可能查询它原来的更新仓库，不会因为本仓库发布了版本而自动切换来源。首次迁移前先备份；开发和验收不得在现有生产账户或安装上执行更新。后续通过本仓库客户端提示下载，并由用户确认重启安装。
 
 ## 7. 常见问题
 

@@ -3,7 +3,7 @@
  * Run from any directory with Node.js 22.13+ (node:module.stripTypeScriptTypes):
  *   node --disable-warning=ExperimentalWarning docs/2026-10-19-account-import-login/evidence/json-import-repro.mjs
  * Optional local samples (read only, output contains structures/counts only):
- *   node --disable-warning=ExperimentalWarning docs/2026-10-19-account-import-login/evidence/json-import-repro.mjs --samples D:/kiroaccout
+ *   node --disable-warning=ExperimentalWarning docs/2026-10-19-account-import-login/evidence/json-import-repro.mjs --samples ./samples
  * Audit the same source functions at a Git tag/commit without checkout:
  *   node --disable-warning=ExperimentalWarning docs/2026-10-19-account-import-login/evidence/json-import-repro.mjs --source-ref v1.7.5
  *
@@ -282,8 +282,7 @@ if (sampleOption >= 0) {
     const manager = await harness().run('manager', raw)
     const settings = await harness().run('settings', raw)
     localSamples.push({
-      sample: index + 1,
-      filename: name,
+      sample: `sample-${localSamples.length + 1}.json`,
       validJson: true,
       bom: raw.startsWith('\ufeff'),
       root: Array.isArray(data) ? 'array' : data === null ? 'null' : typeof data,

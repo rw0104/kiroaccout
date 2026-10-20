@@ -1,16 +1,18 @@
 # kiroaccout
 
-[English](README.md) · [项目仓库](https://github.com/rw0104/kiroaccout)
+Kiro 账户管理桌面应用，用于管理账户、分组和标签，导入账户 JSON，并查看账户状态。
 
-基于 Electron 的 Kiro 账户管理桌面应用，源自 [chaogei](https://github.com/chaogei) 的 [Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager)，遵循 [AGPL-3.0](LICENSE) 许可证。
+[下载 Windows 版本](https://github.com/rw0104/kiroaccout/releases) · [源码与问题反馈](https://github.com/rw0104/kiroaccout) · [开发文档](docs/DEVELOPMENT.md)
 
-JSON/OIDC 导入与登录本地会话修复已合并。[下载 Windows x64 v1.7.6-rc.1 预发布](https://github.com/rw0104/kiroaccout/releases/tag/v1.7.6-rc.1)，包含安装器、ZIP 和 SHA-256 校验清单。真实桌面认证仍需在隔离环境验收。
+[项目首页](README.md)
 
-- [需求文档](docs/2026-10-19-account-import-login/01-requirements.md)
-- [问题分析](docs/2026-10-19-account-import-login/02-analysis.md)
-- [修复方案](docs/2026-10-19-account-import-login/03-remediation-plan.md)
-- [项目规则](AGENTS.md)与[开发隔离规范](docs/development-rules.md)
-- [开发与 Windows 发布指南](docs/DEVELOPMENT.md)
-- [应用源码](Kiro-account-manager/)
+## 使用
 
-开发和测试必须隔离正在运行的 1.7.5、生产账户数据及共享认证缓存。启动开发客户端前，须满足隔离规范。
+- 导入文件：打开“账户管理”，选择导入。
+- 粘贴凭证：打开“添加账户 → OIDC 凭证 → 批量”。
+- 导出备份：打开“设置 → 数据管理 → 导出”，选择 JSON。导出文件可能包含凭证，请妥善保存。
+- 检查更新：打开“关于 → 检查更新”，按提示下载并确认安装。
+
+安装或升级前请先备份原有资料。现有版本尚不提供 Kiro 客户端隔离多开；不要把 ZIP 解压运行等同于数据隔离。
+
+本项目遵循 [AGPL-3.0](LICENSE)。开源来源与适用声明见 [NOTICE](docs/NOTICE.md)，后续功能范围见[需求文档](docs/requirements/2026-10-20-product-update.md)。

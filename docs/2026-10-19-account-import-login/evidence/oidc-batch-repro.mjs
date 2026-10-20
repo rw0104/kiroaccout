@@ -4,16 +4,16 @@
  * Run from any directory with Node >= 22.13:
  *   node docs/2026-10-19-account-import-login/evidence/oidc-batch-repro.mjs
  *   node docs/2026-10-19-account-import-login/evidence/oidc-batch-repro.mjs --ref v1.7.5
- *   node docs/2026-10-19-account-import-login/evidence/oidc-batch-repro.mjs --samples
+ *   node docs/2026-10-19-account-import-login/evidence/oidc-batch-repro.mjs --samples ./samples
  *
- * The default uses invented tokens only. --samples reads exactly the three
- * provided JSON files, prints structure/counts only, and never executes their
+ * The default uses invented tokens only. --samples <directory> reads JSON files
+ * from that explicit directory, prints anonymized structure/counts only, and never executes their
  * credentials. No Electron, browser, fetch, or account-service call is used.
  * Success returned by verifyAccountCredentials is an OFFLINE STUB acceptance;
  * it does not establish that any token is valid or any real login can succeed.
  */
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { readFileSync, readdirSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { execFileSync } from 'node:child_process'
@@ -230,13 +230,13 @@ const output = {
 if (args.includes('--samples')) {
   const allowedKeys = new Set(['accounts', 'data', 'items', 'version', 'exportedAt', 'email', 'id', 'userId', 'password', 'credentials', 'refreshToken', 'clientId', 'clientSecret', 'accessToken', 'authMethod', 'provider', 'region', 'expiresAt', 'profileArn', 'clientIdHash', 'groupId', 'machineId', 'startUrl', 'status'])
   const shapeKeys = (item) => Object.keys(item ?? {}).filter((key) => allowedKeys.has(key)).sort()
-  output.sampleStructureCounts = [
-    '3个_PRO+.json', 'kiro-accounts-2-2026-10-18.json', '黑咖-20261019-215245-pro-plus-4.json',
-  ].map((filename) => {
-    const parsed = JSON.parse(readFileSync(resolve(repoRoot, '..', filename), 'utf8').replace(/^\uFEFF/, ''))
+  const sampleDirectory = args[args.indexOf('--samples') + 1]
+  assert.ok(sampleDirectory && !sampleDirectory.startsWith('--'), '--samples requires an explicit directory')
+  output.sampleStructureCounts = readdirSync(sampleDirectory).filter(filename => filename.toLowerCase().endsWith('.json')).sort().map((filename, index) => {
+    const parsed = JSON.parse(readFileSync(resolve(sampleDirectory, filename), 'utf8').replace(/^\uFEFF/, ''))
     const rows = Array.isArray(parsed) ? parsed : [parsed]
     return {
-      filename, rootKind: Array.isArray(parsed) ? 'array' : typeof parsed, rowCount: rows.length,
+      sample: `sample-${index + 1}.json`, rootKind: Array.isArray(parsed) ? 'array' : typeof parsed, rowCount: rows.length,
       rowFieldShapes: [...new Set(rows.map((row) => JSON.stringify(shapeKeys(row))))].map((shape) => JSON.parse(shape)),
       nonemptyRefreshTokenStrings: rows.filter((row) => typeof row?.refreshToken === 'string' && row.refreshToken.trim()).length,
       nestedCredentialsCount: rows.filter((row) => row?.credentials && typeof row.credentials === 'object').length,
