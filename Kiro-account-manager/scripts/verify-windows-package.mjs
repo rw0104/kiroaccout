@@ -19,6 +19,8 @@ assert.ok(entries.every(entry => allowedRoots.has(entry.split('/')[0])), 'Unexpe
 assert.ok(!entries.some(entry => /(^|\/)(\.env(?:\.[^/]*)?|\.kiro|\.local|\.git|kiro-accounts[^/]*\.json)$/.test(entry)), 'Local state must not be packaged')
 for (const entry of ['out/main/index.js', 'out/preload/index.js', 'out/renderer/index.html',
   'node_modules/electron-store/package.json', 'node_modules/undici/package.json',
+  'node_modules/@cbor-extract/cbor-extract-win32-x64/node.napi.node',
+  'node_modules/koffi/build/koffi/win32_x64/koffi.node',
   'node_modules/tlsclientwrapper/package.json', 'node_modules/koffi/package.json']) {
   assert.ok(entries.includes(entry), `Required application entry missing: ${entry}`)
 }
