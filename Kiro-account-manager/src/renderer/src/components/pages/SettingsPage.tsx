@@ -1,3 +1,5 @@
+import { parseAccountImportText } from '../../../../shared/accountImport'
+import { formatImportOutcome } from '../../utils/accountImport'
 import { useAccountsStore } from '@/store/accounts'
 import { Card, CardContent, CardHeader, CardTitle, Button } from '../ui'
 import { Eye, EyeOff, RefreshCw, Clock, Trash2, Download, Upload, Globe, Repeat, Palette, Moon, Sun, Fingerprint, Info, ChevronDown, ChevronUp, Settings, Database, Layers, UserX, Monitor } from 'lucide-react'
@@ -193,7 +195,7 @@ export function SettingsPage() {
     language,
     setLanguage,
     accounts,
-    importFromExportData
+    importAccountPlan
   } = useAccountsStore()
 
   const { t } = useTranslation()
@@ -375,14 +377,15 @@ export function SettingsPage() {
     try {
       const fileData = await window.api.importFromFile()
       if (fileData && fileData.format === 'json') {
-        const data = JSON.parse(fileData.content)
-        const importResult = importFromExportData(data)
-        alert(`导入完成：成功 ${importResult.success} 个，失败 ${importResult.failed} 个`)
+        const plan = parseAccountImportText(fileData.content)
+        if (!plan.ok) { alert(plan.error?.message || '无法识别账户格式'); return }
+        const importResult = await importAccountPlan(plan)
+        alert(formatImportOutcome(importResult))
       } else if (fileData) {
         alert('设置页面仅支持 JSON 格式导入，请使用账号管理页面导入 CSV/TXT')
       }
     } catch (e) {
-      alert(`导入失败: ${e instanceof Error ? e.message : '未知错误'}`)
+      alert('导入失败，请检查文件或网络状态')
     } finally {
       setIsImporting(false)
     }

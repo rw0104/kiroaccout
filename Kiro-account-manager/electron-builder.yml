@@ -3,12 +3,9 @@ productName: Kiro Account Manager
 directories:
   buildResources: build
 files:
-  - '!**/.vscode/*'
-  - '!src/*'
-  - '!electron.vite.config.{js,ts,mjs,cjs}'
-  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,dev-app-update.yml,CHANGELOG.md,README.md}'
-  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml}'
-  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  - out/**/*
+  - resources/**/*
+  - package.json
 asarUnpack:
   - resources/**
   - node_modules/koffi/**
@@ -17,12 +14,21 @@ asarUnpack:
 extraResources:
   - from: "resources/tls-client-xgo-1.14.0-windows-amd64.dll"
     to: "tls-client-xgo-1.14.0-windows-amd64.dll"
+extraFiles:
+  - from: ../LICENSE
+    to: LICENSE.kiroaccout.txt
 protocols:
   name: Kiro Auth
   schemes:
     - kiro
 copyright: Copyright 2026 Kiro
 win:
+  artifactName: ${name}-${version}-${arch}-windows.${ext}
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: zip
+      arch: [x64]
   executableName: kiro-account-manager
   icon: resources/icon.ico
   legalTrademarks: Copyright 2026 Kiro
@@ -84,5 +90,5 @@ snap:
 npmRebuild: false
 publish:
   provider: github
-  owner: chaogei
-  repo: Kiro-account-manager
+  owner: rw0104
+  repo: kiroaccout

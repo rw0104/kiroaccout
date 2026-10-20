@@ -12,8 +12,7 @@ import type {
   AccountImportItem,
   BatchOperationResult,
   AccountSubscription,
-  SubscriptionType,
-  IdpType
+  SubscriptionType
 } from '../types/account'
 import type {
   ProxyEntry,
@@ -23,6 +22,9 @@ import type {
 } from '../types/proxy'
 import { DEFAULT_PROXY_POOL_CONFIG } from '../types/proxy'
 import { useWebhookStore, type WebhookEvent, type WebhookMessage } from './webhooks'
+import { emptyOutcome, findExistingDuplicate, normalizeCredentialRecord, planFromJsonValue, type ImportPlan, type ImportOutcome } from '../../../shared/accountImport'
+import { planBackupRestore } from '../../../shared/backupRestore'
+import { executeCredentialImport } from '../utils/accountImport'
 
 // ============================================
 // 账号管理 Store
@@ -54,6 +56,15 @@ const SAVE_MAX_WAIT_MS = 5000
 let saveDebounceTimer: ReturnType<typeof setTimeout> | null = null
 let saveMaxWaitTimer: ReturnType<typeof setTimeout> | null = null
 let saveInFlight: Promise<void> | null = null
+let lastSaveError: Error | null = null
+// Session-only aliases prevent reusing a refresh token already rotated by an import.
+const consumedImportTokens = new Map<string, string>()
+let accountImportQueue: Promise<void> = Promise.resolve()
+function enqueueAccountImport<T>(work: () => Promise<T>): Promise<T> {
+  const result = accountImportQueue.then(work, work)
+  accountImportQueue = result.then(() => undefined, () => undefined)
+  return result
+}
 /** 等待本轮防抖窗口落盘的所有调用方 resolver；批量唤醒，避免风暴时 Promise 永久挂起 */
 let savePendingResolvers: Array<() => void> = []
 
@@ -382,6 +393,7 @@ interface AccountsActions {
   exportAccounts: (ids?: string[]) => AccountExportData
   importAccounts: (items: AccountImportItem[]) => BatchOperationResult
   importFromExportData: (data: AccountExportData) => BatchOperationResult
+  importAccountPlan: (plan: ImportPlan, groupId?: string, signal?: AbortSignal) => Promise<ImportOutcome>
 
   // 状态管理
   updateAccountStatus: (id: string, status: AccountStatus, error?: string) => void
@@ -399,6 +411,8 @@ interface AccountsActions {
   saveToStorage: () => Promise<void>
   /** 立即持久化（用于 beforeunload 或关键操作场景） */
   flushSaveImmediately: () => Promise<void>
+  /** Critical account operations require an explicit persistence acknowledgment. */
+  saveAccountChanges: () => Promise<void>
 
   // 设置
   setAutoRefresh: (enabled: boolean, interval?: number) => void
@@ -1136,161 +1150,107 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
   importAccounts: (items) => {
     const result: BatchOperationResult = { success: 0, failed: 0, errors: [] }
-
-    // 验证 idp 是否有效
-    const validIdps = ['Google', 'Github', 'BuilderId'] as const
-    const normalizeIdp = (idp?: string): IdpType => {
-      if (!idp) return 'Google'
-      const normalized = validIdps.find(v => v.toLowerCase() === idp.toLowerCase())
-      return normalized || 'Google'
-    }
-
-    // 批量构造账号对象 + 一次 set，避免 N 次 new Map(O(n²)) 与 N 次 re-render
-    const newAccounts: Account[] = []
-    for (const item of items) {
-      try {
-        const now = Date.now()
-        const id = uuidv4()
-        const machineId = generateRandomMachineId()
-
-        const account: Account = {
-          id,
-          createdAt: now,
-          isActive: false,
-          machineId,
-          email: item.email,
-          password: item.password,
-          nickname: item.nickname,
-          idp: normalizeIdp(item.idp as string),
-          credentials: {
-            accessToken: item.accessToken || '',
-            csrfToken: item.csrfToken || '',
-            refreshToken: item.refreshToken,
-            clientId: item.clientId,
-            clientSecret: item.clientSecret,
-            region: item.region || 'us-east-1',
-            expiresAt: now + 3600 * 1000
-          },
-          subscription: {
-            type: 'Free'
-          },
-          usage: {
-            current: 0,
-            limit: 25,
-            percentUsed: 0,
-            lastUpdated: now
-          },
-          groupId: item.groupId,
-          tags: item.tags ?? [],
-          status: 'unknown',
-          lastUsedAt: now
-        }
-        newAccounts.push(account)
-        result.success++
-      } catch (error) {
+    for (const [index, item] of items.entries()) {
+      const normalized = normalizeCredentialRecord(item)
+      if (!normalized.credential || !item.email?.trim()) {
         result.failed++
-        result.errors.push({
-          id: item.email,
-          error: error instanceof Error ? error.message : 'Unknown error'
-        })
+        result.errors.push({ id: `#${index + 1}`, error: '账户字段不完整或身份无法识别' })
+        continue
       }
-    }
-
-    if (newAccounts.length > 0) {
-      set((state) => {
-        // 仅一次完整 Map 复制
-        const accounts = new Map(state.accounts)
-        for (const account of newAccounts) {
-          accounts.set(account.id, account)
-        }
-        return { accounts }
+      const credential = normalized.credential
+      if (findExistingDuplicate(get().accounts.values(), credential)) {
+        result.errors.push({ id: 'skipped', error: `#${index + 1}: 已存在，跳过` })
+        continue
+      }
+      const now = Date.now()
+      get().addAccount({
+        email: item.email.trim(), password: credential.password, nickname: credential.nickname,
+        userId: credential.userId, idp: credential.provider, groupId: item.groupId,
+        credentials: { ...credential, accessToken: credential.accessToken || '', csrfToken: '', expiresAt: credential.expiresAt || now },
+        subscription: { type: 'Free' },
+        usage: { current: 0, limit: 0, percentUsed: 0, lastUpdated: now },
+        tags: item.tags || [], status: 'unknown', lastUsedAt: now
       })
-      // 防抖触发一次持久化
-      get().saveToStorage()
+      result.success++
     }
-
     return result
   },
 
   importFromExportData: (data) => {
-    const result: BatchOperationResult = { success: 0, failed: 0, errors: [] }
-    const { accounts: existingAccounts } = get()
-    
-    // 检查账户是否已存在（同邮箱+同provider 或 同userId 才算重复）
-    const isAccountExists = (email: string, userId?: string, provider?: string): boolean => {
-      return Array.from(existingAccounts.values()).some(acc => {
-        // userId 相同则重复
-        if (userId && acc.userId === userId) return true
-        // email 相同且 provider 相同则重复（允许同邮箱不同登录方式）
-        if (acc.email === email && acc.credentials.provider === provider) return true
-        return false
-      })
+    const plan = planFromJsonValue(data)
+    if (!plan.ok || !plan.backup) {
+      return { success: 0, failed: 1, errors: [{ id: '$', error: '不是完整账户备份，请使用统一账户导入入口' }] }
     }
-    
-    // 去重：文件内部去重
-    const seenEmails = new Set<string>()
-    const seenUserIds = new Set<string>()
-    const uniqueAccounts = data.accounts.filter(acc => {
-      if (seenEmails.has(acc.email) || (acc.userId && seenUserIds.has(acc.userId))) {
-        return false
-      }
-      seenEmails.add(acc.email)
-      if (acc.userId) seenUserIds.add(acc.userId)
-      return true
+    const restored = planBackupRestore(plan.backup, {
+      existingAccounts: get().accounts.values(), existingGroups: get().groups, existingTags: get().tags,
+      generateId: uuidv4, generateMachineId: generateRandomMachineId, now: Date.now()
     })
-
-    // 收集所有变更，一次性 set，避免 N 次 new Map（O(n²)）
-    let skipped = 0
-    const accountsToAdd: Account[] = []
-
-    for (const accountData of uniqueAccounts) {
-      // 检查本地是否已存在（传入 provider 参数）
-      if (isAccountExists(accountData.email, accountData.userId, accountData.credentials?.provider)) {
-        skipped++
-        continue
-      }
-      try {
-        accountsToAdd.push({ ...accountData, isActive: false })
-        result.success++
-      } catch (error) {
-        result.failed++
-        result.errors.push({
-          id: accountData.id,
-          error: error instanceof Error ? error.message : 'Unknown error'
-        })
-      }
-    }
-
-    // 一次 set 应用所有分组、标签、账号 — 单次 re-render
-    if (data.groups.length > 0 || data.tags.length > 0 || accountsToAdd.length > 0) {
-      set((state) => {
-        const groups = data.groups.length > 0 ? new Map(state.groups) : state.groups
-        if (data.groups.length > 0) {
-          for (const group of data.groups) groups.set(group.id, group)
-        }
-        const tags = data.tags.length > 0 ? new Map(state.tags) : state.tags
-        if (data.tags.length > 0) {
-          for (const tag of data.tags) tags.set(tag.id, tag)
-        }
-        const accounts = accountsToAdd.length > 0 ? new Map(state.accounts) : state.accounts
-        if (accountsToAdd.length > 0) {
-          for (const acc of accountsToAdd) accounts.set(acc.id, acc)
-        }
-        return { groups, tags, accounts }
-      })
-    }
-
-    // 记录跳过数量
-    if (skipped > 0) {
-      result.errors.push({
-        id: 'skipped',
-        error: `跳过 ${skipped} 个已存在的账号`
-      })
-    }
-
+    set((state) => {
+      const accounts = new Map(state.accounts)
+      const groups = new Map(state.groups)
+      const tags = new Map(state.tags)
+      for (const account of restored.accounts) accounts.set(account.id, account as unknown as Account)
+      for (const group of restored.groups) groups.set(group.id, group)
+      for (const tag of restored.tags) tags.set(tag.id, tag)
+      return { accounts, groups, tags }
+    })
     get().saveToStorage()
-    return result
+    return {
+      success: restored.outcome.added,
+      failed: restored.outcome.failed + restored.outcome.invalid,
+      errors: [
+        ...restored.outcome.errors.map((error, index) => ({ id: `#${index + 1}`, error: error.message })),
+        ...(restored.outcome.duplicate ? [{ id: 'skipped', error: `跳过 ${restored.outcome.duplicate} 条重复账户` }] : [])
+      ]
+    }
   },
+
+  importAccountPlan: (plan, groupId, signal) => enqueueAccountImport(async () => {
+    const persist = async (): Promise<void> => {
+      await get().flushSaveImmediately()
+      if (lastSaveError) throw lastSaveError
+    }
+    if (signal?.aborted) return { ...emptyOutcome(plan.counts.total), cancelled: plan.counts.total }
+    if (plan.ok && plan.backup) {
+      // Backup restoration is offline, including exports with intentionally omitted tokens.
+      const restored = planBackupRestore(plan.backup, {
+        existingAccounts: get().accounts.values(), existingGroups: get().groups, existingTags: get().tags,
+        generateId: uuidv4, generateMachineId: generateRandomMachineId, now: Date.now()
+      })
+      set((state) => {
+        const accounts = new Map(state.accounts)
+        const groups = new Map(state.groups)
+        const tags = new Map(state.tags)
+        for (const account of restored.accounts) accounts.set(account.id, account as unknown as Account)
+        for (const group of restored.groups) groups.set(group.id, group)
+        for (const tag of restored.tags) tags.set(tag.id, tag)
+        return { accounts, groups, tags }
+      })
+      if (restored.notes.length) restored.outcome.errors.push({ source: '$metadata', message: '部分分组或标签已忽略或重建，请核对导入结果' })
+      try { await persist() } catch {
+        restored.outcome.failed += restored.outcome.added
+        restored.outcome.added = 0
+        restored.outcome.errors.push({ source: '$', message: '当前窗口已保留导入数据，但保存失败，请重试保存后再退出' })
+      }
+      return restored.outcome
+    }
+    return executeCredentialImport(plan, {
+      existing: () => get().accounts.values(),
+      verify: (credential) => window.api.verifyAccountCredentials({
+        ...credential, clientId: credential.clientId || '', clientSecret: credential.clientSecret || ''
+      }),
+      add: (account) => get().addAccount(account),
+      persist,
+      wasConsumed: (credential) => {
+        const accountId = consumedImportTokens.get(credential.refreshToken)
+        if (!accountId) return false
+        if (get().accounts.has(accountId)) return true
+        consumedImportTokens.delete(credential.refreshToken)
+        return false
+      },
+      rememberConsumed: (credential, accountId) => { consumedImportTokens.set(credential.refreshToken, accountId) }
+    }, groupId && get().groups.has(groupId) ? groupId : undefined, signal)
+  }),
 
   // ==================== 状态管理 ====================
 
@@ -1810,9 +1770,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     const pending = savePendingResolvers
     savePendingResolvers = []
     if (saveInFlight) {
-      const inflight = saveInFlight
-      void inflight.then(() => { for (const r of pending) r() })
-      return inflight
+      await saveInFlight
+      // A mutation can arrive while the previous snapshot is being saved.
+      // Persist a fresh snapshot before acknowledging this flush.
+      await get().flushSaveImmediately()
+      for (const resolve of pending) resolve()
+      return
     }
 
     const {
@@ -1846,7 +1809,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     set({ isSyncing: true })
 
-    saveInFlight = (async () => {
+    lastSaveError = null
+    saveInFlight = Promise.resolve().then(async () => {
       try {
         await window.api.saveAccounts({
           accounts: Object.fromEntries(accounts),
@@ -1877,15 +1841,21 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           accountProxyBindings
         })
       } catch (error) {
-        console.error('Failed to save accounts:', error)
+        lastSaveError = new Error('账户保存失败')
+        console.error('Failed to save accounts')
       } finally {
         set({ isSyncing: false })
         saveInFlight = null
         for (const r of pending) r()
       }
-    })()
+    })
 
     return saveInFlight
+  },
+
+  saveAccountChanges: async () => {
+    await get().flushSaveImmediately()
+    if (lastSaveError) throw lastSaveError
   },
 
   // ==================== 设置 ====================

@@ -1,315 +1,102 @@
-# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
-name: Build & Release
+name: Windows x64 build and release
 
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
 
-# 设置工作目录
-env:
-  WORKING_DIR: Kiro-account-manager
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  # 获取版本号
-  get-version:
-    runs-on: ubuntu-latest
+  build:
+    runs-on: windows-latest
     outputs:
-      version: ${{ steps.get_version.outputs.version }}
-      tag_name: ${{ steps.get_version.outputs.tag_name }}
-      changelog_en: ${{ steps.extract_changelog.outputs.changelog_en }}
-      changelog_cn: ${{ steps.extract_changelog.outputs.changelog_cn }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    defaults:
+      run:
+        working-directory: Kiro-account-manager
+        shell: pwsh
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Get version from package.json
-        id: get_version
-        working-directory: ${{ env.WORKING_DIR }}
-        run: |
-          VERSION=$(node -p "require('./package.json').version")
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            TAG_NAME="${{ github.ref_name }}"
-          else
-            TAG_NAME="v$VERSION"
-          fi
-          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-          echo "Version: $VERSION, Tag: $TAG_NAME"
-
-      - name: Extract changelog from README
-        id: extract_changelog
-        run: |
-          # 提取英文更新日志（从 ### v 开始到下一个 ### 或文件结束）
-          CHANGELOG_EN=$(awk '/^### v[0-9]+\.[0-9]+\.[0-9]+/{if(found) exit; found=1} found' README.md)
-          # 提取中文更新日志
-          CHANGELOG_CN=$(awk '/^### v[0-9]+\.[0-9]+\.[0-9]+/{if(found) exit; found=1} found' README_CN.md)
-          
-          # 使用 EOF 处理多行输出
-          echo "changelog_en<<EOF" >> $GITHUB_OUTPUT
-          echo "$CHANGELOG_EN" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          
-          echo "changelog_cn<<EOF" >> $GITHUB_OUTPUT
-          echo "$CHANGELOG_CN" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-          
-          echo "Extracted changelog for release"
-
-  build-windows:
-    needs: get-version
-    runs-on: windows-latest
-    strategy:
-      matrix:
-        arch: [x64, ia32]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          python-version: '3.11'
-
-      - name: Install setuptools (for node-gyp)
-        run: pip install setuptools
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: 'npm'
-          cache-dependency-path: ${{ env.WORKING_DIR }}/package-lock.json
-
-      - name: Install dependencies
-        working-directory: ${{ env.WORKING_DIR }}
+          node-version: '24.16.0'
+          cache: npm
+          cache-dependency-path: Kiro-account-manager/package-lock.json
+      - name: Validate version and release notes
+        id: version
+        run: node scripts/release-version.mjs
+      - name: Install locked dependencies
         run: npm ci
-
-      - name: Build
-        working-directory: ${{ env.WORKING_DIR }}
+      - name: Offline regressions
+        run: npm run test:unit
+      - name: Typecheck and compile
         run: npm run build
-
-      - name: Package Windows ${{ matrix.arch }}
-        working-directory: ${{ env.WORKING_DIR }}
-        run: npx electron-builder --win --${{ matrix.arch }} -p never
+      - name: Package without installing or publishing
+        run: npm run package:win
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      - name: Verify packaged application contents
+        run: npm run verify:package
+      - name: Generate exact artifact checksums
+        run: npm run release:checksums
+      - uses: actions/upload-artifact@v4
         with:
-          name: windows-${{ matrix.arch }}
+          name: windows-x64-release
+          if-no-files-found: error
           path: |
-            ${{ env.WORKING_DIR }}/dist/*.exe
-            ${{ env.WORKING_DIR }}/dist/*.zip
-            ${{ env.WORKING_DIR }}/dist/*.yml
-            ${{ env.WORKING_DIR }}/dist/*.blockmap
-          if-no-files-found: ignore
-
-  build-windows-arm64:
-    needs: get-version
-    runs-on: windows-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install setuptools (for node-gyp)
-        run: pip install setuptools
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: 'npm'
-          cache-dependency-path: ${{ env.WORKING_DIR }}/package-lock.json
-
-      - name: Install dependencies
-        working-directory: ${{ env.WORKING_DIR }}
-        run: npm ci
-
-      - name: Build
-        working-directory: ${{ env.WORKING_DIR }}
-        run: npm run build
-
-      - name: Package Windows ARM64
-        working-directory: ${{ env.WORKING_DIR }}
-        run: npx electron-builder --win --arm64 -p never
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-arm64
-          path: |
-            ${{ env.WORKING_DIR }}/dist/*.exe
-            ${{ env.WORKING_DIR }}/dist/*.zip
-            ${{ env.WORKING_DIR }}/dist/*.yml
-            ${{ env.WORKING_DIR }}/dist/*.blockmap
-          if-no-files-found: ignore
-
-  build-macos:
-    needs: get-version
-    runs-on: macos-latest
-    strategy:
-      matrix:
-        arch: [x64, arm64]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install setuptools (for node-gyp)
-        run: pip install setuptools
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: 'npm'
-          cache-dependency-path: ${{ env.WORKING_DIR }}/package-lock.json
-
-      - name: Install dependencies
-        working-directory: ${{ env.WORKING_DIR }}
-        run: npm ci
-
-      - name: Build
-        working-directory: ${{ env.WORKING_DIR }}
-        run: npm run build
-
-      - name: Package macOS ${{ matrix.arch }}
-        working-directory: ${{ env.WORKING_DIR }}
-        run: npx electron-builder --mac --${{ matrix.arch }} -p never
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-${{ matrix.arch }}
-          path: |
-            ${{ env.WORKING_DIR }}/dist/*.dmg
-            ${{ env.WORKING_DIR }}/dist/*.zip
-            ${{ env.WORKING_DIR }}/dist/*.yml
-            ${{ env.WORKING_DIR }}/dist/*.blockmap
-          if-no-files-found: ignore
-
-  build-linux:
-    needs: get-version
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        arch: [x64, arm64, armv7l]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install setuptools (for node-gyp)
-        run: pip install setuptools
-
-      - name: Install snapcraft (for x64 snap build)
-        if: matrix.arch == 'x64'
-        run: sudo snap install snapcraft --classic
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: 'npm'
-          cache-dependency-path: ${{ env.WORKING_DIR }}/package-lock.json
-
-      - name: Install dependencies
-        working-directory: ${{ env.WORKING_DIR }}
-        run: npm ci
-
-      - name: Build
-        working-directory: ${{ env.WORKING_DIR }}
-        run: npm run build
-
-      - name: Package Linux ${{ matrix.arch }}
-        working-directory: ${{ env.WORKING_DIR }}
-        run: |
-          if [ "${{ matrix.arch }}" = "x64" ]; then
-            # x64 构建所有目标（包括 snap）
-            npx electron-builder --linux --${{ matrix.arch }} -p never
-          else
-            # ARM 架构不支持交叉编译 snap，只构建 AppImage 和 deb
-            npx electron-builder --linux AppImage deb --${{ matrix.arch }} -p never
-          fi
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-${{ matrix.arch }}
-          path: |
-            ${{ env.WORKING_DIR }}/dist/*.AppImage
-            ${{ env.WORKING_DIR }}/dist/*.deb
-            ${{ env.WORKING_DIR }}/dist/*.snap
-            ${{ env.WORKING_DIR }}/dist/*.tar.gz
-            ${{ env.WORKING_DIR }}/dist/*.yml
-            ${{ env.WORKING_DIR }}/dist/*.blockmap
-          if-no-files-found: ignore
+            Kiro-account-manager/dist/*-x64-setup.exe
+            Kiro-account-manager/dist/*-x64-windows.zip
+            Kiro-account-manager/dist/SHA256SUMS.txt
 
   release:
-    needs: [get-version, build-windows, build-windows-arm64, build-macos, build-linux]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.build.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.build.outputs.version }}
+      PRERELEASE: ${{ needs.build.outputs.prerelease }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: artifacts
-
-      - name: Display structure of downloaded files
-        run: ls -R artifacts
-
-      - name: Flatten and deduplicate artifacts
+          name: windows-x64-release
+          path: release-assets
+      - name: Verify downloaded checksums
+        working-directory: release-assets
+        run: sha256sum --check SHA256SUMS.txt
+      - name: Publish complete release
+        shell: bash
         run: |
-          mkdir -p release-assets
-          # 将所有子目录中的文件扁平化到一个目录，同名文件自动去重（后者覆盖前者）
-          find artifacts -type f \
-            \( -name "*.exe" -o -name "*.zip" -o -name "*.dmg" \
-               -o -name "*.AppImage" -o -name "*.deb" -o -name "*.snap" \
-               -o -name "*.tar.gz" -o -name "*.yml" -o -name "*.blockmap" \) \
-            ! -name "builder-debug.yml" \
-            -exec cp {} release-assets/ \;
-          echo "=== Release assets (deduplicated) ==="
-          ls -lh release-assets/
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v1
-        with:
-          name: Kiro Account Manager v${{ needs.get-version.outputs.version }}
-          tag_name: ${{ needs.get-version.outputs.tag_name }}
-          draft: false
-          prerelease: false
-          generate_release_notes: false
-          body: |
-            ## 🌟 更新内容 | What's New
-
-            ${{ needs.get-version.outputs.changelog_cn }}
-
-            ---
-
-            ${{ needs.get-version.outputs.changelog_en }}
-          files: release-assets/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          set -euo pipefail
+          # --target only applies to a new tag. Reject any existing tag at another commit.
+          remote_refs="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")"
+          if [[ -n "$remote_refs" ]]; then
+            git fetch --depth=1 origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            if [[ "$(git rev-parse "$RELEASE_TAG^{commit}")" != "$GITHUB_SHA" ]]; then
+              echo "Existing tag does not match the built commit"
+              exit 1
+            fi
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release already exists: $RELEASE_TAG"
+            exit 1
+          fi
+          flags=(--latest=false)
+          if [[ "$PRERELEASE" == "true" ]]; then flags+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --draft "${flags[@]}" \
+            --title "kiroaccout $RELEASE_VERSION · Windows x64" \
+            --notes-file "docs/releases/$RELEASE_TAG.md" \
+            release-assets/*
+          gh release edit "$RELEASE_TAG" --draft=false "${flags[@]}"

@@ -10,6 +10,7 @@ Development is in progress to fix JSON account imports, OIDC batch input and onl
 - [Analysis](docs/2026-10-19-account-import-login/02-analysis.md)
 - [Remediation plan](docs/2026-10-19-account-import-login/03-remediation-plan.md)
 - [Project rules](AGENTS.md) and [development isolation](docs/development-rules.md)
+- [Development and Windows release guide](docs/DEVELOPMENT.md)
 - [Application source](Kiro-account-manager/)
 
 Development and testing must remain isolated from the running 1.7.5 installation, production account data and shared authentication caches. Follow the isolation rules before launching a development client.

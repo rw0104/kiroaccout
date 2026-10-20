@@ -1,3 +1,4 @@
+import type { LoginResult, SocialLoginCallback } from '../main/loginSessions'
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
@@ -272,125 +273,21 @@ const api = {
     return ipcRenderer.invoke('import-from-sso-token', bearerToken, region || 'us-east-1')
   },
 
-  // ============ 手动登录 API ============
-
-  // 启动 Builder ID 手动登录
-  startBuilderIdLogin: (region?: string): Promise<{
-    success: boolean
-    userCode?: string
-    verificationUri?: string
-    expiresIn?: number
-    interval?: number
-    error?: string
-  }> => {
-    return ipcRenderer.invoke('start-builder-id-login', region || 'us-east-1')
-  },
-
-  // 轮询 Builder ID 授权状态
-  pollBuilderIdAuth: (region?: string): Promise<{
-    success: boolean
-    completed?: boolean
-    status?: string
-    accessToken?: string
-    refreshToken?: string
-    clientId?: string
-    clientSecret?: string
-    region?: string
-    expiresIn?: number
-    error?: string
-  }> => {
-    return ipcRenderer.invoke('poll-builder-id-auth', region || 'us-east-1')
-  },
-
-  // 取消 Builder ID 登录
-  cancelBuilderIdLogin: (): Promise<{ success: boolean }> => {
-    return ipcRenderer.invoke('cancel-builder-id-login')
-  },
-
-  // 启动 IAM Identity Center SSO 登录 (Authorization Code flow)
-  startIamSsoLogin: (startUrl: string, region?: string): Promise<{
-    success: boolean
-    authorizeUrl?: string
-    expiresIn?: number
-    error?: string
-  }> => {
-    return ipcRenderer.invoke('start-iam-sso-login', startUrl, region || 'us-east-1')
-  },
-
-  // 轮询 IAM SSO 授权状态
-  pollIamSsoAuth: (region?: string): Promise<{
-    success: boolean
-    completed?: boolean
-    status?: string
-    accessToken?: string
-    refreshToken?: string
-    clientId?: string
-    clientSecret?: string
-    region?: string
-    expiresIn?: number
-    error?: string
-  }> => {
-    return ipcRenderer.invoke('poll-iam-sso-auth', region || 'us-east-1')
-  },
-
-  // 完成 IAM SSO 登录 (用授权码换取 token)
-  completeIamSsoLogin: (code: string): Promise<{
-    success: boolean
-    completed?: boolean
-    accessToken?: string
-    refreshToken?: string
-    clientId?: string
-    clientSecret?: string
-    region?: string
-    expiresIn?: number
-    error?: string
-  }> => {
-    return ipcRenderer.invoke('complete-iam-sso-login', code)
-  },
-
-  // 取消 IAM SSO 登录
-  cancelIamSsoLogin: (): Promise<{ success: boolean }> => {
-    return ipcRenderer.invoke('cancel-iam-sso-login')
-  },
-
-  // 启动 Social Auth 登录 (Google/GitHub)
-  startSocialLogin: (provider: 'Google' | 'Github', usePrivateMode?: boolean): Promise<{
-    success: boolean
-    loginUrl?: string
-    state?: string
-    error?: string
-  }> => {
-    return ipcRenderer.invoke('start-social-login', provider, usePrivateMode)
-  },
-
-  // 交换 Social Auth token
-  exchangeSocialToken: (code: string, state: string): Promise<{
-    success: boolean
-    accessToken?: string
-    refreshToken?: string
-    profileArn?: string
-    expiresIn?: number
-    authMethod?: string
-    provider?: string
-    error?: string
-  }> => {
-    return ipcRenderer.invoke('exchange-social-token', code, state)
-  },
-
-  // 取消 Social Auth 登录
-  cancelSocialLogin: (): Promise<{ success: boolean }> => {
-    return ipcRenderer.invoke('cancel-social-login')
-  },
-
-  // 监听 Social Auth 回调
-  onSocialAuthCallback: (callback: (data: { code?: string; state?: string; error?: string }) => void): (() => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, data: { code?: string; state?: string; error?: string }): void => {
-      callback(data)
-    }
+  // Every login operation is bound to the caller's session, including cancellation during start.
+  startBuilderIdLogin: (region: string, sessionId: string): Promise<LoginResult> => ipcRenderer.invoke('start-builder-id-login', region, sessionId),
+  pollBuilderIdAuth: (sessionId: string): Promise<LoginResult> => ipcRenderer.invoke('poll-builder-id-auth', sessionId),
+  cancelBuilderIdLogin: (sessionId: string): Promise<{ success: boolean }> => ipcRenderer.invoke('cancel-builder-id-login', sessionId),
+  startIamSsoLogin: (startUrl: string, region: string, sessionId: string): Promise<LoginResult> => ipcRenderer.invoke('start-iam-sso-login', startUrl, region, sessionId),
+  pollIamSsoAuth: (sessionId: string): Promise<LoginResult> => ipcRenderer.invoke('poll-iam-sso-auth', sessionId),
+  cancelIamSsoLogin: (sessionId: string): Promise<{ success: boolean }> => ipcRenderer.invoke('cancel-iam-sso-login', sessionId),
+  startSocialLogin: (provider: 'Google' | 'Github', usePrivateMode: boolean, sessionId: string): Promise<LoginResult> => ipcRenderer.invoke('start-social-login', provider, usePrivateMode, sessionId),
+  exchangeSocialToken: (code: string, state: string, sessionId: string): Promise<LoginResult> => ipcRenderer.invoke('exchange-social-token', code, state, sessionId),
+  getSocialAuthCallback: (sessionId: string): Promise<SocialLoginCallback | null> => ipcRenderer.invoke('get-social-auth-callback', sessionId),
+  cancelSocialLogin: (sessionId: string): Promise<{ success: boolean }> => ipcRenderer.invoke('cancel-social-login', sessionId),
+  onSocialAuthCallback: (callback: (data: SocialLoginCallback) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: SocialLoginCallback): void => callback(data)
     ipcRenderer.on('social-auth-callback', handler)
-    return () => {
-      ipcRenderer.removeListener('social-auth-callback', handler)
-    }
+    return () => ipcRenderer.removeListener('social-auth-callback', handler)
   },
 
   // 代理设置

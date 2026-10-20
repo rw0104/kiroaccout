@@ -1,10 +1,13 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { Button, Card, CardContent, CardHeader, CardTitle, Input, Label, Select } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { SubscriptionType } from '@/types/account'
 import { X, Loader2, Download, Copy, Check, ExternalLink, Info, EyeOff } from 'lucide-react'
-import { splitCredentialLine } from '@/lib/utils'
+import { parseAccountImportText } from '../../../../shared/accountImport'
+import type { ImportOutcome } from '../../../../shared/accountImport'
+import { startSerialLoginPolling } from '@/lib/loginPolling'
+import type { LoginResult, SocialLoginCallback } from '../../../../main/loginSessions'
 
 interface AddAccountDialogProps {
   isOpen: boolean
@@ -59,9 +62,21 @@ interface VerifiedData {
 
 type ImportMode = 'oidc' | 'sso' | 'login'
 type LoginType = 'builderid' | 'google' | 'github' | 'iamsso'
+interface LoginAttempt {
+  id: string
+  kind: 'builderid' | 'social' | 'iamsso'
+  startUrl?: string
+  unsubscribe?: () => void
+  stopPolling?: () => void
+  expiryTimer?: ReturnType<typeof setTimeout>
+  processing?: boolean
+  adding?: boolean
+  added?: boolean
+}
+
 
 export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): React.ReactNode {
-  const { addAccount, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab } = useAccountsStore()
+  const { addAccount, importAccountPlan, accounts, batchImportConcurrency, loginPrivateMode, groups, activeGroupTab } = useAccountsStore()
 
   // 检查账户是否已存在（同userId 或 同邮箱+同provider 才算重复）
   const isAccountExists = (email: string, userId: string, provider?: string): boolean => {
@@ -96,7 +111,30 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   // OIDC 批量导入
   const [oidcImportMode, setOidcImportMode] = useState<'single' | 'batch'>('single')
   const [oidcBatchData, setOidcBatchData] = useState('')
-  const [oidcBatchImportResult, setOidcBatchImportResult] = useState<{ total: number; success: number; failed: number; errors: string[] } | null>(null)
+  const [oidcBatchImportResult, setOidcBatchImportResult] = useState<ImportOutcome | null>(null)
+  const oidcBatchPlan = useMemo(() => parseAccountImportText(oidcBatchData), [oidcBatchData])
+  const oidcImportControllerRef = useRef<AbortController | null>(null)
+
+  // Closing or unmounting cancels only this dialog's pending import.
+  useEffect(() => {
+    if (!isOpen) {
+      oidcImportControllerRef.current?.abort()
+      oidcImportControllerRef.current = null
+      setIsSubmitting(false)
+    }
+    return () => {
+      oidcImportControllerRef.current?.abort()
+      oidcImportControllerRef.current = null
+    }
+  }, [isOpen])
+
+  const handleDialogClose = () => {
+    oidcImportControllerRef.current?.abort()
+    oidcImportControllerRef.current = null
+    setIsSubmitting(false)
+    cancelLoginAttempt()
+    onClose()
+  }
 
   // 验证后的数据（保留用于条件渲染）
   const [verifiedData, setVerifiedData] = useState<VerifiedData | null>(null)
@@ -111,6 +149,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   // 登录相关状态
   const [loginType, setLoginType] = useState<LoginType>('builderid')
   const [isLoggingIn, setIsLoggingIn] = useState(false)
+  const [loginSavePending, setLoginSavePending] = useState(false)
   const [usePrivateMode, setUsePrivateMode] = useState(loginPrivateMode) // 临时隐私模式开关，默认跟随全局设置
   const [builderIdLoginData, setBuilderIdLoginData] = useState<{
     userCode: string
@@ -119,7 +158,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     interval: number
   } | null>(null)
   const [copied, setCopied] = useState(false)
-  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const loginAttemptRef = useRef<LoginAttempt | null>(null)
   
   // IAM SSO 登录相关状态
   const [ssoStartUrl, setSsoStartUrl] = useState('')
@@ -130,14 +169,54 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     interval: number
   } | null>(null)
 
-  // 清理轮询
+  const isCurrentLogin = (attempt: LoginAttempt) => loginAttemptRef.current === attempt
+  const cancelLoginAttempt = () => {
+    const attempt = loginAttemptRef.current
+    if (!attempt) return
+    // Invalidate synchronously before any IPC can settle.
+    loginAttemptRef.current = null
+    attempt.stopPolling?.()
+    if (attempt.expiryTimer) clearTimeout(attempt.expiryTimer)
+    attempt.unsubscribe?.()
+    const cancel = attempt.kind === 'builderid' ? window.api.cancelBuilderIdLogin
+      : attempt.kind === 'iamsso' ? window.api.cancelIamSsoLogin : window.api.cancelSocialLogin
+    void cancel(attempt.id).catch(() => {})
+  }
+  const finishLoginAttempt = (attempt: LoginAttempt) => {
+    if (!isCurrentLogin(attempt)) return
+    cancelLoginAttempt()
+    setIsLoggingIn(false)
+    setBuilderIdLoginData(null)
+    setIamSsoLoginData(null)
+  }
+  const setAttemptExpiry = (attempt: LoginAttempt, seconds: number) => {
+    if (attempt.expiryTimer) clearTimeout(attempt.expiryTimer)
+    attempt.expiryTimer = setTimeout(() => {
+      if (!isCurrentLogin(attempt)) return
+      setError('登录已过期，请重新开始')
+      finishLoginAttempt(attempt)
+    }, Math.max(1, seconds) * 1000)
+  }
+  const beginLoginAttempt = (kind: LoginAttempt['kind']): LoginAttempt => {
+    cancelLoginAttempt()
+    const attempt: LoginAttempt = { id: crypto.randomUUID(), kind }
+    loginAttemptRef.current = attempt
+    setAttemptExpiry(attempt, 600)
+    setIsLoggingIn(true)
+    setBuilderIdLoginData(null)
+    setIamSsoLoginData(null)
+    setError(null)
+    return attempt
+  }
   useEffect(() => {
-    return () => {
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current)
-      }
+    if (!isOpen) {
+      cancelLoginAttempt()
+      setIsLoggingIn(false)
+      setBuilderIdLoginData(null)
+      setIamSsoLoginData(null)
     }
-  }, [])
+    return () => cancelLoginAttempt()
+  }, [isOpen])
 
   // 打开弹窗时默认选中"当前打开的分组"（activeGroupTab 为真实分组时），否则未分组
   useEffect(() => {
@@ -146,45 +225,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setSelectedGroupId(isRealGroup ? activeGroupTab : undefined)
   }, [isOpen, activeGroupTab, groups])
 
-  // 监听 Social Auth 回调
-  useEffect(() => {
-    if (!isLoggingIn || loginType === 'builderid') return
-
-    const unsubscribe = window.api.onSocialAuthCallback(async (data) => {
-      console.log('[AddAccountDialog] Social auth callback:', data)
-      
-      if (data.error) {
-        setError(`登录失败: ${data.error}`)
-        setIsLoggingIn(false)
-        return
-      }
-
-      if (data.code && data.state) {
-        try {
-          const result = await window.api.exchangeSocialToken(data.code, data.state)
-          if (result.success) {
-            await handleLoginSuccess({
-              accessToken: result.accessToken!,
-              refreshToken: result.refreshToken!,
-              authMethod: 'social',
-              provider: result.provider
-            })
-          } else {
-            setError(result.error || 'Token 交换失败')
-          }
-        } catch (e) {
-          setError(e instanceof Error ? e.message : '登录失败')
-        } finally {
-          setIsLoggingIn(false)
-        }
-      }
-    })
-
-    return () => unsubscribe()
-  }, [isLoggingIn, loginType])
-
   // 处理登录成功
-  const handleLoginSuccess = async (tokenData: {
+  const handleLoginSuccess = async (attempt: LoginAttempt, tokenData: {
     accessToken: string
     refreshToken: string
     clientId?: string
@@ -194,7 +236,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     authMethod?: string
     provider?: string
   }) => {
-    console.log('[AddAccountDialog] Login successful, verifying credentials...')
+    if (!isCurrentLogin(attempt) || attempt.adding) return
+    attempt.adding = true
     
     try {
       // 验证凭证并获取账号信息
@@ -207,6 +250,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         provider: tokenData.provider
       })
 
+      if (!isCurrentLogin(attempt)) return
       if (result.success && result.data) {
         const { email, userId } = result.data
         const providerName = tokenData.provider || 'BuilderId'
@@ -217,6 +261,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           return
         }
         
+        if (!isCurrentLogin(attempt)) return
         // 添加账号
         const now = Date.now()
         addAccount({
@@ -269,218 +314,173 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           lastUsedAt: now
         })
 
+        // Keep the added account in memory if persistence fails; retry saving without exchanging the code again.
+        attempt.added = true
+        setLoginSavePending(true)
+        await useAccountsStore.getState().saveAccountChanges()
+        if (!isCurrentLogin(attempt)) return
+        setLoginSavePending(false)
+        finishLoginAttempt(attempt)
         resetForm()
-        onClose()
+        handleDialogClose()
       } else {
         setError(result.error || '验证失败')
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : '添加账号失败')
+      if (isCurrentLogin(attempt)) setError(attempt.added ? '账户已添加到当前会话，但保存失败；可点击重试保存。' : '添加账户失败，请重试。')
     }
   }
 
-  // 启动 Builder ID 登录
+  const pollLogin = (attempt: LoginAttempt, interval: number) => {
+    attempt.stopPolling = startSerialLoginPolling<LoginResult>({
+      initialInterval: interval,
+      isCurrent: () => isCurrentLogin(attempt),
+      poll: () => attempt.kind === 'builderid' ? window.api.pollBuilderIdAuth(attempt.id) : window.api.pollIamSsoAuth(attempt.id),
+      onResult: async (result) => {
+        if (!isCurrentLogin(attempt) || result.sessionId !== attempt.id) return null
+        if (!result.success) {
+          setError(result.error || '授权失败，请重试')
+          finishLoginAttempt(attempt)
+          return null
+        }
+        if (result.completed) {
+          if (!result.accessToken || !result.refreshToken) {
+            setError('授权响应不完整，请重新开始')
+          } else {
+            await handleLoginSuccess(attempt, {
+              accessToken: result.accessToken,
+              refreshToken: result.refreshToken,
+              clientId: result.clientId,
+              clientSecret: result.clientSecret,
+              region: result.region,
+              startUrl: attempt.startUrl,
+              authMethod: 'IdC',
+              provider: attempt.kind === 'builderid' ? 'BuilderId' : 'Enterprise'
+            })
+          }
+          if (isCurrentLogin(attempt)) finishLoginAttempt(attempt)
+          return null
+        }
+        return result.retryAfter || result.interval || interval
+      },
+      onError: () => {
+        if (!isCurrentLogin(attempt)) return
+        setError('无法查询授权状态，请重新开始')
+        finishLoginAttempt(attempt)
+      }
+    })
+  }
+
   const handleStartBuilderIdLogin = async () => {
-    setIsLoggingIn(true)
-    setError(null)
-    setBuilderIdLoginData(null)
-
+    const attempt = beginLoginAttempt('builderid')
     try {
-      const result = await window.api.startBuilderIdLogin(region)
-      
+      const result = await window.api.startBuilderIdLogin(region, attempt.id)
+      if (!isCurrentLogin(attempt) || result.sessionId !== attempt.id) return
       if (result.success && result.userCode && result.verificationUri) {
-        setBuilderIdLoginData({
-          userCode: result.userCode,
-          verificationUri: result.verificationUri,
-          expiresIn: result.expiresIn || 600,
-          interval: result.interval || 5
-        })
-
-        // 打开浏览器（支持隐私模式）
+        setAttemptExpiry(attempt, result.expiresIn || 600)
+        setBuilderIdLoginData({ userCode: result.userCode, verificationUri: result.verificationUri, expiresIn: result.expiresIn || 600, interval: result.interval || 5 })
         window.api.openExternal(result.verificationUri, usePrivateMode)
-
-        // 开始轮询
-        startPolling(result.interval || 5)
+        pollLogin(attempt, result.interval || 5)
       } else {
         setError(result.error || '启动登录失败')
-        setIsLoggingIn(false)
+        finishLoginAttempt(attempt)
       }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '启动登录失败')
-      setIsLoggingIn(false)
+    } catch {
+      if (!isCurrentLogin(attempt)) return
+      setError('启动登录失败，请重试')
+      finishLoginAttempt(attempt)
     }
   }
 
-  // 启动 IAM SSO 登录 (Authorization Code flow)
   const handleStartIamSsoLogin = async () => {
-    if (!ssoStartUrl.trim()) {
-      setError(isEn ? 'Please enter SSO Start URL' : '请输入 SSO Start URL')
-      return
-    }
-    
-    setIsLoggingIn(true)
-    setError(null)
-    setIamSsoLoginData(null)
-
+    if (!ssoStartUrl.trim()) { setError(isEn ? 'Please enter SSO Start URL' : '请输入 SSO Start URL'); return }
+    const attempt = beginLoginAttempt('iamsso')
+    attempt.startUrl = ssoStartUrl.trim()
     try {
-      const result = await window.api.startIamSsoLogin(ssoStartUrl.trim(), region)
-      
+      const result = await window.api.startIamSsoLogin(attempt.startUrl, region, attempt.id)
+      if (!isCurrentLogin(attempt) || result.sessionId !== attempt.id) return
       if (result.success && result.authorizeUrl) {
-        // 设置登录数据（用于显示等待状态）
-        setIamSsoLoginData({
-          userCode: '',
-          verificationUri: result.authorizeUrl,
-          expiresIn: result.expiresIn || 600,
-          interval: 3
-        })
-
-        // 打开浏览器（支持隐私模式）
+        setAttemptExpiry(attempt, result.expiresIn || 600)
+        setIamSsoLoginData({ userCode: '', verificationUri: result.authorizeUrl, expiresIn: result.expiresIn || 600, interval: 3 })
         window.api.openExternal(result.authorizeUrl, usePrivateMode)
-
-        // 开始轮询（等待服务器回调自动完成 token 交换）
-        startIamSsoPolling(3)
+        pollLogin(attempt, 3)
       } else {
-        setError(result.error || (isEn ? 'Failed to start login' : '启动登录失败'))
-        setIsLoggingIn(false)
+        setError(result.error || '启动登录失败')
+        finishLoginAttempt(attempt)
       }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : (isEn ? 'Failed to start login' : '启动登录失败'))
-      setIsLoggingIn(false)
+    } catch {
+      if (!isCurrentLogin(attempt)) return
+      setError('启动登录失败，请重试')
+      finishLoginAttempt(attempt)
     }
   }
 
-  // 开始轮询 IAM SSO 授权
-  const startIamSsoPolling = (interval: number) => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current)
-    }
-
-    pollIntervalRef.current = setInterval(async () => {
-      try {
-        const result = await window.api.pollIamSsoAuth(region)
-        
-        if (!result.success) {
-          setError(result.error || (isEn ? 'Authorization failed' : '授权失败'))
-          setIsLoggingIn(false)
-          setIamSsoLoginData(null)
-          if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current)
-            pollIntervalRef.current = null
-          }
-          return
-        }
-
-        if (result.completed) {
-          if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current)
-            pollIntervalRef.current = null
-          }
-          
-          await handleLoginSuccess({
-            accessToken: result.accessToken!,
-            refreshToken: result.refreshToken!,
-            clientId: result.clientId,
-            clientSecret: result.clientSecret,
-            region: result.region,
-            startUrl: ssoStartUrl.trim(),
-            authMethod: 'IdC',
-            provider: 'Enterprise'
-          })
-          
-          setIsLoggingIn(false)
-          setIamSsoLoginData(null)
-        }
-        // 如果是 pending 或 slow_down，继续轮询
-      } catch (e) {
-        console.error('[AddAccountDialog] IAM SSO Poll error:', e)
-      }
-    }, interval * 1000)
-  }
-
-  // 开始轮询 Builder ID 授权
-  const startPolling = (interval: number) => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current)
-    }
-
-    pollIntervalRef.current = setInterval(async () => {
-      try {
-        const result = await window.api.pollBuilderIdAuth(region)
-        
-        if (!result.success) {
-          setError(result.error || '授权失败')
-          setIsLoggingIn(false)
-          setBuilderIdLoginData(null)
-          if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current)
-            pollIntervalRef.current = null
-          }
-          return
-        }
-
-        if (result.completed) {
-          if (pollIntervalRef.current) {
-            clearInterval(pollIntervalRef.current)
-            pollIntervalRef.current = null
-          }
-          
-          await handleLoginSuccess({
-            accessToken: result.accessToken!,
-            refreshToken: result.refreshToken!,
-            clientId: result.clientId,
-            clientSecret: result.clientSecret,
-            region: result.region,
-            authMethod: 'IdC',
-            provider: 'BuilderId'
-          })
-          
-          setIsLoggingIn(false)
-          setBuilderIdLoginData(null)
-        }
-        // 如果是 pending 或 slow_down，继续轮询
-      } catch (e) {
-        console.error('[AddAccountDialog] Poll error:', e)
-      }
-    }, interval * 1000)
-  }
-
-  // 取消登录
   const handleCancelLogin = async () => {
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current)
-      pollIntervalRef.current = null
-    }
-
-    if (loginType === 'builderid') {
-      await window.api.cancelBuilderIdLogin()
-    } else if (loginType === 'iamsso') {
-      await window.api.cancelIamSsoLogin()
-    } else {
-      await window.api.cancelSocialLogin()
-    }
-
+    cancelLoginAttempt()
     setIsLoggingIn(false)
     setBuilderIdLoginData(null)
     setIamSsoLoginData(null)
     setError(null)
   }
 
-  // 启动 Social Auth 登录 (Google/GitHub)
   const handleStartSocialLogin = async (socialProvider: 'Google' | 'Github') => {
-    setIsLoggingIn(true)
-    setError(null)
-
+    const attempt = beginLoginAttempt('social')
+    const receive = async (callback: SocialLoginCallback) => {
+      if (!isCurrentLogin(attempt) || callback.sessionId !== attempt.id || attempt.processing) return
+      attempt.processing = true
+      if (callback.error) {
+        setError(callback.error)
+        finishLoginAttempt(attempt)
+        return
+      }
+      if (!callback.code || !callback.state) return
+      try {
+        const result = await window.api.exchangeSocialToken(callback.code, callback.state, attempt.id)
+        if (!isCurrentLogin(attempt) || result.sessionId !== attempt.id) return
+        if (result.success && result.completed && result.accessToken && result.refreshToken) {
+          await handleLoginSuccess(attempt, { accessToken: result.accessToken, refreshToken: result.refreshToken, provider: result.provider, authMethod: 'social' })
+          if (isCurrentLogin(attempt)) finishLoginAttempt(attempt)
+        } else if (!result.success) {
+          setError(result.error || 'Token 交换失败')
+          finishLoginAttempt(attempt)
+        }
+      } catch {
+        if (!isCurrentLogin(attempt)) return
+        setError('Token 交换失败，请重新开始')
+        finishLoginAttempt(attempt)
+      }
+    }
+    // Subscribe before start can open a browser; query the cached handoff after await as well.
+    attempt.unsubscribe = window.api.onSocialAuthCallback(callback => { void receive(callback) })
     try {
-      const result = await window.api.startSocialLogin(socialProvider, usePrivateMode)
-      
+      const result = await window.api.startSocialLogin(socialProvider, usePrivateMode, attempt.id)
+      if (!isCurrentLogin(attempt) || attempt.processing) return
       if (!result.success) {
         setError(result.error || '启动登录失败')
-        setIsLoggingIn(false)
+        finishLoginAttempt(attempt)
+        return
       }
-      // 成功后等待回调
-    } catch (e) {
-      setError(e instanceof Error ? e.message : '启动登录失败')
-      setIsLoggingIn(false)
+      setAttemptExpiry(attempt, result.expiresIn || 600)
+      const pending = await window.api.getSocialAuthCallback(attempt.id)
+      if (!isCurrentLogin(attempt)) return
+      if (pending) await receive(pending)
+    } catch {
+      if (!isCurrentLogin(attempt)) return
+      setError('启动登录失败，请重试')
+      finishLoginAttempt(attempt)
+    }
+  }
+
+  const handleRetryLoginSave = async () => {
+    setIsSubmitting(true)
+    try {
+      await useAccountsStore.getState().saveAccountChanges()
+      setLoginSavePending(false)
+      setError(null)
+    } catch {
+      setError('保存失败，账户仍保留在当前会话，请重试。')
+    } finally {
+      setIsSubmitting(false)
     }
   }
 
@@ -649,229 +649,33 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     }
   }
 
-  // OIDC 批量导入
+  // Preview, button count and submission share the exact same parsed plan.
   const handleOidcBatchAdd = async () => {
-    if (!oidcBatchData.trim()) {
-      setError('请输入凭证数据')
+    if (oidcImportControllerRef.current) return
+    if (!oidcBatchPlan.ok) {
+      setError(oidcBatchPlan.error?.message || (isEn ? 'Invalid credentials data' : '凭证数据无效'))
       return
     }
 
-    // 解析凭证数据：自动识别 JSON 或卡密格式
-    let credentials: Array<{
-      refreshToken: string
-      password?: string
-      clientId?: string
-      clientSecret?: string
-      region?: string
-      authMethod?: 'IdC' | 'social'
-      provider?: string
-    }>
-
-    const trimmed = oidcBatchData.trim()
-    let isKamiFormat = false
-
-    try {
-      const parsed = JSON.parse(trimmed)
-      credentials = Array.isArray(parsed) ? parsed : [parsed]
-    } catch {
-      // JSON 解析失败，尝试卡密格式：邮箱----密码----RefreshToken----ClientId----ClientSecret
-      // 支持分隔符：----、Tab、连续空格
-      const lines = trimmed.split('\n').filter(line => line.trim() && !line.startsWith('#'))
-      if (lines.length === 0) {
-        setError(isEn ? 'Invalid format' : '格式错误，请输入 JSON 数组或卡密格式（邮箱----密码----Token----ID----Secret）')
-        return
-      }
-
-      credentials = lines.map(line => {
-        const parts = splitCredentialLine(line)
-        const rawPwd = parts[1]?.trim()
-        const clientId = parts[3]?.trim() || undefined
-        const clientSecret = parts[4]?.trim() || undefined
-        // 第6字段为登录方式(idp)：新卡密直接带；旧卡密无此字段时按 ClientId/Secret 推断——
-        // social(Github/Google) 只有 refreshToken，IdC(BuilderId/Enterprise) 才有 ClientId/Secret。
-        // provider 决定下方 verify 的 authMethod(social→只需 refreshToken / IdC→需 ClientId+Secret)
-        const rawIdp = parts[5]?.trim()
-        const provider = rawIdp || ((!clientId && !clientSecret) ? 'Google' : 'BuilderId')
-        return {
-          _email: parts[0]?.trim() || '',
-          password: (rawPwd && rawPwd !== 'no_password') ? rawPwd : undefined,
-          refreshToken: parts[2]?.trim() || '',
-          clientId,
-          clientSecret,
-          provider
-        }
-      }).filter(item => item.refreshToken) as typeof credentials
-
-      if (credentials.length === 0) {
-        setError(isEn ? 'Invalid format' : '格式错误，请输入 JSON 数组或卡密格式（邮箱----密码----Token----ID----Secret）')
-        return
-      }
-      isKamiFormat = true
-    }
-
-    if (credentials.length === 0) {
-      setError(isEn ? 'Enter at least one credential' : '请输入至少一个凭证')
-      return
-    }
-
+    const controller = new AbortController()
+    oidcImportControllerRef.current = controller
     setIsSubmitting(true)
     setError(null)
     setOidcBatchImportResult(null)
 
-    const importResult = { total: credentials.length, success: 0, failed: 0, errors: [] as string[], failedIndices: [] as number[] }
-
-    // 单个凭证导入函数
-    const importSingleCredential = async (cred: typeof credentials[0], index: number): Promise<void> => {
-      try {
-        if (!cred.refreshToken) {
-          importResult.failed++
-          importResult.failedIndices.push(index)
-          importResult.errors.push(`#${index + 1}: 缺少 refreshToken`)
-          return
-        }
-
-        // 根据 provider 自动确定 authMethod
-        const credProvider = cred.provider || 'BuilderId'
-        const credAuthMethod = cred.authMethod || ((credProvider === 'BuilderId' || credProvider === 'Enterprise') ? 'IdC' : 'social')
-
-        const result = await window.api.verifyAccountCredentials({
-          refreshToken: cred.refreshToken,
-          clientId: cred.clientId || '',
-          clientSecret: cred.clientSecret || '',
-          region: cred.region || 'us-east-1',
-          authMethod: credAuthMethod,
-          provider: credProvider
-        })
-
-        if (result.success && result.data) {
-          const { email, userId } = result.data
-          const provider = (cred.provider || 'BuilderId') as 'BuilderId' | 'Enterprise' | 'Github' | 'Google'
-          
-          if (isAccountExists(email, userId, provider)) {
-            // 已存在的不记入失败，也从输入框中移除
-            importResult.errors.push(`#${index + 1}: ${email} ${isEn ? 'already exists' : '已存在'}`)
-            return
-          }
-          
-          // 根据 provider 确定 idp 和 authMethod
-          const idpMap: Record<string, 'BuilderId' | 'Enterprise' | 'Github' | 'Google'> = {
-            'BuilderId': 'BuilderId',
-            'Enterprise': 'Enterprise',
-            'Github': 'Github',
-            'Google': 'Google'
-          }
-          const idp = idpMap[provider] || 'BuilderId'
-          // GitHub 和 Google 使用 social 认证方式，BuilderId 和 Enterprise 使用 IdC
-          const authMethod = cred.authMethod || ((provider === 'BuilderId' || provider === 'Enterprise') ? 'IdC' : 'social')
-          
-          const now = Date.now()
-          addAccount({
-            email,
-            password: cred.password,
-            userId,
-            nickname: email ? email.split('@')[0] : undefined,
-            idp,
-            groupId: selectedGroupId,
-            credentials: {
-              accessToken: result.data.accessToken,
-              csrfToken: '',
-              refreshToken: result.data.refreshToken,
-              clientId: cred.clientId || '',
-              clientSecret: cred.clientSecret || '',
-              region: cred.region || 'us-east-1',
-              expiresAt: result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000,
-              authMethod,
-              provider,
-              profileArn: result.data.profileArn
-            },
-            subscription: {
-              type: result.data.subscriptionType as SubscriptionType,
-              title: result.data.subscriptionTitle,
-              daysRemaining: result.data.daysRemaining,
-              expiresAt: result.data.expiresAt,
-              managementTarget: result.data.subscription?.managementTarget,
-              upgradeCapability: result.data.subscription?.upgradeCapability,
-              overageCapability: result.data.subscription?.overageCapability
-            },
-            usage: {
-              current: result.data.usage.current,
-              limit: result.data.usage.limit,
-              percentUsed: result.data.usage.limit > 0 
-                ? result.data.usage.current / result.data.usage.limit 
-                : 0,
-              lastUpdated: now,
-              baseLimit: result.data.usage.baseLimit,
-              baseCurrent: result.data.usage.baseCurrent,
-              freeTrialLimit: result.data.usage.freeTrialLimit,
-              freeTrialCurrent: result.data.usage.freeTrialCurrent,
-              freeTrialExpiry: result.data.usage.freeTrialExpiry,
-              bonuses: result.data.usage.bonuses,
-              nextResetDate: result.data.usage.nextResetDate,
-              resourceDetail: result.data.usage.resourceDetail
-            },
-            tags: [],
-            status: 'active',
-            lastUsedAt: now
-          })
-          
-          importResult.success++
-        } else {
-          importResult.failed++
-          importResult.failedIndices.push(index)
-          const err = result.error as { message?: string } | string | undefined
-          const errorMsg = typeof err === 'object' ? (err?.message || '验证失败') : (err || '验证失败')
-          importResult.errors.push(`#${index + 1}: ${errorMsg}`)
-        }
-      } catch (e) {
-        importResult.failed++
-        importResult.failedIndices.push(index)
-        importResult.errors.push(`#${index + 1}: ${e instanceof Error ? e.message : '导入失败'}`)
-      }
-    }
-
     try {
-      // 并发控制：使用配置的并发数，避免 API 限流
-      const BATCH_SIZE = batchImportConcurrency
-      for (let i = 0; i < credentials.length; i += BATCH_SIZE) {
-        const batch = credentials.slice(i, i + BATCH_SIZE)
-        await Promise.allSettled(
-          batch.map((cred, batchIndex) => importSingleCredential(cred, i + batchIndex))
-        )
-        // 批次间添加短暂延迟，进一步避免限流
-        if (i + BATCH_SIZE < credentials.length) {
-          await new Promise(resolve => setTimeout(resolve, 100))
-        }
-      }
-      
-      setOidcBatchImportResult(importResult)
-      
-      if (importResult.failed === 0) {
-        resetForm()
-        onClose()
-      } else {
-        // 保留失败的凭证在输入框中
-        const failedCredentials = importResult.failedIndices.map(i => credentials[i])
-        if (failedCredentials.length > 0) {
-          if (isKamiFormat) {
-            // 卡密格式：还原为卡密文本
-            const kamiLines = failedCredentials.map(c => 
-              [(c as Record<string, string>)._email || '', c.password || '', c.refreshToken, c.clientId || '', c.clientSecret || '', c.provider || ''].join('----')
-            )
-            setOidcBatchData(kamiLines.join('\n'))
-          } else {
-            setOidcBatchData(JSON.stringify(failedCredentials, null, 2))
-          }
-        }
-        if (importResult.success > 0) {
-          setError(`成功导入 ${importResult.success} 个，失败 ${importResult.failed} 个`)
-        } else {
-          setError(`全部导入失败 (${importResult.failed} 个)`)
-        }
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'OIDC 批量导入失败')
+      const outcome = await importAccountPlan(oidcBatchPlan, selectedGroupId, controller.signal)
+      // A closed/reopened dialog must not receive a previous batch's result.
+      if (oidcImportControllerRef.current !== controller) return
+      setOidcBatchImportResult(outcome)
+    } catch {
+      if (oidcImportControllerRef.current !== controller) return
+      setError(isEn ? 'Batch import could not complete. Your input has been kept.' : '批量导入未能完成，输入内容已保留。')
     } finally {
-      setIsSubmitting(false)
+      if (oidcImportControllerRef.current === controller) {
+        oidcImportControllerRef.current = null
+        setIsSubmitting(false)
+      }
     }
   }
 
@@ -987,23 +791,20 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setIsLoggingIn(false)
     setBuilderIdLoginData(null)
     setCopied(false)
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current)
-      pollIntervalRef.current = null
-    }
+    cancelLoginAttempt()
   }
 
   if (!isOpen) return null
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
-      <div className="absolute inset-0 bg-black/50" onClick={onClose} />
+      <div className="absolute inset-0 bg-black/50" onClick={handleDialogClose} />
 
       <Card className="relative w-full max-w-lg max-h-[90vh] overflow-auto z-10">
         <CardHeader className="pb-4 border-b">
           <div className="flex flex-row items-center justify-between">
             <CardTitle className="text-xl font-bold">{isEn ? 'Add Account' : '添加账号'}</CardTitle>
-            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-red-500 hover:text-white transition-colors" onClick={onClose}>
+            <Button variant="ghost" size="icon" className="h-8 w-8 rounded-full hover:bg-red-500 hover:text-white transition-colors" onClick={handleDialogClose}>
               <X className="h-4 w-4" />
             </Button>
           </div>
@@ -1035,7 +836,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                   : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
               }`}
               onClick={() => { setImportMode('login'); setError(null) }}
-              disabled={!!verifiedData || isLoggingIn}
+              disabled={!!verifiedData || isLoggingIn || isSubmitting}
             >
               {isEn ? 'Login' : '在线登录'}
             </button>
@@ -1046,7 +847,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                   : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
               }`}
               onClick={() => { setImportMode('oidc'); setError(null) }}
-              disabled={!!verifiedData || isLoggingIn}
+              disabled={!!verifiedData || isLoggingIn || isSubmitting}
             >
               {isEn ? 'OIDC Token' : 'OIDC 凭证'}
             </button>
@@ -1057,7 +858,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                   : 'text-muted-foreground hover:text-foreground hover:bg-background/50'
               }`}
               onClick={() => { setImportMode('sso'); setError(null) }}
-              disabled={!!verifiedData || isLoggingIn}
+              disabled={!!verifiedData || isLoggingIn || isSubmitting}
             >
               SSO Token
             </button>
@@ -1518,12 +1319,14 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                     <button
                       className={`px-2.5 py-1 text-xs rounded-md transition-all ${oidcImportMode === 'single' ? 'bg-background shadow-sm font-medium' : 'text-muted-foreground hover:text-foreground'}`}
                       onClick={() => { setOidcImportMode('single'); setOidcBatchImportResult(null) }}
+                      disabled={isSubmitting}
                     >
                       {isEn ? 'Single' : '单个'}
                     </button>
                     <button
                       className={`px-2.5 py-1 text-xs rounded-md transition-all ${oidcImportMode === 'batch' ? 'bg-background shadow-sm font-medium' : 'text-muted-foreground hover:text-foreground'}`}
                       onClick={() => { setOidcImportMode('batch'); setOidcBatchImportResult(null) }}
+                      disabled={isSubmitting}
                     >
                       {isEn ? 'Batch' : '批量'}
                     </button>
@@ -1718,8 +1521,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                 <>
                   <div className="p-3 bg-primary/[0.04] rounded-xl border border-primary/15">
                     <p className="text-xs text-primary">
-                      {isEn ? 'Supports JSON array or Card Key format. JSON required:' : '支持 JSON 数组或卡密格式。JSON 必填:'} <code className="px-1 bg-primary/15 rounded">refreshToken</code>.
-                      {isEn ? 'Card Key format:' : '卡密格式：'} <code className="px-1 bg-primary/15 rounded">{isEn ? 'email----pwd----token----id----secret' : '邮箱----密码----Token----ID----Secret'}</code>
+                      {isEn ? 'Supports account objects, arrays, accounts/data containers, complete backups and Card Key lines. Builder ID requires refreshToken, clientId and clientSecret. Google/Github require an explicit provider.' : '支持单账户、数组、accounts/data 容器、完整备份及卡密行。Builder ID 需 refreshToken、clientId 和 clientSecret；Google/Github 需明确填写 provider。'}
                     </p>
                   </div>
 
@@ -1783,36 +1585,49 @@ email----password----refreshToken----clientId----clientSecret`
 或卡密格式（每行一个）：
 邮箱----密码----RefreshToken----ClientId----ClientSecret`}
                       value={oidcBatchData}
-                      onChange={(e) => { setOidcBatchData(e.target.value); setOidcBatchImportResult(null) }}
+                      onChange={(e) => { setOidcBatchData(e.target.value); setOidcBatchImportResult(null); setError(null) }}
+                      disabled={isSubmitting}
                     />
-                    {oidcBatchData.trim() && (() => {
-                      const val = oidcBatchData.trim()
-                      try {
-                        const parsed = JSON.parse(val)
-                        const count = Array.isArray(parsed) ? parsed.length : 1
-                        return <p className="text-xs text-muted-foreground">{isEn ? `Entered ${count} credentials (JSON)` : `已输入 ${count} 个凭证 (JSON)`}</p>
-                      } catch {
-                        // 尝试卡密格式计数
-                        const kamiLines = val.split('\n').filter(l => l.trim() && !l.startsWith('#'))
-                        if (kamiLines.length > 0 && kamiLines.some(l => l.includes('----') || l.includes('\t') || /\s{2,}/.test(l))) {
-                          return <p className="text-xs text-muted-foreground">{isEn ? `Entered ${kamiLines.length} credentials (Card Key)` : `已输入 ${kamiLines.length} 个凭证 (卡密格式)`}</p>
-                        }
-                        return <p className="text-xs text-destructive">{isEn ? 'Invalid format (JSON or Card Key)' : '格式错误（支持 JSON 或卡密格式）'}</p>
-                      }
-                    })()}
+                    {oidcBatchData.trim() && (
+                      <div className="space-y-1 text-xs" aria-live="polite">
+                        {oidcBatchPlan.error ? (
+                          <p className="text-destructive">{oidcBatchPlan.error.message}</p>
+                        ) : oidcBatchPlan.backup ? (
+                          <p className="text-muted-foreground">{isEn ? `Complete backup: ${oidcBatchPlan.counts.total} accounts; records will be validated as backup data.` : `完整备份：${oidcBatchPlan.counts.total} 个账户，将按备份格式校验。`}</p>
+                        ) : (
+                          <>
+                            <p className="text-muted-foreground">{isEn
+                              ? `Total ${oidcBatchPlan.counts.total} · Valid ${oidcBatchPlan.counts.valid} · Invalid ${oidcBatchPlan.counts.invalid} · Duplicate ${oidcBatchPlan.counts.duplicate}`
+                              : `总数 ${oidcBatchPlan.counts.total} · 有效 ${oidcBatchPlan.counts.valid} · 无效 ${oidcBatchPlan.counts.invalid} · 重复 ${oidcBatchPlan.counts.duplicate}`}</p>
+                            <ul className="space-y-1 max-h-28 overflow-y-auto">
+                              {oidcBatchPlan.records.map(record => (
+                                <li key={record.index} className={record.status === 'invalid' ? 'text-destructive' : 'text-muted-foreground'}>
+                                  #{record.index + 1}: {record.credential ? `${record.credential.provider} / ${record.credential.authMethod}` : (isEn ? 'Invalid record' : '无效记录')}
+                                  {record.issues.length > 0 && ` — ${record.issues.map(issue => issue.message).join('；')}`}
+                                  {record.warnings.length > 0 && ` — ${record.warnings.join('；')}`}
+                                </li>
+                              ))}
+                            </ul>
+                          </>
+                        )}
+                      </div>
+                    )}
                   </div>
 
-                  {/* 批量导入结果 */}
+                  {/* Result stays visible; input remains available for correction and retry. */}
                   {oidcBatchImportResult && (
-                    <div className={`p-3 rounded-lg text-sm ${oidcBatchImportResult.failed > 0 ? 'bg-warning/10 border border-warning/30' : 'bg-success/10 border border-success/30'}`}>
-                      <p className={`font-medium ${oidcBatchImportResult.failed > 0 ? 'text-warning' : 'text-success'}`}>
-                        {isEn ? `Result: ${oidcBatchImportResult.success}/${oidcBatchImportResult.total} succeeded` : `导入结果: 成功 ${oidcBatchImportResult.success}/${oidcBatchImportResult.total}`}
+                    <div role="status" className={`p-3 rounded-lg text-sm ${oidcBatchImportResult.failed + oidcBatchImportResult.invalid + oidcBatchImportResult.cancelled > 0 ? 'bg-warning/10 border border-warning/30' : 'bg-success/10 border border-success/30'}`}>
+                      <p className="font-medium">
+                        {isEn
+                          ? `Total ${oidcBatchImportResult.total} · Added ${oidcBatchImportResult.added} · Duplicate ${oidcBatchImportResult.duplicate} · Invalid ${oidcBatchImportResult.invalid} · Failed ${oidcBatchImportResult.failed} · Cancelled ${oidcBatchImportResult.cancelled}`
+                          : `总数 ${oidcBatchImportResult.total} · 新增 ${oidcBatchImportResult.added} · 重复 ${oidcBatchImportResult.duplicate} · 无效 ${oidcBatchImportResult.invalid} · 失败 ${oidcBatchImportResult.failed} · 取消 ${oidcBatchImportResult.cancelled}`}
                       </p>
                       {oidcBatchImportResult.errors.length > 0 && (
-                        <ul className="mt-2 text-xs text-warning/90 space-y-0.5 max-h-20 overflow-y-auto">
-                          {oidcBatchImportResult.errors.map((err, i) => (
-                            <li key={i}>{err}</li>
-                          ))}
+                        <ul className="mt-2 text-xs text-warning/90 space-y-0.5 max-h-24 overflow-y-auto">
+                          {oidcBatchImportResult.errors.map((issue, index) => {
+                            const record = oidcBatchPlan.records.find(item => item.source === issue.source)
+                            return <li key={index}>{record ? `#${record.index + 1}: ` : ''}{issue.message}</li>
+                          })}
                         </ul>
                       )}
                     </div>
@@ -1830,12 +1645,23 @@ email----password----refreshToken----clientId----clientSecret`
             </div>
           )}
 
+          {loginSavePending && (
+            <Button type="button" variant="outline" onClick={handleRetryLoginSave} disabled={isSubmitting}>
+              {isEn ? 'Retry Saving Added Account' : '重试保存已添加账户'}
+            </Button>
+          )}
+
           {/* 提交按钮 - 只在 OIDC 模式显示 */}
           {importMode === 'oidc' && (
             <div className="flex justify-end gap-3 pt-4 border-t">
-              <Button type="button" variant="outline" onClick={onClose} className="rounded-xl h-10 px-6">
+              <Button type="button" variant="outline" onClick={handleDialogClose} className="rounded-xl h-10 px-6">
                 {isEn ? 'Cancel' : '取消'}
               </Button>
+              {oidcImportMode === 'batch' && isSubmitting && (
+                <Button type="button" variant="outline" onClick={() => oidcImportControllerRef.current?.abort()} className="rounded-xl h-10 px-6">
+                  {isEn ? 'Cancel Import' : '取消导入'}
+                </Button>
+              )}
               {oidcImportMode === 'single' ? (
                 <Button 
                   onClick={handleOidcAdd} 
@@ -1848,7 +1674,7 @@ email----password----refreshToken----clientId----clientSecret`
               ) : (
                 <Button 
                   onClick={handleOidcBatchAdd} 
-                  disabled={isSubmitting || !oidcBatchData.trim()}
+                  disabled={isSubmitting || !oidcBatchPlan.ok || (!oidcBatchPlan.backup && oidcBatchPlan.counts.valid === 0)}
                   className="rounded-xl h-10 px-6"
                 >
                   {isSubmitting ? (
@@ -1857,15 +1683,7 @@ email----password----refreshToken----clientId----clientSecret`
                       {isEn ? 'Importing...' : '正在并发导入...'}
                     </>
                   ) : (
-                    (() => {
-                      try {
-                        const parsed = JSON.parse(oidcBatchData.trim())
-                        const count = Array.isArray(parsed) ? parsed.length : 1
-                        return isEn ? `Batch import ${count} accounts` : `批量导入 ${count} 个账号`
-                      } catch {
-                        return isEn ? 'Batch Import' : '批量导入'
-                      }
-                    })()
+                    (isEn ? `Batch import ${oidcBatchPlan.counts.total} accounts` : `批量导入 ${oidcBatchPlan.counts.total} 个账户`)
                   )}
                 </Button>
               )}
