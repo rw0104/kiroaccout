@@ -43,7 +43,7 @@ npm run typecheck
 npm run build
 ```
 
-已有检出应先检查 `git status --short`，保留其他人的未提交改动；不要为了更新依赖而 reset 或清理目录。`npm ci` 严格使用 lockfile，并保留依赖自身的安装脚本；项目的 `postinstall` 静态检查 Electron 分发文件，并加载 cbor-extract/Koffi 的 Node-API 预编译依赖，不启动桌面客户端。不要用 `--ignore-scripts` 省略 Electron 的安装，也不要强制 `electron-builder install-app-deps` 重编译这些自带 Node-API 的模块。网络不可用时依赖安装不算离线操作。单元测试通过注入响应执行，不请求真实 Kiro 服务。
+已有检出应先检查 `git status --short`，保留其他人的未提交改动；不要为了更新依赖而 reset 或清理目录。`npm ci` 严格使用 lockfile，并保留依赖自身的安装脚本；项目的 `postinstall` 检查 Electron 包元数据，并加载 cbor-extract/Koffi 的 Node-API 预编译依赖，不启动桌面客户端。打包器独立下载 Electron 运行库，运行库和生成产物在打包后检查，不以开发环境的 `electron/path.txt` 为门槛。不要用 `--ignore-scripts` 跳过依赖安装，也不要强制 `electron-builder install-app-deps` 重编译这些自带 Node-API 的模块。网络不可用时依赖安装不算离线操作。单元测试通过注入响应执行，不请求真实 Kiro 服务。
 
 | 命令 | 用途 | 输出或副作用边界 |
 | --- | --- | --- |
