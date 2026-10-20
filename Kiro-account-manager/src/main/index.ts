@@ -31,6 +31,7 @@ import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import { normalizeCredentialRecord } from '../shared/accountImport'
+import { isNewerVersion } from '../shared/version'
 import { LoginSessionManager } from './loginSessions'
 import {
   createTray,
@@ -2636,7 +2637,7 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 手动检查更新（使用 GitHub API，用于 AboutPage）
-  const GITHUB_REPO = 'chaogei/Kiro-account-manager'
+  const GITHUB_REPO = 'rw0104/kiroaccout'
   const GITHUB_API_URL = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`
   
   ipcMain.handle('check-for-updates-manual', async () => {
@@ -2675,20 +2676,7 @@ app.whenReady().then(async () => {
       
       const latestVersion = release.tag_name.replace(/^v/, '')
       
-      // 比较版本号
-      const compareVersions = (v1: string, v2: string): number => {
-        const parts1 = v1.split('.').map(Number)
-        const parts2 = v2.split('.').map(Number)
-        for (let i = 0; i < Math.max(parts1.length, parts2.length); i++) {
-          const p1 = parts1[i] || 0
-          const p2 = parts2[i] || 0
-          if (p1 > p2) return 1
-          if (p1 < p2) return -1
-        }
-        return 0
-      }
-      
-      const hasUpdate = compareVersions(latestVersion, currentVersion) > 0
+      const hasUpdate = isNewerVersion(release.tag_name, currentVersion)
       
       console.log(`[Update] Current: ${currentVersion}, Latest: ${latestVersion}, HasUpdate: ${hasUpdate}`)
       

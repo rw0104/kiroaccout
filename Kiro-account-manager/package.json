@@ -1,6 +1,6 @@
 {
   "name": "kiro-account-manager",
-  "version": "1.7.6",
+  "version": "1.7.6-rc.1",
   "description": "Kiro Account Manager - Manage your Kiro accounts, usage and subscriptions",
   "main": "./out/main/index.js",
   "author": "Kiro",
@@ -18,6 +18,9 @@
     "postinstall": "electron-builder install-app-deps",
     "build:unpack": "npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",
+    "package:win": "electron-builder --win nsis zip --x64 --publish never",
+    "verify:package": "node scripts/verify-windows-package.mjs",
+    "release:checksums": "node scripts/release-checksums.mjs",
     "build:mac": "electron-vite build && electron-builder --mac",
     "build:linux": "electron-vite build && electron-builder --linux",
     "test:unit": "node --disable-warning=ExperimentalWarning --import ./test/unit/register-ts-resolve.mjs --test test/unit/*.test.ts test/unit/*.test.mjs",
