@@ -4,7 +4,7 @@
 
 An Electron desktop Kiro account manager, derived from [chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager) by [chaogei](https://github.com/chaogei). Licensed under [AGPL-3.0](LICENSE).
 
-Development is in progress to fix JSON account imports, OIDC batch input and online login callbacks. Real desktop authentication still requires acceptance testing; this repository does not announce a new release.
+JSON/OIDC import and local authentication-session fixes are merged. [Download the Windows x64 v1.7.6-rc.1 prerelease](https://github.com/rw0104/kiroaccout/releases/tag/v1.7.6-rc.1): installer, ZIP and SHA-256 checksums. Real desktop authentication still requires acceptance testing in an isolated environment.
 
 - [Requirements](docs/2026-10-19-account-import-login/01-requirements.md)
 - [Analysis](docs/2026-10-19-account-import-login/02-analysis.md)

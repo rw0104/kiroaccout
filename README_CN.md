@@ -4,7 +4,7 @@
 
 基于 Electron 的 Kiro 账户管理桌面应用，源自 [chaogei](https://github.com/chaogei) 的 [Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager)，遵循 [AGPL-3.0](LICENSE) 许可证。
 
-当前正在修复账户 JSON 导入、OIDC 批量粘贴及在线登录回调。真实桌面认证仍需验收，本仓库尚未发布本次修复版本。
+JSON/OIDC 导入与登录本地会话修复已合并。[下载 Windows x64 v1.7.6-rc.1 预发布](https://github.com/rw0104/kiroaccout/releases/tag/v1.7.6-rc.1)，包含安装器、ZIP 和 SHA-256 校验清单。真实桌面认证仍需在隔离环境验收。
 
 - [需求文档](docs/2026-10-19-account-import-login/01-requirements.md)
 - [问题分析](docs/2026-10-19-account-import-login/02-analysis.md)
