@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut, autoUpdater as nativeAutoUpdater } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
 import { join } from 'path'
@@ -31,7 +31,8 @@ import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import { normalizeCredentialRecord } from '../shared/accountImport'
-import { isNewerVersion } from '../shared/version'
+import { AppUpdateController, type AppUpdateState, type UpdateEngine } from './appUpdater'
+import { randomUUID } from 'node:crypto'
 import { LoginSessionManager } from './loginSessions'
 import {
   createTray,
@@ -45,59 +46,60 @@ import {
   defaultTraySettings
 } from './tray'
 
-// ============ 自动更新配置 ============
-autoUpdater.autoDownload = false
-autoUpdater.autoInstallOnAppQuit = true
+// ============ 软件自动更新 ============
+let appUpdateController: AppUpdateController | null = null
+let updateInstallSave: { requestId: string; senderId: number; timer: ReturnType<typeof setTimeout>; resolve: () => void; reject: () => void } | null = null
+let updatePoolWasRunning = false
+let updateQuitRequested = false
+nativeAutoUpdater.on('before-quit-for-update', () => { updateQuitRequested = true })
+
+function publishUpdateState(state: AppUpdateState): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.webContents.send('app-update-state', state)
+}
+
+function prepareUpdateInstall(): Promise<void> {
+  const window = mainWindow
+  if (!window || window.isDestroyed()) return Promise.reject(new Error('Window unavailable'))
+  if (updateInstallSave) return Promise.reject(new Error('Save already pending'))
+  return new Promise<void>((resolve, reject) => {
+    const requestId = randomUUID()
+    const timer = setTimeout(() => {
+      if (updateInstallSave?.requestId !== requestId) return
+      updateInstallSave = null
+      reject(new Error('Save acknowledgment timed out'))
+    }, 15000)
+    updateInstallSave = { requestId, senderId: window.webContents.id, timer, resolve, reject: () => reject(new Error('Save failed')) }
+    try { window.webContents.send('app-update-prepare-install', { requestId }) }
+    catch {
+      clearTimeout(timer)
+      updateInstallSave = null
+      reject(new Error('Window unavailable'))
+    }
+  })
+}
 
 function setupAutoUpdater(): void {
-  // 检查更新出错
-  autoUpdater.on('error', (error) => {
-    console.error('[AutoUpdater] Error:', error)
-    mainWindow?.webContents.send('update-error', error.message)
+  if (appUpdateController) return
+  autoUpdater.setFeedURL({ provider: 'github', owner: 'rw0104', repo: 'kiroaccout' })
+  appUpdateController = new AppUpdateController({
+    updater: autoUpdater as unknown as UpdateEngine,
+    enabled: app.isPackaged && process.platform === 'win32',
+    currentVersion: app.getVersion(),
+    notify: publishUpdateState,
+    prepareInstall: prepareUpdateInstall,
+    beforeInstall: () => {
+      updatePoolWasRunning = !!mainPoolRefreshTimer
+      stopMainPoolTokenRefresh()
+      isQuitting = true
+    },
+    installFailed: () => {
+      isQuitting = false
+      if (updatePoolWasRunning) startMainPoolTokenRefresh()
+      updatePoolWasRunning = false
+    }
   })
-
-  // 检查更新中
-  autoUpdater.on('checking-for-update', () => {
-    console.log('[AutoUpdater] Checking for update...')
-    mainWindow?.webContents.send('update-checking')
-  })
-
-  // 有可用更新
-  autoUpdater.on('update-available', (info) => {
-    console.log('[AutoUpdater] Update available:', info.version)
-    mainWindow?.webContents.send('update-available', {
-      version: info.version,
-      releaseDate: info.releaseDate,
-      releaseNotes: info.releaseNotes
-    })
-  })
-
-  // 没有可用更新
-  autoUpdater.on('update-not-available', (info) => {
-    console.log('[AutoUpdater] No update available, current:', info.version)
-    mainWindow?.webContents.send('update-not-available', { version: info.version })
-  })
-
-  // 下载进度
-  autoUpdater.on('download-progress', (progress) => {
-    console.log(`[AutoUpdater] Download progress: ${progress.percent.toFixed(1)}%`)
-    mainWindow?.webContents.send('update-download-progress', {
-      percent: progress.percent,
-      bytesPerSecond: progress.bytesPerSecond,
-      transferred: progress.transferred,
-      total: progress.total
-    })
-  })
-
-  // 下载完成
-  autoUpdater.on('update-downloaded', (info) => {
-    console.log('[AutoUpdater] Update downloaded:', info.version)
-    mainWindow?.webContents.send('update-downloaded', {
-      version: info.version,
-      releaseDate: info.releaseDate,
-      releaseNotes: info.releaseNotes
-    })
-  })
+  appUpdateController.start()
 }
 
 // ============ Kiro API 调用 ============
@@ -2449,14 +2451,8 @@ app.whenReady().then(async () => {
   await loadTraySettings()
   initTray()
 
-  // 初始化自动更新（仅生产环境）
-  if (!is.dev) {
-    setupAutoUpdater()
-    // 启动后延迟检查更新
-    setTimeout(() => {
-      autoUpdater.checkForUpdates().catch(console.error)
-    }, 3000)
-  }
+  // Development exposes a disabled snapshot; packaged Windows clients check after startup.
+  setupAutoUpdater()
 
   // Set app user model id for windows
   electronApp.setAppUserModelId('com.kiro.account-manager')
@@ -2599,108 +2595,31 @@ app.whenReady().then(async () => {
     return app.getVersion()
   })
 
-  // IPC: 检查更新
+  // Update state is queryable so startup notifications are not lost while the renderer loads.
+  ipcMain.handle('get-app-update-state', () => appUpdateController!.getState())
   ipcMain.handle('check-for-updates', async () => {
-    if (is.dev) {
-      return { hasUpdate: false, message: '开发环境不支持更新检查' }
-    }
-    try {
-      const result = await autoUpdater.checkForUpdates()
-      return {
-        hasUpdate: !!result?.updateInfo,
-        version: result?.updateInfo?.version,
-        releaseDate: result?.updateInfo?.releaseDate
-      }
-    } catch (error) {
-      console.error('[AutoUpdater] Check failed:', error)
-      return { hasUpdate: false, error: error instanceof Error ? error.message : 'Unknown error' }
-    }
+    const state = await appUpdateController!.check()
+    return { hasUpdate: ['available', 'downloading', 'downloaded'].includes(state.status), version: state.version,
+      releaseDate: state.releaseDate, error: state.error, state }
   })
-
-  // IPC: 下载更新
-  ipcMain.handle('download-update', async () => {
-    if (is.dev) {
-      return { success: false, message: '开发环境不支持更新' }
-    }
-    try {
-      await autoUpdater.downloadUpdate()
-      return { success: true }
-    } catch (error) {
-      console.error('[AutoUpdater] Download failed:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
-    }
-  })
-
-  // IPC: 安装更新并重启
-  ipcMain.handle('install-update', () => {
-    autoUpdater.quitAndInstall(false, true)
-  })
-
-  // IPC: 手动检查更新（使用 GitHub API，用于 AboutPage）
-  const GITHUB_REPO = 'rw0104/kiroaccout'
-  const GITHUB_API_URL = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`
-  
   ipcMain.handle('check-for-updates-manual', async () => {
-    try {
-      console.log('[Update] Manual check via GitHub API...')
-      const currentVersion = app.getVersion()
-      
-      const response = await fetchWithAppProxy(GITHUB_API_URL, {
-        headers: {
-          'Accept': 'application/vnd.github.v3+json',
-          'User-Agent': 'Kiro-Account-Manager'
-        }
-      })
-      
-      if (!response.ok) {
-        if (response.status === 403) {
-          throw new Error('GitHub API 请求次数超限，请稍后再试')
-        } else if (response.status === 404) {
-          throw new Error('未找到发布版本')
-        }
-        throw new Error(`GitHub API 错误: ${response.status}`)
-      }
-      
-      const release = await response.json() as {
-        tag_name: string
-        name: string
-        body: string
-        html_url: string
-        published_at: string
-        assets: Array<{
-          name: string
-          browser_download_url: string
-          size: number
-        }>
-      }
-      
-      const latestVersion = release.tag_name.replace(/^v/, '')
-      
-      const hasUpdate = isNewerVersion(release.tag_name, currentVersion)
-      
-      console.log(`[Update] Current: ${currentVersion}, Latest: ${latestVersion}, HasUpdate: ${hasUpdate}`)
-      
-      return {
-        hasUpdate,
-        currentVersion,
-        latestVersion,
-        releaseNotes: release.body || '',
-        releaseName: release.name || `v${latestVersion}`,
-        releaseUrl: release.html_url,
-        publishedAt: release.published_at,
-        assets: release.assets.map(a => ({
-          name: a.name,
-          downloadUrl: a.browser_download_url,
-          size: a.size
-        }))
-      }
-    } catch (error) {
-      console.error('[Update] Manual check failed:', error)
-      return {
-        hasUpdate: false,
-        error: error instanceof Error ? error.message : '检查更新失败'
-      }
-    }
+    const state = await appUpdateController!.check()
+    return { hasUpdate: ['available', 'downloading', 'downloaded'].includes(state.status), currentVersion: state.currentVersion,
+      latestVersion: state.version, releaseNotes: state.releaseNotes, releaseUrl: 'https://github.com/rw0104/kiroaccout/releases',
+      error: state.error, state }
+  })
+  ipcMain.handle('download-update', () => appUpdateController!.download())
+  ipcMain.handle('install-update', () => appUpdateController!.install())
+  ipcMain.on('show-app-update-dialog', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('show-app-update-dialog')
+  })
+  ipcMain.on('confirm-app-update-save', (event, response: { requestId?: unknown; success?: unknown }) => {
+    const pending = updateInstallSave
+    if (!pending || event.sender.id !== pending.senderId || response?.requestId !== pending.requestId) return
+    clearTimeout(pending.timer)
+    updateInstallSave = null
+    if (response.success === true) pending.resolve()
+    else pending.reject()
   })
 
   // ============ 一键诊断 ============
@@ -6707,6 +6626,21 @@ app.on('open-url', (_event, url) => {
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
     app.quit()
+  }
+})
+
+app.on('before-quit', (event) => {
+  if (updateQuitRequested && !appUpdateController?.canQuitForUpdate()) {
+    updateQuitRequested = false
+    event.preventDefault()
+    return
+  }
+  updateQuitRequested = false
+  appUpdateController?.dispose()
+  if (updateInstallSave) {
+    clearTimeout(updateInstallSave.timer)
+    updateInstallSave.reject()
+    updateInstallSave = null
   }
 })
 

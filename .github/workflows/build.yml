@@ -47,14 +47,13 @@ jobs:
         run: npm run verify:package
       - name: Generate exact artifact checksums
         run: npm run release:checksums
+      - name: Stage exact assets for release channel
+        run: npm run release:stage
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64-release
           if-no-files-found: error
-          path: |
-            Kiro-account-manager/dist/*-x64-setup.exe
-            Kiro-account-manager/dist/*-x64-windows.zip
-            Kiro-account-manager/dist/SHA256SUMS.txt
+          path: Kiro-account-manager/dist/release-assets/${{ steps.version.outputs.version }}/*
 
   release:
     needs: build
@@ -93,9 +92,10 @@ jobs:
             echo "Release already exists: $RELEASE_TAG"
             exit 1
           fi
-          flags=(--latest=false)
-          if [[ "$PRERELEASE" == "true" ]]; then flags+=(--prerelease); fi
-          gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --draft "${flags[@]}" \
+          flags=(--latest=true)
+          draft_flags=(--latest=false)
+          if [[ "$PRERELEASE" == "true" ]]; then flags=(--latest=false --prerelease); draft_flags+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --draft "${draft_flags[@]}" \
             --title "kiroaccout $RELEASE_VERSION · Windows x64" \
             --notes-file "docs/releases/$RELEASE_TAG.md" \
             release-assets/*

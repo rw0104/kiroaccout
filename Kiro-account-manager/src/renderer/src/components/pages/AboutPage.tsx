@@ -1,72 +1,24 @@
 import { useState, useEffect } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, Button } from '../ui'
-import { Github, Heart, Code, ExternalLink, User, Coffee, MessageCircle, X, RefreshCw, Download, CheckCircle, AlertCircle, Info, Zap } from 'lucide-react'
+import { Github, Code, ExternalLink, RefreshCw, Info, Zap } from 'lucide-react'
 import kiroLogo from '@/assets/kiro-high-resolution-logo-transparent.png'
-import alipayQR from '@/assets/支付宝支付.png'
-import wechatQR from '@/assets/微信支付.png'
-import groupQR from '@/assets/交流群.png'
-import authorAvatar from '@/assets/author-avatar.png'
 import { useAccountsStore } from '@/store/accounts'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
 
-interface UpdateInfo {
-  hasUpdate: boolean
-  currentVersion?: string
-  latestVersion?: string
-  releaseNotes?: string
-  releaseName?: string
-  releaseUrl?: string
-  publishedAt?: string
-  assets?: Array<{
-    name: string
-    downloadUrl: string
-    size: number
-  }>
-  error?: string
-}
-
 export function AboutPage() {
   const [version, setVersion] = useState('...')
-  const [showGroupQR, setShowGroupQR] = useState(false)
-  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false)
-  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
-  const [showUpdateModal, setShowUpdateModal] = useState(false)
   const { darkMode } = useAccountsStore()
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
 
   useEffect(() => {
     window.api.getAppVersion().then(setVersion)
-    // 不自动检查更新，避免 GitHub API 速率限制
-    // 用户可以手动点击"检查更新"按钮
   }, [])
 
-  const checkForUpdates = async (showModal = true) => {
-    setIsCheckingUpdate(true)
-    try {
-      const result = await window.api.checkForUpdatesManual()
-      setUpdateInfo(result)
-      if (showModal || result.hasUpdate) {
-        setShowUpdateModal(true)
-      }
-    } catch (error) {
-      console.error('Check update failed:', error)
-    } finally {
-      setIsCheckingUpdate(false)
-    }
-  }
-
-  const openReleasePage = () => {
-    if (updateInfo?.releaseUrl) {
-      window.api.openExternal(updateInfo.releaseUrl)
-    }
-  }
-
-  const formatFileSize = (bytes: number) => {
-    if (bytes < 1024) return bytes + ' B'
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
+  const checkForUpdates = () => {
+    window.api.showAppUpdateDialog()
+    void window.api.checkForUpdates().catch(() => {})
   }
 
   return (
@@ -90,161 +42,15 @@ export function AboutPage() {
             variant="outline"
             size="sm"
             className="gap-2"
-            onClick={() => checkForUpdates(true)}
-            disabled={isCheckingUpdate}
+            onClick={checkForUpdates}
           >
-            <RefreshCw className={cn("h-4 w-4", isCheckingUpdate && "animate-spin")} />
-            {isCheckingUpdate ? (isEn ? 'Checking...' : '检查中...') : (isEn ? 'Check Updates' : '检查更新')}
-          </Button>
-          <Button
-            variant="outline"
-            size="sm"
-            className="gap-2"
-            onClick={() => setShowGroupQR(true)}
-          >
-            <MessageCircle className="h-4 w-4" />
-            {isEn ? 'Join Group' : '加入交流群'}
+            <RefreshCw className="h-4 w-4" />
+            {isEn ? 'Check Updates' : '检查更新'}
           </Button>
         </div>
         
-        {/* 更新提示 */}
-        {updateInfo?.hasUpdate && !showUpdateModal && (
-          <div 
-            className="inline-flex items-center gap-2 px-3 py-1.5 bg-primary/10 text-primary rounded-full text-sm cursor-pointer hover:bg-primary/20"
-            onClick={() => setShowUpdateModal(true)}
-          >
-            <Download className="h-4 w-4" />
-            {isEn ? `New version v${updateInfo.latestVersion}` : `发现新版本 v${updateInfo.latestVersion}`}
-          </div>
-        )}
         </div>
       </div>
-
-      {/* 更新弹窗 */}
-      {showUpdateModal && updateInfo && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/50" onClick={() => setShowUpdateModal(false)} />
-          <div className="relative bg-card rounded-xl p-6 shadow-xl z-10 max-w-md w-full mx-4 max-h-[80vh] overflow-y-auto">
-            <button
-              className="absolute top-3 right-3 text-muted-foreground hover:text-foreground"
-              onClick={() => setShowUpdateModal(false)}
-            >
-              <X className="h-5 w-5" />
-            </button>
-            
-            <div className="space-y-4">
-              {updateInfo.hasUpdate ? (
-                <>
-                  <div className="flex items-center gap-3">
-                    <div className="p-2 rounded-full bg-success/10">
-                      <Download className="h-6 w-6 text-success" />
-                    </div>
-                    <div>
-                      <h3 className="font-semibold text-lg">{isEn ? 'New Version Available' : '发现新版本'}</h3>
-                      <p className="text-sm text-muted-foreground">
-                        {updateInfo.currentVersion} → {updateInfo.latestVersion}
-                      </p>
-                    </div>
-                  </div>
-                  
-                  <div className="bg-muted/50 rounded-lg p-3">
-                    <p className="text-sm font-medium mb-2">{updateInfo.releaseName}</p>
-                    {updateInfo.publishedAt && (
-                      <p className="text-xs text-muted-foreground">
-                        {isEn ? `Released: ${new Date(updateInfo.publishedAt).toLocaleDateString('en-US')}` : `发布时间: ${new Date(updateInfo.publishedAt).toLocaleDateString('zh-CN')}`}
-                      </p>
-                    )}
-                  </div>
-                  
-                  {updateInfo.releaseNotes && (
-                    <div className="space-y-2">
-                      <p className="text-sm font-medium">{isEn ? 'Release Notes:' : '更新内容:'}</p>
-                      <div className="text-sm text-muted-foreground bg-muted/30 rounded-lg p-3 max-h-32 overflow-y-auto whitespace-pre-wrap">
-                        {updateInfo.releaseNotes}
-                      </div>
-                    </div>
-                  )}
-                  
-                  {updateInfo.assets && updateInfo.assets.length > 0 && (
-                    <div className="space-y-2">
-                      <p className="text-sm font-medium">{isEn ? 'Download Files:' : '下载文件:'}</p>
-                      <div className="space-y-1 max-h-32 overflow-y-auto">
-                        {updateInfo.assets.slice(0, 6).map((asset, i) => (
-                          <div key={i} className="flex items-center justify-between text-xs bg-muted/30 rounded px-2 py-1">
-                            <span className="truncate flex-1">{asset.name}</span>
-                            <span className="text-muted-foreground ml-2">{formatFileSize(asset.size)}</span>
-                          </div>
-                        ))}
-                        {updateInfo.assets.length > 6 && (
-                          <p className="text-xs text-muted-foreground text-center">
-                            {isEn ? `${updateInfo.assets.length - 6} more files...` : `还有 ${updateInfo.assets.length - 6} 个文件...`}
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                  )}
-                  
-                  <Button className="w-full gap-2" onClick={openReleasePage}>
-                    <ExternalLink className="h-4 w-4" />
-                    {isEn ? 'Go to Download Page' : '前往下载页面'}
-                  </Button>
-                </>
-              ) : updateInfo.error ? (
-                <>
-                  <div className="flex items-center gap-3">
-                    <div className="p-2 rounded-full bg-red-500/10">
-                      <AlertCircle className="h-6 w-6 text-red-500" />
-                    </div>
-                    <div>
-                      <h3 className="font-semibold text-lg">{isEn ? 'Check Failed' : '检查更新失败'}</h3>
-                      <p className="text-sm text-muted-foreground">{updateInfo.error}</p>
-                    </div>
-                  </div>
-                  <Button variant="outline" className="w-full" onClick={() => checkForUpdates(true)}>
-                    {isEn ? 'Retry' : '重试'}
-                  </Button>
-                </>
-              ) : (
-                <>
-                  <div className="flex items-center gap-3">
-                    <div className="p-2 rounded-full bg-success/10">
-                      <CheckCircle className="h-6 w-6 text-success" />
-                    </div>
-                    <div>
-                      <h3 className="font-semibold text-lg">{isEn ? 'Up to Date' : '已是最新版本'}</h3>
-                      <p className="text-sm text-muted-foreground">
-                        {isEn ? `Version v${updateInfo.currentVersion} is the latest` : `当前版本 v${updateInfo.currentVersion} 已经是最新的了`}
-                      </p>
-                    </div>
-                  </div>
-                </>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* 交流群弹窗 */}
-      {showGroupQR && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/50" onClick={() => setShowGroupQR(false)} />
-          <div className="relative bg-card rounded-xl p-6 shadow-xl z-10">
-            <button
-              className="absolute top-3 right-3 text-muted-foreground hover:text-foreground"
-              onClick={() => setShowGroupQR(false)}
-            >
-              <X className="h-5 w-5" />
-            </button>
-            <div className="text-center space-y-3">
-              <h3 className="font-semibold text-lg">{isEn ? 'Join Group' : '扫码加入交流群'}</h3>
-              <div className="bg-[#07C160]/5 rounded-xl p-3 border border-[#07C160]/20">
-                <img src={groupQR} alt="Group" className="w-48 h-48 object-contain" />
-              </div>
-              <p className="text-sm text-muted-foreground">{isEn ? 'Scan with WeChat' : 'QQ 扫码加入'}</p>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Description */}
       <Card className="hover-lift">
@@ -259,13 +65,13 @@ export function AboutPage() {
         <CardContent className="text-sm text-muted-foreground space-y-3">
           <p>
             {isEn 
-              ? 'Kiro Account Manager is a powerful multi-account management tool for Kiro IDE. It supports quick account switching, auto token refresh, group/tag management, and machine ID management.'
-              : 'Kiro 账户管理器是一个功能强大的 Kiro IDE 多账号管理工具。支持多账号快速切换、自动 Token 刷新、分组标签管理、机器码管理等功能，帮助你高效管理和使用多个 Kiro 账号。'}
+              ? 'Kiro Account Manager manages Kiro accounts, imports account credentials, and organizes accounts with groups and tags.'
+              : 'Kiro 账户管理器用于管理 Kiro 账号、导入账号凭证，以及按分组和标签整理账号。'}
           </p>
           <p>
             {isEn 
-              ? 'Built with Electron + React + TypeScript, supporting Windows, macOS and Linux. All data is stored locally to protect your privacy.'
-              : '本应用使用 Electron + React + TypeScript 开发，支持 Windows、macOS 和 Linux 平台。所有数据均存储在本地，保护你的隐私安全。'}
+              ? 'Built with Electron, React and TypeScript. Account data is saved locally; authentication and account checks connect to the relevant services. Current release packages target Windows x64.'
+              : '使用 Electron、React 和 TypeScript 开发。账号资料保存在本地，登录和账号校验需要连接相关服务。当前提供 Windows x64 安装包。'}
           </p>
         </CardContent>
       </Card>
@@ -308,7 +114,7 @@ export function AboutPage() {
             </li>
             <li className="flex items-start gap-2">
               <span className="text-primary mt-0.5">✓</span>
-              <strong>{isEn ? 'Machine ID' : '机器码管理'}</strong>{isEn ? ': Modify device identifier' : '：修改设备标识符，防止账号关联封禁'}
+              <strong>{isEn ? 'Machine ID' : '机器码管理'}</strong>{isEn ? ': Modify device identifier' : '：读取与管理设备标识符'}
             </li>
             <li className="flex items-start gap-2">
               <span className="text-primary mt-0.5">✓</span>
@@ -328,7 +134,7 @@ export function AboutPage() {
             </li>
             <li className="flex items-start gap-2">
               <span className="text-primary mt-0.5">✓</span>
-              <strong>{isEn ? 'Themes' : '主题定制'}</strong>{isEn ? ': 32 colors, dark/light mode' : '：32 种主题颜色，深色/浅色模式'}
+              <strong>{isEn ? 'Themes' : '主题定制'}</strong>{isEn ? ': Theme colors and dark/light mode' : '：主题颜色与深色/浅色模式'}
             </li>
           </ul>
         </CardContent>
@@ -358,76 +164,37 @@ export function AboutPage() {
         </CardContent>
       </Card>
 
-      {/* Author */}
+      {/* Project links */}
       <Card className="hover-lift">
         <CardHeader className="pb-2">
           <CardTitle className="text-base flex items-center gap-3">
             <div className="p-2 rounded-lg bg-primary/10">
-              <User className="h-4 w-4 text-primary" />
+              <Github className="h-4 w-4 text-primary" />
             </div>
-            {isEn ? 'Author' : '作者'}
+            {isEn ? 'Open-source project' : '开源项目'}
           </CardTitle>
         </CardHeader>
-        <CardContent>
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
-              <img 
-                src={authorAvatar}
-                alt="chaogei666"
-                className="w-10 h-10 rounded-full"
-              />
-              <p className="font-medium">chaogei666</p>
-            </div>
-            <a 
-              href="https://github.com/chaogei/Kiro-account-manager" 
-              target="_blank" 
-              rel="noopener noreferrer"
-              className="flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors px-3 py-1.5 rounded-lg hover:bg-muted"
-            >
-              <Github className="h-4 w-4" />
-              GitHub
-              <ExternalLink className="h-3 w-3" />
-            </a>
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* Sponsor */}
-      <Card className="hover-lift">
-        <CardHeader className="pb-2">
-          <CardTitle className="text-base flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-primary/10">
-              <Coffee className="h-4 w-4 text-primary" />
-            </div>
-            {isEn ? 'Sponsor' : '赞助支持'}
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <p className="text-sm text-muted-foreground mb-4">
-            {isEn ? 'If this project helps you, buy me a coffee ☕' : '如果这个项目对你有帮助，可以请作者喝杯咖啡 ☕'}
+        <CardContent className="space-y-3">
+          <p className="text-sm text-muted-foreground">
+            {isEn ? 'Repository: rw0104/kiroaccout · License: AGPL-3.0' : '项目仓库：rw0104/kiroaccout · 许可证：AGPL-3.0'}
           </p>
-          <div className="grid grid-cols-2 gap-4">
-            <div className="text-center space-y-2">
-              <div className="bg-[#1677FF]/5 rounded-xl p-3 border border-[#1677FF]/20">
-                <img src={alipayQR} alt="Alipay" className="w-full aspect-square object-contain rounded-lg" />
-              </div>
-              <p className="text-sm font-medium text-[#1677FF]">{isEn ? 'Alipay' : '支付宝'}</p>
-            </div>
-            <div className="text-center space-y-2">
-              <div className="bg-[#07C160]/5 rounded-xl p-3 border border-[#07C160]/20">
-                <img src={wechatQR} alt="WeChat Pay" className="w-full aspect-square object-contain rounded-lg" />
-              </div>
-              <p className="text-sm font-medium text-[#07C160]">{isEn ? 'WeChat Pay' : '微信支付'}</p>
-            </div>
+          <div className="flex gap-2 flex-wrap">
+            <Button variant="outline" size="sm" className="gap-2" onClick={() => window.api.openExternal('https://github.com/rw0104/kiroaccout')}>
+              <Github className="h-4 w-4" />
+              {isEn ? 'Source code' : '开源代码'}
+              <ExternalLink className="h-3 w-3" />
+            </Button>
+            <Button variant="outline" size="sm" className="gap-2" onClick={() => window.api.openExternal('https://github.com/rw0104/kiroaccout/issues')}>
+              {isEn ? 'Report an issue' : '反馈问题'}
+              <ExternalLink className="h-3 w-3" />
+            </Button>
           </div>
         </CardContent>
       </Card>
 
       {/* Footer */}
       <div className="text-center text-xs text-muted-foreground py-4">
-        <p className="flex items-center justify-center gap-1">
-          Made with <Heart className="h-3 w-3 text-primary" /> for Kiro users
-        </p>
+        <p>kiroaccout · AGPL-3.0</p>
       </div>
     </div>
   )

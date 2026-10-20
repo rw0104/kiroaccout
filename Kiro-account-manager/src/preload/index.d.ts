@@ -1,3 +1,4 @@
+import type { AppUpdateState, UpdateActionResult } from '../main/appUpdater'
 import type { LoginResult, SocialLoginCallback } from '../main/loginSessions'
 import { ElectronAPI } from '@electron-toolkit/preload'
 
@@ -438,45 +439,16 @@ interface KiroApi {
 
   // ============ 自动更新 API ============
 
-  // 检查更新 (electron-updater)
-  checkForUpdates: () => Promise<{
-    hasUpdate: boolean
-    version?: string
-    releaseDate?: string
-    message?: string
-    error?: string
-  }>
-
-  // 手动检查更新 (GitHub API, 用于 AboutPage)
-  checkForUpdatesManual: () => Promise<{
-    hasUpdate: boolean
-    currentVersion?: string
-    latestVersion?: string
-    releaseNotes?: string
-    releaseName?: string
-    releaseUrl?: string
-    publishedAt?: string
-    assets?: Array<{
-      name: string
-      downloadUrl: string
-      size: number
-    }>
-    error?: string
-  }>
-
-  // 下载更新
-  downloadUpdate: () => Promise<{ success: boolean; error?: string }>
-
-  // 安装更新并重启
-  installUpdate: () => Promise<void>
-
-  // 监听更新事件
-  onUpdateChecking: (callback: () => void) => () => void
-  onUpdateAvailable: (callback: (info: { version: string; releaseDate?: string; releaseNotes?: string }) => void) => () => void
-  onUpdateNotAvailable: (callback: (info: { version: string }) => void) => () => void
-  onUpdateDownloadProgress: (callback: (progress: { percent: number; bytesPerSecond: number; transferred: number; total: number }) => void) => () => void
-  onUpdateDownloaded: (callback: (info: { version: string; releaseDate?: string; releaseNotes?: string }) => void) => () => void
-  onUpdateError: (callback: (error: string) => void) => () => void
+  getAppUpdateState: () => Promise<AppUpdateState>
+  checkForUpdates: () => Promise<{ hasUpdate: boolean; version?: string; error?: string; state: AppUpdateState }>
+  checkForUpdatesManual: () => Promise<{ hasUpdate: boolean; currentVersion: string; latestVersion?: string; error?: string; state: AppUpdateState }>
+  downloadUpdate: () => Promise<UpdateActionResult>
+  installUpdate: () => Promise<UpdateActionResult>
+  showAppUpdateDialog: () => void
+  confirmAppUpdateSave: (requestId: string, success: boolean) => void
+  onAppUpdateState: (callback: (state: AppUpdateState) => void) => () => void
+  onShowAppUpdateDialog: (callback: () => void) => () => void
+  onPrepareAppUpdateInstall: (callback: (requestId: string) => void) => () => void
 
   // ============ Kiro 设置管理 API ============
 

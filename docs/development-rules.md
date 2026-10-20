@@ -4,9 +4,7 @@
 
 ## 1. 当前隔离状态
 
-修复源码位于 `D:\kiroaccout\Kiro-account-manager`，用户的 1.7.5 安装位于 `D:\kiro-account-manager`。本轮只读取进程元数据、文件版本和路径，没有操作客户端、认证缓存或协议注册。
-
-该次观测到主进程 PID 为 14256，文件版本为 1.7.5，userData 为 `C:\Users\reki\AppData\Roaming\kiro-account-manager`。PID 仅为当次观测记录，后续必须按可执行路径重新识别。
+修复源码位于当前 Git 检出目录，既有 1.7.5 的安装和数据目录是生产保护对象。只读识别可执行路径与版本；实际安装位置、用户名及进程 ID 不写入公开文档。应用数据目录用 `%APPDATA%\kiro-account-manager` 表示。
 
 当前使用的隔离方式为：**独立源码目录 + 不启动开发客户端 + mock 的离线验证**。当前没有经过验证的 Electron 隔离运行模式，真实 GUI 和授权测试尚未进入。
 

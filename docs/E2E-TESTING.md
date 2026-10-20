@@ -77,7 +77,7 @@ ZS_TOKEN=sk-xxx npm run test:e2e
 
 ## 适配自 ZephyrSail
 
-本套件复刻自 ZephyrSail E2E 套件 (`F:\Trace\analysis\ZephyrSail\test\e2e-fullsuite`)，针对 Kiro 反代做以下调整：
+本套件参考 ZephyrSail E2E 套件，针对 Kiro 反代做以下调整；公开文档不记录原开发机器的目录：
 
 1. **默认模型**: `claude-opus-4-7-max` → `claude-sonnet-4.5` (Kiro 官方支持)
 2. **CASE 01 probe**: 移除 < 2s 本地拦截硬性断言 (Kiro 反代未实现 probe-intercept，请求会真实打上游)
