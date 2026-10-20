@@ -1,3 +1,4 @@
+import type { LoginResult, SocialLoginCallback } from '../main/loginSessions'
 import { ElectronAPI } from '@electron-toolkit/preload'
 
 interface AccountData {
@@ -379,85 +380,18 @@ interface KiroApi {
     error?: { message: string }
   }>
 
-  // ============ 手动登录 API ============
-
-  // 启动 Builder ID 手动登录
-  startBuilderIdLogin: (region?: string) => Promise<{
-    success: boolean
-    userCode?: string
-    verificationUri?: string
-    expiresIn?: number
-    interval?: number
-    error?: string
-  }>
-
-  // 轮询 Builder ID 授权状态
-  pollBuilderIdAuth: (region?: string) => Promise<{
-    success: boolean
-    completed?: boolean
-    status?: string
-    accessToken?: string
-    refreshToken?: string
-    clientId?: string
-    clientSecret?: string
-    region?: string
-    expiresIn?: number
-    error?: string
-  }>
-
-  // 取消 Builder ID 登录
-  cancelBuilderIdLogin: () => Promise<{ success: boolean }>
-
-  // 启动 IAM Identity Center SSO 登录 (Authorization Code flow)
-  startIamSsoLogin: (startUrl: string, region?: string) => Promise<{
-    success: boolean
-    authorizeUrl?: string
-    expiresIn?: number
-    error?: string
-  }>
-
-  // 轮询 IAM SSO 授权状态
-  pollIamSsoAuth: (region?: string) => Promise<{
-    success: boolean
-    completed?: boolean
-    status?: string
-    accessToken?: string
-    refreshToken?: string
-    clientId?: string
-    clientSecret?: string
-    region?: string
-    expiresIn?: number
-    error?: string
-  }>
-
-  // 取消 IAM SSO 登录
-  cancelIamSsoLogin: () => Promise<{ success: boolean }>
-
-  // 启动 Social Auth 登录 (Google/GitHub)
-  startSocialLogin: (provider: 'Google' | 'Github', usePrivateMode?: boolean) => Promise<{
-    success: boolean
-    loginUrl?: string
-    state?: string
-    error?: string
-  }>
-
-  // 交换 Social Auth token
-  exchangeSocialToken: (code: string, state: string) => Promise<{
-    success: boolean
-    accessToken?: string
-    refreshToken?: string
-    profileArn?: string
-    expiresIn?: number
-    authMethod?: string
-    provider?: string
-    error?: string
-  }>
-
-  // 取消 Social Auth 登录
-  cancelSocialLogin: () => Promise<{ success: boolean }>
-
-  // 监听 Social Auth 回调
-  onSocialAuthCallback: (callback: (data: { code?: string; state?: string; error?: string }) => void) => () => void
+  // Every login operation is bound to the caller's session, including cancellation during start.
+  startBuilderIdLogin: (region: string, sessionId: string) => Promise<LoginResult>
+  pollBuilderIdAuth: (sessionId: string) => Promise<LoginResult>
+  cancelBuilderIdLogin: (sessionId: string) => Promise<{ success: boolean }>
+  startIamSsoLogin: (startUrl: string, region: string, sessionId: string) => Promise<LoginResult>
+  pollIamSsoAuth: (sessionId: string) => Promise<LoginResult>
+  cancelIamSsoLogin: (sessionId: string) => Promise<{ success: boolean }>
+  startSocialLogin: (provider: 'Google' | 'Github', usePrivateMode: boolean, sessionId: string) => Promise<LoginResult>
+  exchangeSocialToken: (code: string, state: string, sessionId: string) => Promise<LoginResult>
+  getSocialAuthCallback: (sessionId: string) => Promise<SocialLoginCallback | null>
+  cancelSocialLogin: (sessionId: string) => Promise<{ success: boolean }>
+  onSocialAuthCallback: (callback: (data: SocialLoginCallback) => void) => () => void
 
   // 代理设置
   setProxy: (enabled: boolean, url: string) => Promise<{ success: boolean; error?: string; normalizedUrl?: string }>

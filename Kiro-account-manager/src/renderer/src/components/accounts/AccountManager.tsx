@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import { AccountToolbar, type AccountViewMode } from './AccountToolbar'
@@ -11,7 +11,8 @@ import { TagManageDialog } from './TagManageDialog'
 import { ExportDialog } from './ExportDialog'
 import { Button } from '../ui'
 import type { Account } from '@/types/account'
-import { splitCredentialLine } from '@/lib/utils'
+import { parseAccountImportText } from '../../../../shared/accountImport'
+import { formatImportOutcome } from '../../utils/accountImport'
 import { ArrowLeft, Loader2, Users } from 'lucide-react'
 
 interface AccountManagerProps {
@@ -22,8 +23,7 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
   const {
     isLoading,
     accounts,
-    importFromExportData,
-    importAccounts,
+    importAccountPlan,
     selectedIds,
     activeGroupTab,
     groups
@@ -86,124 +86,44 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
     return result
   }
 
+  const importInFlight = useRef(false)
+
   // 导入
   const handleImport = async (): Promise<void> => {
-    // 文件导入归入"当前打开的分组"（activeGroupTab 为真实分组时），否则未分组
-    const currentGroupId = (activeGroupTab !== 'all' && activeGroupTab !== 'ungrouped' && groups.has(activeGroupTab)) ? activeGroupTab : undefined
-    const groupName = currentGroupId ? (groups.get(currentGroupId)?.name ?? '未分组') : '未分组'
-    const fileData = await window.api.importFromFile()
-
-    if (!fileData) return
-
-    const { content, format } = fileData
-
+    if (importInFlight.current) return
+    importInFlight.current = true
     try {
-      if (format === 'json') {
-        // JSON 格式：完整导出数据
-        const data = JSON.parse(content)
-        if (data.version && data.accounts) {
-          const result = importFromExportData(data)
-          const skippedInfo = result.errors.find(e => e.id === 'skipped')
-          const skippedMsg = skippedInfo ? `，${skippedInfo.error}` : ''
-          alert(`导入完成：成功 ${result.success} 个${skippedMsg}`)
-        } else {
-          alert('无效的 JSON 文件格式')
-        }
-      } else if (format === 'csv') {
-        // CSV 格式：邮箱,昵称,登录方式,RefreshToken,ClientId,ClientSecret,Region
-        const lines = content.split('\n').filter(line => line.trim())
-        if (lines.length < 2) {
-          alert('CSV 文件为空或只有标题行')
-          return
-        }
-
-        // 跳过标题行，解析数据行
-        const items = lines.slice(1).map(line => {
+      const fileData = await window.api.importFromFile()
+      if (!fileData) return
+      const currentGroupId = groups.has(activeGroupTab) ? activeGroupTab : undefined
+      const { content, format } = fileData
+      let input = content
+      if (format === 'csv') {
+        const rows = content.replace(/^\uFEFF/, '').split(/\r?\n/).filter(line => line.trim())
+        if (rows.length < 2) { alert('CSV 文件为空或只有标题行'); return }
+        input = JSON.stringify(rows.slice(1).map(line => {
           const cols = parseCSVLine(line)
-          return {
-            email: cols[0] || '',
-            nickname: cols[1] || undefined,
-            idp: cols[2] || 'Google',
-            refreshToken: cols[3] || '',
-            clientId: cols[4] || '',
-            clientSecret: cols[5] || '',
-            region: cols[6] || 'us-east-1',
-            groupId: currentGroupId
-          }
-        }).filter(item => item.email && item.refreshToken)
-
-        if (items.length === 0) {
-          alert('未找到有效的账号数据（需要邮箱和 RefreshToken）')
-          return
-        }
-
-        const result = importAccounts(items)
-        alert(`导入完成：成功 ${result.success} 个，失败 ${result.failed} 个（分组：${groupName}）`)
+          return { email: cols[0], nickname: cols[1], provider: cols[2] || undefined,
+            refreshToken: cols[3], clientId: cols[4], clientSecret: cols[5], region: cols[6] || 'us-east-1' }
+        }))
       } else if (format === 'txt') {
-        // TXT 格式：自动识别卡密格式或普通格式
-        const lines = content.split('\n').filter(line => line.trim() && !line.startsWith('#'))
-
-        // 检测是否为卡密格式（包含 ---- 分隔符）
-        const isKamiFormat = lines.some(line => line.includes('----'))
-
-        if (isKamiFormat) {
-          // 卡密格式：邮箱----密码----RefreshToken----ClientId----ClientSecret
-          // 自动识别分隔符：----、\t、连续空格
-          const items = lines.map(line => {
-            const parts = splitCredentialLine(line)
-            const rawPwd = parts[1]?.trim()
-            const clientId = parts[3]?.trim() || undefined
-            const clientSecret = parts[4]?.trim() || undefined
-            // 第6字段为登录方式(idp)：新卡密直接带；旧卡密无此字段时按 ClientId/Secret 推断
-            // social(Github/Google) 只有 refreshToken，IdC(BuilderId) 才有 ClientId/Secret
-            const rawIdp = parts[5]?.trim()
-            const idp = rawIdp || ((!clientId && !clientSecret) ? 'Google' : 'BuilderId')
-            return {
-              email: parts[0]?.trim() || '',
-              password: (rawPwd && rawPwd !== 'no_password') ? rawPwd : undefined,
-              refreshToken: parts[2]?.trim() || '',
-              clientId,
-              clientSecret,
-              idp,
-              groupId: currentGroupId
-            }
-          }).filter(item => item.email && item.refreshToken)
-
-          if (items.length === 0) {
-            alert('未找到有效的卡密数据（格式：邮箱----密码----RefreshToken----ClientId----ClientSecret）')
-            return
-          }
-
-          const result = importAccounts(items)
-          alert(`卡密导入完成：成功 ${result.success} 个，失败 ${result.failed} 个（分组：${groupName}）`)
-        } else {
-          // 普通 TXT 格式：邮箱,RefreshToken 或 邮箱|RefreshToken
-          const items = lines.map(line => {
-            const parts = line.includes('|') ? line.split('|') : line.split(',')
-            return {
-              email: parts[0]?.trim() || '',
-              refreshToken: parts[1]?.trim() || '',
-              nickname: parts[2]?.trim() || undefined,
-              idp: parts[3]?.trim() || 'Google',
-              groupId: currentGroupId
-            }
-          }).filter(item => item.email && item.refreshToken)
-
-          if (items.length === 0) {
-            alert('未找到有效的账号数据（格式：邮箱,RefreshToken 或 卡密格式：邮箱----密码----Token----ID----Secret）')
-            return
-          }
-
-          const result = importAccounts(items)
-          alert(`导入完成：成功 ${result.success} 个，失败 ${result.failed} 个（分组：${groupName}）`)
+        const lines = content.split(/\r?\n/).filter(line => line.trim() && !line.trim().startsWith('#'))
+        const structured = /^[\s\uFEFF]*[\[{]/.test(content)
+        const card = lines.some(line => line.includes('----') || line.includes('\t') || /\S\s{2,}\S/.test(line))
+        if (!structured && !card) {
+          input = JSON.stringify(lines.map(line => {
+            const parts = (line.includes('|') ? line.split('|') : parseCSVLine(line)).map(value => value.trim())
+            return { email: parts[0], refreshToken: parts[1], nickname: parts[2], provider: parts[3] || undefined }
+          }))
         }
-      } else {
-        alert(`不支持的文件格式：${format}`)
-      }
-    } catch (e) {
-      console.error('Import error:', e)
-      alert('解析导入文件失败')
-    }
+      } else if (format !== 'json') { alert('不支持的文件格式'); return }
+      const plan = parseAccountImportText(input)
+      if (!plan.ok) { alert(plan.error?.message || '无法识别账户格式'); return }
+      const result = await importAccountPlan(plan, currentGroupId)
+      alert(formatImportOutcome(result))
+    } catch {
+      alert('导入失败，请检查文件或网络状态')
+    } finally { importInFlight.current = false }
   }
 
   // 管理分组

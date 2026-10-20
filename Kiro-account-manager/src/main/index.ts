@@ -30,6 +30,8 @@ import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
+import { normalizeCredentialRecord } from '../shared/accountImport'
+import { LoginSessionManager } from './loginSessions'
 import {
   createTray,
   destroyTray,
@@ -572,7 +574,7 @@ function getWindowsDefaultBrowser(): string {
 // 使用隐私模式打开浏览器
 function openBrowserInPrivateMode(url: string): void {
   const platform = process.platform
-  console.log(`[Browser] Opening in private mode on ${platform}: ${url}`)
+  console.log(`[Browser] Opening in private mode on ${platform}`)
 
   try {
     if (platform === 'win32') {
@@ -653,7 +655,7 @@ function openBrowserInPrivateMode(url: string): void {
       })
     }
   } catch (error) {
-    console.error('[Browser] Error opening in private mode:', error)
+    console.error('[Browser] Unable to open browser in private mode')
     shell.openExternal(url)
   }
 }
@@ -666,7 +668,7 @@ async function refreshOidcToken(
   region: string = 'us-east-1',
   proxyUrl?: string  // 账号绑定的代理 URL（可选，优先级最高）
 ): Promise<OidcRefreshResult> {
-  console.log(`[OIDC] Refreshing token with clientId: ${clientId.substring(0, 20)}...${proxyUrl ? ' [via bound proxy]' : ''}`)
+  console.log(`[OIDC] Refreshing token${proxyUrl ? ' [via bound proxy]' : ''}`)
 
   const url = `https://oidc.${region}.amazonaws.com/token`
 
@@ -688,7 +690,7 @@ async function refreshOidcToken(
     
     if (!response.ok) {
       const errorText = await response.text()
-      console.error(`[OIDC] Refresh failed: ${response.status} - ${errorText}`)
+      console.error(`[OIDC] Refresh failed: HTTP ${response.status}`)
       return { success: false, error: `HTTP ${response.status}: ${errorText}` }
     }
     
@@ -702,7 +704,7 @@ async function refreshOidcToken(
       expiresIn: data.expiresIn
     }
   } catch (error) {
-    console.error(`[OIDC] Refresh error:`, error)
+    console.error('[OIDC] Refresh request failed')
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
   }
 }
@@ -729,7 +731,7 @@ async function refreshSocialToken(
     
     if (!response.ok) {
       const errorText = await response.text()
-      console.error(`[Social] Refresh failed: ${response.status} - ${errorText}`)
+      console.error(`[Social] Refresh failed: HTTP ${response.status}`)
       return { success: false, error: `HTTP ${response.status}: ${errorText}` }
     }
     
@@ -743,7 +745,7 @@ async function refreshSocialToken(
       expiresIn: data.expiresIn
     }
   } catch (error) {
-    console.error(`[Social] Refresh error:`, error)
+    console.error('[Social] Refresh request failed')
     return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
   }
 }
@@ -2377,19 +2379,17 @@ function createWindow(): void {
 
 // 注册自定义协议
 function registerProtocol(): void {
-  // 先注销旧的注册（防止上次异常退出未注销）
-  unregisterProtocol()
-  
+  // A failed registration must not be logged as success.
+  let registered = false
   if (process.defaultApp) {
     if (process.argv.length >= 2) {
-      app.setAsDefaultProtocolClient(PROTOCOL_PREFIX, process.execPath, [
-        join(process.argv[1])
-      ])
+      registered = app.setAsDefaultProtocolClient(PROTOCOL_PREFIX, process.execPath, [join(process.argv[1])])
     }
   } else {
-    app.setAsDefaultProtocolClient(PROTOCOL_PREFIX)
+    registered = app.setAsDefaultProtocolClient(PROTOCOL_PREFIX)
   }
-  console.log(`[Protocol] Registered ${PROTOCOL_PREFIX}:// protocol`)
+  if (registered) console.log(`[Protocol] Registered ${PROTOCOL_PREFIX}:// protocol`)
+  else console.warn(`[Protocol] Unable to register ${PROTOCOL_PREFIX}:// protocol`)
 }
 
 // 注销自定义协议 (应用退出时调用)
@@ -2425,7 +2425,7 @@ function handleProtocolUrl(url: string): void {
       }
     }
   } catch (error) {
-    console.error('Failed to parse protocol URL:', error)
+    console.error('[Protocol] Invalid callback URL')
   }
 }
 
@@ -4380,26 +4380,21 @@ app.whenReady().then(async () => {
     console.log('[IPC] verify-account-credentials called')
     
     try {
-      const { refreshToken, clientId, clientSecret, region = 'us-east-1', authMethod, provider } = credentials
-      // 确定 idp：社交登录使用 provider，IdC 也需要根据 provider 区分 BuilderId 和 Enterprise
-      const idp = provider && (provider === 'Enterprise' || provider === 'Github' || provider === 'Google') 
-        ? provider 
-        : 'BuilderId'
-      
-      // 社交登录只需要 refreshToken，IdC 需要 clientId 和 clientSecret
-      if (!refreshToken) {
-        return { success: false, error: '请填写 Refresh Token' }
+      // Validate again at the process boundary; never infer Social from an unknown label.
+      const normalized = normalizeCredentialRecord(credentials)
+      if (!normalized.credential) {
+        return { success: false, error: normalized.issues.map(issue => issue.message).join('；') }
       }
-      if (authMethod !== 'social' && (!clientId || !clientSecret)) {
-        return { success: false, error: '请填写 Client ID 和 Client Secret' }
-      }
+      const { refreshToken, clientId = '', clientSecret = '', region, authMethod, provider } = normalized.credential
+      const idp = provider
       
       // Step 1: 使用合适的方式刷新获取 accessToken
       console.log(`[Verify] Step 1: Refreshing token (authMethod: ${authMethod || 'IdC'})...`)
       const refreshResult = await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod)
       
       if (!refreshResult.success || !refreshResult.accessToken) {
-        return { success: false, error: `Token 刷新失败: ${refreshResult.error}` }
+        const status = typeof refreshResult.error === 'string' ? refreshResult.error.match(/HTTP \d{3}/)?.[0] : undefined
+        return { success: false, error: `Token 刷新失败${status ? ` (${status})` : ''}，请检查凭证与网络状态` }
       }
       
       console.log('[Verify] Step 2: Getting user info...')
@@ -4523,11 +4518,11 @@ app.whenReady().then(async () => {
         daysRemaining = Math.max(0, Math.ceil((expiresAt - Date.now()) / (1000 * 60 * 60 * 24)))
       }
       
-      console.log('[Verify] Success! Email:', email)
+      console.log('[Verify] Account verification succeeded')
 
       // Enterprise 账号：验证时自动获取 profileArn（BuilderId/Social 不需要调 API）
       let enterpriseProfileArn: string | undefined
-      const isEnt = provider === 'Enterprise' || authMethod === 'external_idp'
+      const isEnt = provider === 'Enterprise' || provider === 'IAM_SSO'
       if (isEnt) {
         try {
           enterpriseProfileArn = await fetchEnterpriseProfileArn({
@@ -4538,10 +4533,10 @@ app.whenReady().then(async () => {
             authMethod: authMethod as 'IdC' | 'social' | 'idc' | 'external_idp' | undefined
           })
           if (enterpriseProfileArn) {
-            console.log(`[Verify] Enterprise profileArn auto-resolved: ${enterpriseProfileArn}`)
+            console.log('[Verify] Enterprise profile resolved')
           }
         } catch (e) {
-          console.warn('[Verify] Failed to fetch Enterprise profileArn:', e)
+          console.warn('[Verify] Failed to fetch Enterprise profile')
         }
       }
       
@@ -4588,8 +4583,8 @@ app.whenReady().then(async () => {
         }
       }
     } catch (error) {
-      console.error('[Verify] Error:', error)
-      return { success: false, error: error instanceof Error ? error.message : '验证失败' }
+      console.error('[Verify] Account verification failed')
+      return { success: false, error: '账户验证失败，请检查网络与账户状态' }
     }
   })
 
@@ -5018,570 +5013,27 @@ app.whenReady().then(async () => {
 
   // ============ 手动登录相关 IPC ============
 
-  // 存储当前登录状态
-  let currentLoginState: {
-    type: 'builderid' | 'social' | 'iamsso'
-    // BuilderId / IAM SSO 相关
-    clientId?: string
-    clientSecret?: string
-    deviceCode?: string
-    userCode?: string
-    verificationUri?: string
-    interval?: number
-    expiresAt?: number
-    startUrl?: string // IAM SSO 专用
-    redirectUri?: string // IAM SSO Authorization Code flow
-    region?: string // IAM SSO region
-    // Social Auth 相关
-    codeVerifier?: string
-    codeChallenge?: string
-    oauthState?: string
-    provider?: string
-  } | null = null
-
-  // IPC: 启动 Builder ID 手动登录
-  ipcMain.handle('start-builder-id-login', async (_event, region: string = 'us-east-1') => {
-    console.log('[Login] Starting Builder ID login...')
-    
-    const oidcBase = `https://oidc.${region}.amazonaws.com`
-    const startUrl = 'https://view.awsapps.com/start'
-    const scopes = [
-      'codewhisperer:completions',
-      'codewhisperer:analysis',
-      'codewhisperer:conversations',
-      'codewhisperer:transformations',
-      'codewhisperer:taskassist'
-    ]
-
-    try {
-      // Step 1: 注册 OIDC 客户端
-      console.log('[Login] Step 1: Registering OIDC client...')
-      const regRes = await fetchWithAppProxy(`${oidcBase}/client/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          clientName: 'Kiro Account Manager',
-          clientType: 'public',
-          scopes,
-          grantTypes: ['urn:ietf:params:oauth:grant-type:device_code', 'refresh_token'],
-          issuerUrl: startUrl
-        })
-      })
-
-      if (!regRes.ok) {
-        const errText = await regRes.text()
-        return { success: false, error: `注册客户端失败: ${errText}` }
+  const loginSessions = new LoginSessionManager({
+    fetch: fetchWithAppProxy,
+    authEndpoint: KIRO_AUTH_ENDPOINT,
+    openBrowser: (url, privateMode) => privateMode ? openBrowserInPrivateMode(url) : shell.openExternal(url),
+    notifySocial: (callback) => {
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('social-auth-callback', callback)
+        mainWindow.focus()
       }
-
-      const regData = await regRes.json()
-      const clientId = regData.clientId
-      const clientSecret = regData.clientSecret
-      console.log('[Login] Client registered:', clientId.substring(0, 30) + '...')
-
-      // Step 2: 发起设备授权
-      console.log('[Login] Step 2: Starting device authorization...')
-      const authRes = await fetchWithAppProxy(`${oidcBase}/device_authorization`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ clientId, clientSecret, startUrl })
-      })
-
-      if (!authRes.ok) {
-        const errText = await authRes.text()
-        return { success: false, error: `设备授权失败: ${errText}` }
-      }
-
-      const authData = await authRes.json()
-      const { deviceCode, userCode, verificationUri, verificationUriComplete, interval = 5, expiresIn = 600 } = authData
-      console.log('[Login] Device code obtained, user_code:', userCode)
-
-      // 保存登录状态
-      currentLoginState = {
-        type: 'builderid',
-        clientId,
-        clientSecret,
-        deviceCode,
-        userCode,
-        verificationUri,
-        interval,
-        expiresAt: Date.now() + expiresIn * 1000
-      }
-
-      return {
-        success: true,
-        userCode,
-        verificationUri: verificationUriComplete || verificationUri,
-        expiresIn,
-        interval
-      }
-    } catch (error) {
-      console.error('[Login] Error:', error)
-      return { success: false, error: error instanceof Error ? error.message : '登录失败' }
     }
   })
-
-  // IPC: 轮询 Builder ID 授权状态
-  ipcMain.handle('poll-builder-id-auth', async (_event, region: string = 'us-east-1') => {
-    console.log('[Login] Polling for authorization...')
-
-    if (!currentLoginState || currentLoginState.type !== 'builderid') {
-      return { success: false, error: '没有进行中的登录' }
-    }
-
-    if (Date.now() > (currentLoginState.expiresAt || 0)) {
-      currentLoginState = null
-      return { success: false, error: '授权已过期，请重新开始' }
-    }
-
-    const oidcBase = `https://oidc.${region}.amazonaws.com`
-    const { clientId, clientSecret, deviceCode } = currentLoginState
-
-    try {
-      const tokenRes = await fetchWithAppProxy(`${oidcBase}/token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          clientId,
-          clientSecret,
-          grantType: 'urn:ietf:params:oauth:grant-type:device_code',
-          deviceCode
-        })
-      })
-
-      if (tokenRes.status === 200) {
-        const tokenData = await tokenRes.json()
-        console.log('[Login] Authorization successful!')
-        
-        const result = {
-          success: true,
-          completed: true,
-          accessToken: tokenData.accessToken,
-          refreshToken: tokenData.refreshToken,
-          clientId,
-          clientSecret,
-          region,
-          expiresIn: tokenData.expiresIn
-        }
-        
-        currentLoginState = null
-        return result
-      } else if (tokenRes.status === 400) {
-        const errData = await tokenRes.json()
-        const error = errData.error
-
-        if (error === 'authorization_pending') {
-          return { success: true, completed: false, status: 'pending' }
-        } else if (error === 'slow_down') {
-          if (currentLoginState) {
-            currentLoginState.interval = (currentLoginState.interval || 5) + 5
-          }
-          return { success: true, completed: false, status: 'slow_down' }
-        } else if (error === 'expired_token') {
-          currentLoginState = null
-          return { success: false, error: '设备码已过期' }
-        } else if (error === 'access_denied') {
-          currentLoginState = null
-          return { success: false, error: '用户拒绝授权' }
-        } else {
-          currentLoginState = null
-          return { success: false, error: `授权错误: ${error}` }
-        }
-      } else {
-        return { success: false, error: `未知响应: ${tokenRes.status}` }
-      }
-    } catch (error) {
-      console.error('[Login] Poll error:', error)
-      return { success: false, error: error instanceof Error ? error.message : '轮询失败' }
-    }
-  })
-
-  // IPC: 取消 Builder ID 登录
-  ipcMain.handle('cancel-builder-id-login', async () => {
-    console.log('[Login] Cancelling Builder ID login...')
-    currentLoginState = null
-    return { success: true }
-  })
-
-  // IAM SSO 本地服务器和状态
-  let iamSsoServer: ReturnType<typeof import('http').createServer> | null = null
-  let iamSsoResult: {
-    completed: boolean
-    success: boolean
-    accessToken?: string
-    refreshToken?: string
-    clientId?: string
-    clientSecret?: string
-    region?: string
-    expiresIn?: number
-    error?: string
-  } | null = null
-
-  // IPC: 启动 IAM Identity Center SSO 登录 (使用 Authorization Code Grant with PKCE)
-  ipcMain.handle('start-iam-sso-login', async (_event, startUrl: string, region: string = 'us-east-1') => {
-    console.log('[Login] Starting IAM Identity Center SSO login (Authorization Code flow)...')
-    console.log('[Login] Start URL:', startUrl)
-    
-    // 验证 startUrl 格式
-    if (!startUrl || !startUrl.startsWith('https://')) {
-      return { success: false, error: 'SSO Start URL 必须以 https:// 开头' }
-    }
-    
-    const crypto = await import('crypto')
-    const http = await import('http')
-    
-    const oidcBase = `https://oidc.${region}.amazonaws.com`
-    const scopes = [
-      'codewhisperer:completions',
-      'codewhisperer:analysis',
-      'codewhisperer:conversations',
-      'codewhisperer:transformations',
-      'codewhisperer:taskassist'
-    ]
-
-    try {
-      // Step 1: 注册 OIDC 客户端 (使用 authorization_code grant type)
-      console.log('[Login] Step 1: Registering OIDC client...')
-      const regRes = await fetchWithAppProxy(`${oidcBase}/client/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          clientName: 'Kiro Account Manager',
-          clientType: 'public',
-          scopes,
-          grantTypes: ['authorization_code', 'refresh_token'],
-          redirectUris: ['http://127.0.0.1/oauth/callback'],
-          issuerUrl: startUrl
-        })
-      })
-
-      if (!regRes.ok) {
-        const errText = await regRes.text()
-        console.error('[Login] IAM SSO client registration failed:', regRes.status, errText)
-        
-        if (errText.includes('UnauthorizedException') || errText.includes('access denied')) {
-          return { 
-            success: false, 
-            error: '授权失败：您的组织可能未配置 Amazon Q Developer 访问权限。请联系组织管理员在 IAM Identity Center 中启用相关权限。' 
-          }
-        }
-        
-        return { success: false, error: `注册客户端失败: ${errText}` }
-      }
-
-      const regData = await regRes.json()
-      const clientId = regData.clientId
-      const clientSecret = regData.clientSecret
-      console.log('[Login] Client registered:', clientId.substring(0, 30) + '...')
-
-      // Step 2: 生成 PKCE 和 state
-      const codeVerifier = crypto.randomBytes(32).toString('base64url')
-      const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url')
-      const state = crypto.randomUUID()
-
-      // Step 3: 启动本地 HTTP 服务器接收回调
-      console.log('[Login] Step 2: Starting local OAuth callback server...')
-      
-      // 关闭之前的服务器
-      if (iamSsoServer) {
-        iamSsoServer.close()
-        iamSsoServer = null
-      }
-
-      // 找一个可用端口
-      const port = await new Promise<number>((resolve, reject) => {
-        const server = http.createServer()
-        server.listen(0, '127.0.0.1', () => {
-          const addr = server.address()
-          if (addr && typeof addr === 'object') {
-            const p = addr.port
-            server.close(() => resolve(p))
-          } else {
-            reject(new Error('无法获取端口'))
-          }
-        })
-      })
-
-      const redirectUri = `http://127.0.0.1:${port}/oauth/callback`
-      console.log('[Login] Redirect URI:', redirectUri)
-
-      // 重置结果
-      iamSsoResult = null
-
-      // 创建回调服务器
-      iamSsoServer = http.createServer(async (req, res) => {
-        const url = new URL(req.url || '', `http://127.0.0.1:${port}`)
-        
-        if (url.pathname === '/oauth/callback') {
-          const code = url.searchParams.get('code')
-          const returnedState = url.searchParams.get('state')
-          const error = url.searchParams.get('error')
-          
-          if (error) {
-            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-            res.end('<html><body><h1>授权失败</h1><p>您可以关闭此窗口。</p></body></html>')
-            iamSsoResult = { completed: true, success: false, error: `授权失败: ${error}` }
-            return
-          }
-          
-          if (returnedState !== state) {
-            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-            res.end('<html><body><h1>授权失败</h1><p>状态不匹配，请重试。</p></body></html>')
-            iamSsoResult = { completed: true, success: false, error: '状态不匹配' }
-            return
-          }
-          
-          if (code) {
-            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-            res.end('<html><body><h1>授权成功！</h1><p>正在获取令牌，请稍候...</p></body></html>')
-            
-            // 自动完成 token 交换
-            try {
-              const tokenRes = await fetchWithAppProxy(`${oidcBase}/token`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  clientId,
-                  clientSecret,
-                  grantType: 'authorization_code',
-                  redirectUri,
-                  code,
-                  codeVerifier
-                })
-              })
-
-              if (!tokenRes.ok) {
-                const errText = await tokenRes.text()
-                console.error('[Login] Token exchange failed:', tokenRes.status, errText)
-                iamSsoResult = { completed: true, success: false, error: `获取 Token 失败: ${errText}` }
-              } else {
-                const tokenData = await tokenRes.json()
-                console.log('[Login] IAM SSO Authorization successful!')
-                iamSsoResult = {
-                  completed: true,
-                  success: true,
-                  accessToken: tokenData.accessToken,
-                  refreshToken: tokenData.refreshToken,
-                  clientId,
-                  clientSecret,
-                  region,
-                  expiresIn: tokenData.expiresIn
-                }
-              }
-            } catch (tokenError) {
-              console.error('[Login] Token exchange error:', tokenError)
-              iamSsoResult = { 
-                completed: true, 
-                success: false, 
-                error: tokenError instanceof Error ? tokenError.message : '获取 Token 失败' 
-              }
-            }
-          } else {
-            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
-            res.end('<html><body><h1>授权失败</h1><p>未收到授权码。</p></body></html>')
-            iamSsoResult = { completed: true, success: false, error: '未收到授权码' }
-          }
-        } else {
-          res.writeHead(404)
-          res.end('Not Found')
-        }
-      })
-
-      iamSsoServer.listen(port, '127.0.0.1', () => {
-        console.log('[Login] OAuth callback server listening on port', port)
-      })
-
-      // Step 4: 构建授权 URL 并打开浏览器
-      const authorizeParams = new URLSearchParams({
-        response_type: 'code',
-        client_id: clientId,
-        redirect_uri: redirectUri,
-        scopes: scopes.join(','),
-        state: state,
-        code_challenge: codeChallenge,
-        code_challenge_method: 'S256'
-      })
-      const authorizeUrl = `${oidcBase}/authorize?${authorizeParams.toString()}`
-      console.log('[Login] Opening browser for authorization...')
-
-      // 保存登录状态
-      currentLoginState = {
-        type: 'iamsso',
-        clientId,
-        clientSecret,
-        codeVerifier,
-        redirectUri,
-        region,
-        startUrl,
-        expiresAt: Date.now() + 600000
-      }
-
-      // 返回授权 URL，前端会打开浏览器
-      return {
-        success: true,
-        authorizeUrl,
-        expiresIn: 600
-      }
-    } catch (error) {
-      console.error('[Login] Error:', error)
-      return { success: false, error: error instanceof Error ? error.message : '登录失败' }
-    }
-  })
-
-  // IPC: 轮询 IAM SSO 授权状态 (检查本地服务器是否收到回调)
-  ipcMain.handle('poll-iam-sso-auth', async () => {
-    if (!currentLoginState || currentLoginState.type !== 'iamsso') {
-      return { success: false, error: '没有进行中的 IAM SSO 登录' }
-    }
-
-    if (Date.now() > (currentLoginState.expiresAt || 0)) {
-      if (iamSsoServer) {
-        iamSsoServer.close()
-        iamSsoServer = null
-      }
-      iamSsoResult = null
-      currentLoginState = null
-      return { success: false, error: '授权已过期，请重新开始' }
-    }
-
-    // 检查是否已收到回调并完成 token 交换
-    if (iamSsoResult) {
-      const result = { ...iamSsoResult }
-      if (result.completed) {
-        // 清理状态
-        if (iamSsoServer) {
-          iamSsoServer.close()
-          iamSsoServer = null
-        }
-        iamSsoResult = null
-        currentLoginState = null
-      }
-      return result
-    }
-
-    // 还在等待回调
-    return { success: true, completed: false, status: 'pending' }
-  })
-
-  // IPC: 取消 IAM SSO 登录
-  ipcMain.handle('cancel-iam-sso-login', async () => {
-    console.log('[Login] Cancelling IAM SSO login...')
-    if (iamSsoServer) {
-      iamSsoServer.close()
-      iamSsoServer = null
-    }
-    iamSsoResult = null
-    currentLoginState = null
-    return { success: true }
-  })
-
-  // IPC: 启动 Social Auth 登录 (Google/GitHub)
-  ipcMain.handle('start-social-login', async (_event, provider: 'Google' | 'Github', usePrivateMode?: boolean) => {
-    console.log(`[Login] Starting ${provider} Social Auth login... (privateMode: ${usePrivateMode})`)
-    
-    const crypto = await import('crypto')
-
-    // 生成 PKCE
-    const codeVerifier = crypto.randomBytes(64).toString('base64url').substring(0, 128)
-    const codeChallenge = crypto.createHash('sha256').update(codeVerifier).digest('base64url')
-    const oauthState = crypto.randomBytes(32).toString('base64url')
-
-    // 构建登录 URL
-    const redirectUri = 'kiro://kiro.kiroAgent/authenticate-success'
-    const loginUrl = new URL(`${KIRO_AUTH_ENDPOINT}/login`)
-    loginUrl.searchParams.set('idp', provider)
-    loginUrl.searchParams.set('redirect_uri', redirectUri)
-    loginUrl.searchParams.set('code_challenge', codeChallenge)
-    loginUrl.searchParams.set('code_challenge_method', 'S256')
-    loginUrl.searchParams.set('state', oauthState)
-
-    // 保存登录状态
-    currentLoginState = {
-      type: 'social',
-      codeVerifier,
-      codeChallenge,
-      oauthState,
-      provider
-    }
-
-    const urlStr = loginUrl.toString()
-    console.log(`[Login] Opening browser for ${provider} login...`)
-
-    // 根据是否使用隐私模式选择打开方式
-    if (usePrivateMode) {
-      openBrowserInPrivateMode(urlStr)
-    } else {
-      shell.openExternal(urlStr)
-    }
-
-    return {
-      success: true,
-      loginUrl: urlStr,
-      state: oauthState
-    }
-  })
-
-  // IPC: 交换 Social Auth token
-  ipcMain.handle('exchange-social-token', async (_event, code: string, state: string) => {
-    console.log('[Login] Exchanging Social Auth token...')
-
-    if (!currentLoginState || currentLoginState.type !== 'social') {
-      return { success: false, error: '没有进行中的社交登录' }
-    }
-
-    // 验证 state
-    if (state !== currentLoginState.oauthState) {
-      currentLoginState = null
-      return { success: false, error: '状态参数不匹配，可能存在安全风险' }
-    }
-
-    const { codeVerifier, provider } = currentLoginState
-    const redirectUri = 'kiro://kiro.kiroAgent/authenticate-success'
-
-    try {
-      const tokenRes = await fetchWithAppProxy(`${KIRO_AUTH_ENDPOINT}/oauth/token`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          code,
-          code_verifier: codeVerifier,
-          redirect_uri: redirectUri
-        })
-      })
-
-      if (!tokenRes.ok) {
-        const errText = await tokenRes.text()
-        currentLoginState = null
-        return { success: false, error: `Token 交换失败: ${errText}` }
-      }
-
-      const tokenData = await tokenRes.json()
-      console.log('[Login] Token exchange successful!')
-
-      const result = {
-        success: true,
-        accessToken: tokenData.accessToken,
-        refreshToken: tokenData.refreshToken,
-        profileArn: tokenData.profileArn,
-        expiresIn: tokenData.expiresIn,
-        authMethod: 'social' as const,
-        provider
-      }
-
-      currentLoginState = null
-      return result
-    } catch (error) {
-      console.error('[Login] Token exchange error:', error)
-      currentLoginState = null
-      return { success: false, error: error instanceof Error ? error.message : 'Token 交换失败' }
-    }
-  })
-
-  // IPC: 取消 Social Auth 登录
-  ipcMain.handle('cancel-social-login', async () => {
-    console.log('[Login] Cancelling Social Auth login...')
-    currentLoginState = null
-    return { success: true }
-  })
+  ipcMain.handle('start-builder-id-login', (_event, region: string, sessionId: string) => loginSessions.startBuilder(sessionId, region))
+  ipcMain.handle('poll-builder-id-auth', (_event, sessionId: string) => loginSessions.pollBuilder(sessionId))
+  ipcMain.handle('cancel-builder-id-login', (_event, sessionId: string) => loginSessions.cancel('builderid', sessionId))
+  ipcMain.handle('start-iam-sso-login', (_event, startUrl: string, region: string, sessionId: string) => loginSessions.startIam(sessionId, startUrl, region))
+  ipcMain.handle('poll-iam-sso-auth', (_event, sessionId: string) => loginSessions.pollIam(sessionId))
+  ipcMain.handle('cancel-iam-sso-login', (_event, sessionId: string) => loginSessions.cancel('iamsso', sessionId))
+  ipcMain.handle('start-social-login', (_event, provider: 'Google' | 'Github', privateMode: boolean, sessionId: string) => loginSessions.startSocial(sessionId, provider, privateMode))
+  ipcMain.handle('exchange-social-token', (_event, code: string, state: string, sessionId: string) => loginSessions.exchangeSocial(sessionId, code, state))
+  ipcMain.handle('get-social-auth-callback', (_event, sessionId: string) => loginSessions.getSocialCallback(sessionId))
+  ipcMain.handle('cancel-social-login', (_event, sessionId: string) => loginSessions.cancel('social', sessionId))
 
   // IPC: 设置代理
   ipcMain.handle('set-proxy', async (_event, enabled: boolean, url: string) => {
@@ -7195,33 +6647,20 @@ app.whenReady().then(async () => {
     try {
       const urlObj = new URL(url)
       
-      // 处理 Social Auth 回调 (kiro://kiro.kiroAgent/authenticate-success)
-      if (url.includes('authenticate-success') || url.includes('auth')) {
-        const code = urlObj.searchParams.get('code')
-        const state = urlObj.searchParams.get('state')
-        const error = urlObj.searchParams.get('error')
-
-        if (error) {
-          console.log('[Login] Auth callback error:', error)
-          if (mainWindow) {
-            mainWindow.webContents.send('social-auth-callback', { error })
-            mainWindow.focus()
-          }
-          return
-        }
-
-        if (code && state && mainWindow) {
-          console.log('[Login] Auth callback received, code:', code.substring(0, 20) + '...')
-          mainWindow.webContents.send('social-auth-callback', { code, state })
-          mainWindow.focus()
-        }
+      // Only the exact expected route may feed the in-memory PKCE session.
+      if (urlObj.hostname.toLowerCase() === 'kiro.kiroagent' && urlObj.pathname === '/authenticate-success') {
+        loginSessions.acceptSocialCallback({
+          code: urlObj.searchParams.get('code'),
+          state: urlObj.searchParams.get('state'),
+          error: urlObj.searchParams.get('error')
+        })
         return
       }
 
       // 调用原始处理函数处理其他协议
       originalHandleProtocolUrl(url)
     } catch (error) {
-      console.error('Failed to parse protocol URL:', error)
+      console.error('[Protocol] Invalid callback URL')
     }
   }
 
