@@ -290,6 +290,7 @@ export function planBackupRestore(backup: BackupPayload, ctx: RestoreContext): B
         refreshToken,
         clientId: credential.clientId,
         clientSecret: credential.clientSecret,
+        clientSecretExpiresAt: credential.clientSecretExpiresAt,
         startUrl: credential.startUrl,
         profileArn: credential.profileArn,
         region,

@@ -1,0 +1,22 @@
+import type { IpcMain } from 'electron'
+import { KIRO_INSTANCE_CHANNELS, type CreateKiroInstanceInput, type KiroInstanceResult } from '../../shared/kiroInstances'
+import { KiroInstanceError, type KiroInstanceService } from '../kiroInstances'
+
+export function registerKiroInstanceIpc(deps: {
+  ipcMain: Pick<IpcMain, 'handle' | 'removeHandler'>
+  service: KiroInstanceService
+  chooseExecutable(): Promise<string | null>
+}): () => void {
+  const handle = <T>(channel: string, action: (...args: unknown[]) => Promise<T>): void => {
+    deps.ipcMain.handle(channel, async (_event, ...args): Promise<KiroInstanceResult<T>> => {
+      try { return { success: true, value: await action(...args) } }
+      catch (error) { return { success: false, error: error instanceof KiroInstanceError ? error.message : '实例操作未完成，请检查 Windows 用户和安装状态后重试。' } }
+    })
+  }
+  handle(KIRO_INSTANCE_CHANNELS.snapshot, () => deps.service.snapshot())
+  handle(KIRO_INSTANCE_CHANNELS.create, input => deps.service.create(input as CreateKiroInstanceInput))
+  handle(KIRO_INSTANCE_CHANNELS.remove, id => deps.service.remove(id as string))
+  handle(KIRO_INSTANCE_CHANNELS.launch, id => deps.service.launch(id as string))
+  handle(KIRO_INSTANCE_CHANNELS.chooseExecutable, () => deps.chooseExecutable())
+  return () => Object.values(KIRO_INSTANCE_CHANNELS).forEach(channel => deps.ipcMain.removeHandler(channel))
+}

@@ -6,7 +6,7 @@ import kiroLogoSmall from '@/assets/Kiro Logo.svg'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 
-export type PageType = 'home' | 'accounts' | 'machineId' | 'kiroSettings' | 'proxy' | 'kproxy' | 'proxyPool' | 'register' | 'subscription' | 'webhooks' | 'diagnose' | 'configSync' | 'logs' | 'settings' | 'about'
+export type PageType = 'home' | 'accounts' | 'machineId' | 'kiroSettings' | 'kiroInstances' | 'proxy' | 'kproxy' | 'proxyPool' | 'register' | 'subscription' | 'webhooks' | 'diagnose' | 'configSync' | 'logs' | 'settings' | 'about'
 
 interface SidebarProps {
   currentPage: PageType
@@ -20,6 +20,7 @@ const menuItemsConfig: { id: PageType; labelKey: string; icon: React.ElementType
   { id: 'accounts', labelKey: 'nav.accounts', icon: Users },
   { id: 'machineId', labelKey: 'nav.machineId', icon: Fingerprint },
   { id: 'kiroSettings', labelKey: 'nav.kiroSettings', icon: Sparkles },
+  { id: 'kiroInstances', labelKey: 'nav.kiroInstances', icon: Users },
   { id: 'proxy', labelKey: 'nav.proxy', icon: Server },
   { id: 'kproxy', labelKey: 'nav.kproxy', icon: Shield },
   { id: 'proxyPool', labelKey: 'nav.proxyPool', icon: Network },

@@ -61,6 +61,7 @@ export function verifiedAccount(
       csrfToken: '',
       clientId: credential.clientId,
       clientSecret: credential.clientSecret,
+      clientSecretExpiresAt: credential.clientSecretExpiresAt,
       region: credential.region,
       startUrl: credential.startUrl,
       expiresAt: now + seconds * 1000,

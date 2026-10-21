@@ -1,7 +1,8 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { createServer, type Server } from 'node:http'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 
-export type LoginKind = 'builderid' | 'social' | 'iamsso'
+export type LoginKind = 'builderid' | 'social' | 'iamsso' | 'portal'
+export type PortalProvider = 'Google' | 'Github' | 'BuilderId' | 'Enterprise'
 export interface LoginResult {
   success: boolean
   sessionId: string
@@ -15,7 +16,10 @@ export interface LoginResult {
   clientId?: string
   clientSecret?: string
   region?: string
-  provider?: 'Google' | 'Github'
+  provider?: PortalProvider
+  authMethod?: 'social' | 'IdC'
+  startUrl?: string
+  clientSecretExpiresAt?: number
   userCode?: string
   verificationUri?: string
   interval?: number
@@ -36,13 +40,16 @@ interface HttpResponse {
   json(): Promise<unknown>
 }
 interface LoginDependencies {
-  fetch: (url: string, init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal }) => Promise<HttpResponse>
+  fetch: (url: string, init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal; redirect?: RequestRedirect }) => Promise<HttpResponse>
   authEndpoint: string
   openBrowser: (url: string, privateMode?: boolean) => void | Promise<unknown>
   notifySocial: (callback: SocialLoginCallback) => void
   now?: () => number
   schedule?: typeof setTimeout
   unschedule?: typeof clearTimeout
+  /** Test-only listener injection; production uses the current official portal port list. */
+  portalPorts?: readonly number[]
+  requestTimeoutMs?: number
 }
 interface LoginSession {
   id: string
@@ -58,7 +65,13 @@ interface LoginSession {
   deviceCode?: string
   verifier?: string
   state?: string
-  provider?: 'Google' | 'Github'
+  provider?: PortalProvider
+  expectedProvider?: PortalProvider
+  privateMode?: boolean
+  portalConsumed?: boolean
+  portalStage?: 'portal' | 'idc-starting' | 'idc'
+  startUrl?: string
+  clientSecretExpiresAt?: number
   redirectUri?: string
   server?: Server
   expiryTimer?: ReturnType<typeof setTimeout>
@@ -68,9 +81,23 @@ interface LoginSession {
 }
 const SCOPES = ['codewhisperer:completions', 'codewhisperer:analysis', 'codewhisperer:conversations', 'codewhisperer:transformations', 'codewhisperer:taskassist']
 const SOCIAL_REDIRECT_URI = 'kiro://kiro.kiroAgent/authenticate-success'
+const PORTAL_ENDPOINT = 'https://app.kiro.dev/signin'
+const PORTAL_PORTS = [3128, 4649, 6588, 8008, 9091, 49153, 50153, 51153, 52153, 53153] as const
+const PORTAL_PROVIDERS: Record<string, PortalProvider> = { google: 'Google', github: 'Github', builderid: 'BuilderId', awsidc: 'Enterprise' }
 const text = (value: unknown): string | undefined => typeof value === 'string' && value.length > 0 ? value : undefined
 const positive = (value: unknown, fallback: number): number => typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
 const body = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+const validRegion = (region: unknown): region is string => typeof region === 'string' && /^(?:af|ap|ca|eu|il|me|mx|sa|us)(?:-[a-z]+){1,3}-[1-9]\d?$/.test(region)
+function validIssuer(value: string | null, provider: PortalProvider): string | undefined {
+  if (!value || value.length > 2048) return
+  try {
+    const url = new URL(value)
+    if (url.protocol !== 'https:' || url.username || url.password || url.port || url.search || url.hash) return
+    if (provider === 'BuilderId') return url.href.replace(/\/$/, '') === 'https://view.awsapps.com/start' ? 'https://view.awsapps.com/start' : undefined
+    if (provider === 'Enterprise' && /^(?:[a-z0-9-]+\.)+awsapps\.com$/.test(url.hostname) && /^\/(?:start\/?|directory\/[a-zA-Z0-9-]+\/?)$/.test(url.pathname)) return url.href
+  } catch { /* Callback values are untrusted. Never use them as a credential request endpoint. */ }
+  return
+}
 
 /** Session-owned async work. No Electron, disk, protocol registration or production credentials. */
 export class LoginSessionManager {
@@ -86,6 +113,7 @@ export class LoginSessionManager {
     session.controller.abort()
     if (session.expiryTimer) (this.deps.unschedule ?? clearTimeout)(session.expiryTimer)
     session.server?.close()
+    if (session.kind === 'portal') session.server?.closeAllConnections()
     session.callback = undefined
     session.result = undefined
   }
@@ -131,14 +159,238 @@ export class LoginSessionManager {
     return { success: false, sessionId: session.id, error: message }
   }
   private async post(session: LoginSession, url: string, payload: Record<string, unknown>): Promise<HttpResponse> {
-    return this.deps.fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: session.controller.signal })
+    if (session.kind !== 'portal') return this.deps.fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: session.controller.signal })
+    const timeout = this.deps.requestTimeoutMs ?? 10000
+    const controller = new AbortController()
+    const aborted = () => controller.abort()
+    session.controller.signal.addEventListener('abort', aborted, { once: true })
+    if (session.controller.signal.aborted) controller.abort()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let rejectAbort!: (reason: Error) => void
+    const interrupted = new Promise<never>((_, reject) => { rejectAbort = reject })
+    let finish = () => {}
+    const failAbort = () => { finish(); rejectAbort(new Error('authorization_request_interrupted')) }
+    controller.signal.addEventListener('abort', failAbort, { once: true })
+    timer = setTimeout(() => controller.abort(), Math.max(1, Math.min(30000, timeout)))
+    timer.unref?.()
+    finish = () => {
+      if (timer) clearTimeout(timer)
+      session.controller.signal.removeEventListener('abort', aborted)
+      controller.signal.removeEventListener('abort', failAbort)
+    }
+    try {
+      if (controller.signal.aborted) throw new Error('cancelled')
+      const response = await Promise.race([this.deps.fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: controller.signal, redirect: 'error' }), interrupted])
+      if (!response.ok) finish()
+      // Keep the deadline active while reading/parsing the response, not just until headers arrive.
+      return { ok: response.ok, status: response.status, json: async () => {
+        try { return await Promise.race([response.json(), interrupted]) } finally { finish() }
+      } }
+    } catch (error) { finish(); throw error }
   }
   cancel(kind: LoginKind, sessionId: string): { success: boolean } {
     const session = this.current
     if (session?.kind === kind && session.id === sessionId) this.clear(session)
     return { success: true }
   }
+  private reply(response: ServerResponse, status: number, message: string): void {
+    if (response.destroyed || response.writableEnded) return
+    response.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' })
+    response.end(message)
+  }
+  private portalFailure(session: LoginSession, message: string): void {
+    if (this.active(session)) session.result = { success: false, completed: true, sessionId: session.id, error: message }
+  }
+  private async closeCallbackServer(session: LoginSession): Promise<void> {
+    const server = session.server
+    session.server = undefined
+    if (!server) return
+    await new Promise<void>(resolve => {
+      if (!server.listening) { resolve(); return }
+      server.close(() => resolve())
+      server.closeAllConnections()
+    })
+  }
+  private async listenPortal(session: LoginSession, idc: boolean): Promise<void> {
+    const server = createServer((request, response) => {
+      void this.handlePortalCallback(session, request, response, idc).catch(() => {
+        this.portalFailure(session, '登录授权失败，请重新开始')
+        this.reply(response, 400, 'Authorization failed. Return to the desktop application.')
+      })
+    })
+    session.server = server
+    const ports = idc ? [0] : this.deps.portalPorts ?? PORTAL_PORTS
+    if (!ports.length || ports.some(port => !Number.isInteger(port) || port < 0 || port > 65535)) throw new Error('invalid_callback_ports')
+    await new Promise<void>((resolve, reject) => {
+      let index = 0
+      let settled = false
+      const finish = (error?: Error) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        session.controller.signal.removeEventListener('abort', abort)
+        server.removeListener('error', failed)
+        if (error) reject(error); else resolve()
+      }
+      const abort = () => { server.close(); finish(new Error('cancelled')) }
+      const failed = (error: NodeJS.ErrnoException) => {
+        if (error.code === 'EADDRINUSE' && index + 1 < ports.length && this.active(session)) {
+          server.listen(ports[++index], '127.0.0.1')
+        } else finish(new Error('callback_listener_unavailable'))
+      }
+      const timer = setTimeout(() => { server.close(); finish(new Error('callback_listener_timeout')) }, 10000)
+      timer.unref?.()
+      session.controller.signal.addEventListener('abort', abort, { once: true })
+      server.on('error', failed)
+      server.once('listening', () => finish())
+      if (session.controller.signal.aborted) { abort(); return }
+      server.listen(ports[0], '127.0.0.1')
+    })
+    if (!this.active(session)) { server.close(); throw new Error('cancelled') }
+    server.on('error', () => this.portalFailure(session, '本地登录回调服务失败，请重试'))
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('callback_listener_unavailable')
+    session.redirectUri = idc ? `http://127.0.0.1:${address.port}/oauth/callback` : `http://localhost:${address.port}`
+  }
+  /** Current official portal flow; all networking and browser effects remain injected. */
+  async startPortal(sessionId: string, expectedProvider?: PortalProvider, privateMode?: boolean): Promise<LoginResult> {
+    if (typeof sessionId !== 'string' || !/^[A-Za-z0-9-]{1,128}$/.test(sessionId)) return { success: false, sessionId, error: '登录会话标识无效' }
+    if (expectedProvider && !Object.values(PORTAL_PROVIDERS).includes(expectedProvider)) return { success: false, sessionId, error: '不支持的登录方式' }
+    const session = this.begin('portal', sessionId, 'us-east-1')
+    session.expectedProvider = expectedProvider
+    session.privateMode = privateMode
+    session.portalStage = 'portal'
+    session.state = randomUUID()
+    session.verifier = randomBytes(32).toString('base64url')
+    try {
+      await this.listenPortal(session, false)
+      if (!this.active(session)) return this.stopped(sessionId)
+      const url = new URL(PORTAL_ENDPOINT)
+      url.search = new URLSearchParams({ state: session.state!, code_challenge: createHash('sha256').update(session.verifier!).digest('base64url'), code_challenge_method: 'S256', redirect_uri: session.redirectUri!, redirect_from: 'KiroIDE' }).toString()
+      const opened = await this.deps.openBrowser(url.toString(), privateMode)
+      if (!this.active(session)) return this.stopped(sessionId)
+      if (opened === false) return this.failure(session, '无法打开登录浏览器，请重试')
+      return { success: true, sessionId, loginUrl: url.toString(), authorizeUrl: url.toString(), state: session.state, expiresIn: 600, interval: 1 }
+    } catch { return this.failure(session, '无法启动网页登录，请检查本地回调端口后重试') }
+  }
+  pollPortal(sessionId: string): LoginResult {
+    const session = this.find('portal', sessionId)
+    if (!session) return this.stopped(sessionId)
+    if (session.result) {
+      const result = session.result
+      this.clear(session)
+      return result
+    }
+    return { success: true, sessionId, completed: false, status: 'pending', interval: 1, provider: session.provider }
+  }
+  private validCallback(session: LoginSession, request: IncomingMessage, idc: boolean): URL | undefined {
+    if (request.method !== 'GET' || !session.redirectUri || !request.url || request.url.length > 16384) return
+    try {
+      const base = new URL(session.redirectUri)
+      const host = request.headers.host
+      if (host !== `localhost:${base.port}` && host !== `127.0.0.1:${base.port}`) return
+      const url = new URL(request.url, base)
+      if (url.origin !== base.origin && url.origin !== `http://127.0.0.1:${base.port}`) return
+      if (idc ? url.pathname !== '/oauth/callback' : !['/oauth/callback', '/signin/callback'].includes(url.pathname)) return
+      for (const key of ['state', 'code', 'error', 'login_option', 'issuer_url', 'idc_region']) if (url.searchParams.getAll(key).length > 1) return
+      return url
+    } catch { return }
+  }
+  private portalTokenResult(session: LoginSession, value: unknown): LoginResult | undefined {
+    const data = body(value)
+    const accessToken = text(data.accessToken)?.trim()
+    const refreshToken = text(data.refreshToken)?.trim()
+    const expiresIn = positive(data.expiresIn, 0)
+    if (!accessToken || !refreshToken || !expiresIn) return
+    return { success: true, completed: true, sessionId: session.id, accessToken, refreshToken, expiresIn, profileArn: text(data.profileArn), provider: session.provider, authMethod: session.provider === 'Google' || session.provider === 'Github' ? 'social' : 'IdC', ...(session.clientId ? { clientId: session.clientId, clientSecret: session.clientSecret, clientSecretExpiresAt: session.clientSecretExpiresAt, region: session.region, startUrl: session.startUrl } : {}) }
+  }
+  private async handlePortalCallback(session: LoginSession, request: IncomingMessage, response: ServerResponse, idc: boolean): Promise<void> {
+    const url = this.validCallback(session, request, idc)
+    if (!url) { this.reply(response, 400, 'Invalid authorization callback'); return }
+    if (!this.active(session) || url.searchParams.get('state') !== session.state) { this.reply(response, 400, 'Invalid or expired login session'); return }
+    if (session.result || session.exchangeStarted || (!idc && session.portalConsumed) || idc !== (session.portalStage === 'idc')) { this.reply(response, 409, 'Authorization is already being processed'); return }
+    if (url.searchParams.get('error')) {
+      this.portalFailure(session, url.searchParams.get('error') === 'access_denied' ? '用户拒绝授权' : '网页授权未完成，请重试')
+      this.reply(response, 400, 'Authorization did not complete. Return to the desktop application.'); return
+    }
+    if (idc) {
+      const code = text(url.searchParams.get('code'))
+      if (!code) { this.reply(response, 400, 'Missing authorization code'); return }
+      session.exchangeStarted = true
+      try {
+        const result = await this.post(session, `https://oidc.${session.region}.amazonaws.com/token`, { clientId: session.clientId, clientSecret: session.clientSecret, grantType: 'authorization_code', redirectUri: session.redirectUri, code, codeVerifier: session.verifier })
+        if (!this.active(session)) { this.reply(response, 410, 'Login session was cancelled'); return }
+        if (!result.ok) throw new Error('token_exchange')
+        const token = this.portalTokenResult(session, await result.json())
+        if (!this.active(session)) { this.reply(response, 410, 'Login session was cancelled'); return }
+        if (!token) throw new Error('incomplete_token')
+        session.result = token
+        this.reply(response, 200, '授权完成，请返回桌面应用。')
+      } catch { this.portalFailure(session, 'Token 交换失败，请重新开始'); this.reply(response, 400, 'Authorization failed. Return to the desktop application.') }
+      return
+    }
+    const option = url.searchParams.get('login_option') || ''
+    const provider = Object.hasOwn(PORTAL_PROVIDERS, option) ? PORTAL_PROVIDERS[option] : undefined
+    if (!provider || session.expectedProvider && session.expectedProvider !== provider) {
+      this.reply(response, 400, 'Unexpected sign-in provider'); return
+    }
+    if (provider === 'Google' || provider === 'Github') {
+      const code = text(url.searchParams.get('code'))
+      if (!code) { this.reply(response, 400, 'Missing authorization code'); return }
+      session.provider = provider
+      session.portalConsumed = true
+      session.exchangeStarted = true
+      try {
+        const result = await this.post(session, `${this.deps.authEndpoint}/oauth/token`, { code, code_verifier: session.verifier, redirect_uri: `${session.redirectUri}${url.pathname}?login_option=${url.searchParams.get('login_option')}` })
+        if (!this.active(session)) { this.reply(response, 410, 'Login session was cancelled'); return }
+        if (!result.ok) throw new Error('token_exchange')
+        const token = this.portalTokenResult(session, await result.json())
+        if (!this.active(session)) { this.reply(response, 410, 'Login session was cancelled'); return }
+        if (!token) throw new Error('incomplete_token')
+        session.result = token
+        this.reply(response, 200, '授权完成，请返回桌面应用。')
+      } catch { this.portalFailure(session, 'Token 交换失败，请重新开始'); this.reply(response, 400, 'Authorization failed. Return to the desktop application.') }
+      return
+    }
+    const issuer = validIssuer(url.searchParams.get('issuer_url'), provider)
+    const region = url.searchParams.get('idc_region')
+    if (!issuer || !validRegion(region)) { this.reply(response, 400, 'Invalid organization issuer or region'); return }
+    session.provider = provider
+    session.portalConsumed = true
+    session.portalStage = 'idc-starting'
+    session.startUrl = issuer
+    session.region = provider === 'BuilderId' ? 'us-east-1' : region
+    response.once('finish', () => { void this.startPortalIdc(session) })
+    this.reply(response, 200, '请选择浏览器中随后打开的授权页面完成登录。')
+  }
+  private async startPortalIdc(session: LoginSession): Promise<void> {
+    try {
+      await this.closeCallbackServer(session)
+      if (!this.active(session)) return
+      const base = `https://oidc.${session.region}.amazonaws.com`
+      const registration = await this.post(session, `${base}/client/register`, { clientName: 'Kiro Account Manager', clientType: 'public', scopes: SCOPES, grantTypes: ['authorization_code', 'refresh_token'], redirectUris: ['http://127.0.0.1/oauth/callback'], issuerUrl: session.startUrl })
+      if (!this.active(session)) return
+      if (!registration.ok) throw new Error('client_registration')
+      const client = body(await registration.json())
+      if (!this.active(session)) return
+      session.clientId = text(client.clientId)
+      session.clientSecret = text(client.clientSecret)
+      session.clientSecretExpiresAt = positive(client.clientSecretExpiresAt, 0) || undefined
+      if (!session.clientId || !session.clientSecret || session.clientSecretExpiresAt !== undefined && session.clientSecretExpiresAt * 1000 <= this.now()) throw new Error('invalid_client_registration')
+      session.state = randomUUID()
+      session.verifier = randomBytes(32).toString('base64url')
+      session.exchangeStarted = false
+      session.portalStage = 'idc'
+      await this.listenPortal(session, true)
+      if (!this.active(session)) return
+      const params = new URLSearchParams({ response_type: 'code', client_id: session.clientId, redirect_uri: session.redirectUri!, scopes: SCOPES.join(','), state: session.state, code_challenge: createHash('sha256').update(session.verifier).digest('base64url'), code_challenge_method: 'S256' })
+      const opened = await this.deps.openBrowser(`${base}/authorize?${params}`, session.privateMode)
+      if (!this.active(session)) return
+      if (opened === false) throw new Error('browser_open_failed')
+    } catch { this.portalFailure(session, '无法继续组织或 Builder ID 授权，请重新开始') }
+  }
   async startBuilder(sessionId: string, region = 'us-east-1'): Promise<LoginResult> {
+    if (!validRegion(region)) return { success: false, sessionId, error: '无效的 AWS 区域' }
     const session = this.begin('builderid', sessionId, region)
     const base = `https://oidc.${region}.amazonaws.com`
     const startUrl = 'https://view.awsapps.com/start'
@@ -250,6 +502,7 @@ export class LoginSessionManager {
     } catch { return this.failure(session, 'Token 交换失败，请重试') }
   }
   async startIam(sessionId: string, startUrl: string, region = 'us-east-1'): Promise<LoginResult> {
+    if (!validRegion(region)) return { success: false, sessionId, error: '无效的 AWS 区域' }
     if (!startUrl?.startsWith('https://')) return { success: false, sessionId, error: 'SSO Start URL 必须以 https:// 开头' }
     const session = this.begin('iamsso', sessionId, region)
     const base = `https://oidc.${region}.amazonaws.com`

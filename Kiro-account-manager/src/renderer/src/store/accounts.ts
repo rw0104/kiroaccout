@@ -65,6 +65,36 @@ function enqueueAccountImport<T>(work: () => Promise<T>): Promise<T> {
   accountImportQueue = result.then(() => undefined, () => undefined)
   return result
 }
+
+interface CredentialVersion {
+  expectedRefreshToken?: string
+  expectedAccessToken?: string
+}
+interface BackgroundCredentialResult extends CredentialVersion {
+  id: string
+  success: boolean
+  data?: unknown
+  error?: string
+}
+function credentialVersion(account: Account): CredentialVersion {
+  return { expectedRefreshToken: account.credentials.refreshToken, expectedAccessToken: account.credentials.accessToken }
+}
+/** Compare both tokens: a refresh need not rotate its refreshToken, so that alone is not a generation. */
+function credentialResultDisposition(
+  account: Account | undefined,
+  expected: CredentialVersion,
+  next?: { accessToken?: string; refreshToken?: string }
+): 'input' | 'duplicate' | 'stale' {
+  if (!account || typeof expected.expectedRefreshToken !== 'string' && typeof expected.expectedAccessToken !== 'string') return 'stale'
+  const current = account.credentials
+  if ((expected.expectedRefreshToken === undefined || current.refreshToken === expected.expectedRefreshToken) &&
+      (expected.expectedAccessToken === undefined || current.accessToken === expected.expectedAccessToken)) return 'input'
+  // A duplicate delivered after another consumer already applied the exact result is a no-op,
+  // including expiry and status; never extend a cached token's lifetime on redelivery.
+  if (next?.accessToken && current.accessToken === next.accessToken &&
+      current.refreshToken === (next.refreshToken ?? expected.expectedRefreshToken)) return 'duplicate'
+  return 'stale'
+}
 /** 等待本轮防抖窗口落盘的所有调用方 resolver；批量唤醒，避免风暴时 Promise 永久挂起 */
 let savePendingResolvers: Array<() => void> = []
 
@@ -465,12 +495,12 @@ interface AccountsActions {
   checkAndRefreshExpiringTokens: () => Promise<void>
   refreshExpiredTokensOnly: () => Promise<void>
   triggerBackgroundRefresh: () => Promise<void>
-  handleBackgroundRefreshResult: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void
-  handleBackgroundCheckResult: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void
+  handleBackgroundRefreshResult: (data: BackgroundCredentialResult) => void
+  handleBackgroundCheckResult: (data: BackgroundCredentialResult) => void
   /** 批量处理后台刷新结果：一次 set 应用 N 条结果，消除 N 次 Map 全量复制 */
-  applyBackgroundRefreshResults: (items: Array<{ id: string; success: boolean; data?: unknown; error?: string }>) => void
+  applyBackgroundRefreshResults: (items: BackgroundCredentialResult[]) => void
   /** 批量处理后台检查结果：一次 set 应用 N 条结果 */
-  applyBackgroundCheckResults: (items: Array<{ id: string; success: boolean; data?: unknown; error?: string }>) => void
+  applyBackgroundCheckResults: (items: BackgroundCredentialResult[]) => void
 
   // 定时自动保存（防止数据丢失）
   startAutoSave: () => void
@@ -1288,12 +1318,15 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     const account = accounts.get(id)
 
     if (!account) return false
+    const expected = credentialVersion(account)
 
     updateAccountStatus(id, 'refreshing')
 
     try {
       // 通过主进程调用 Kiro API 刷新 Token（避免 CORS）
       const result = await window.api.refreshAccountToken(account)
+      const disposition = credentialResultDisposition(get().accounts.get(id), expected, result.success ? result.data : undefined)
+      if (disposition !== 'input') return disposition === 'duplicate'
 
       if (result.success && result.data) {
         // 当 refresh 后 main 进程检测到该账号是 IDE 当前激活账号，会自动同步到磁盘 token 文件；
@@ -1346,6 +1379,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         return false
       }
     } catch (error) {
+      if (credentialResultDisposition(get().accounts.get(id), expected) !== 'input') return false
       updateAccountStatus(id, 'error', error instanceof Error ? error.message : 'Unknown error')
       return false
     }
@@ -1413,6 +1447,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     const account = accounts.get(id)
 
     if (!account) return
+    const expected = credentialVersion(account)
 
     // 设置刷新状态，提供视觉反馈
     updateAccountStatus(id, 'refreshing')
@@ -1420,6 +1455,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     try {
       // 通过主进程调用 Kiro API 获取状态（避免 CORS）
       const result = await window.api.checkAccountStatus(account)
+      if (credentialResultDisposition(get().accounts.get(id), expected, result.success ? result.data?.newCredentials : undefined) !== 'input') return
 
       if (result.success && result.data) {
         set((state) => {
@@ -1505,6 +1541,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         }
       }
     } catch (error) {
+      if (credentialResultDisposition(get().accounts.get(id), expected) !== 'input') return
       updateAccountStatus(id, 'error', error instanceof Error ? error.message : 'Unknown error')
     }
   },
@@ -2431,6 +2468,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         const { id, success, data: resultData, error } = data
         const account = accounts.get(id)
         if (!account) continue
+        const next = success && resultData && typeof resultData === 'object'
+          ? resultData as { accessToken?: string; refreshToken?: string } : undefined
+        if (credentialResultDisposition(account, data, next) !== 'input') continue
 
         if (!success) {
           accounts.set(id, {
@@ -2547,7 +2587,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       for (const data of items) {
         const { id, success, data: resultData, error } = data
         const account = accounts.get(id)
-        if (!account) continue
+        if (!account || credentialResultDisposition(account, data) !== 'input') continue
 
         if (!success) {
           accounts.set(id, {

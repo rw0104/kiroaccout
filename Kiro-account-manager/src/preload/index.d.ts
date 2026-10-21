@@ -1,5 +1,6 @@
 import type { AppUpdateState, UpdateActionResult } from '../main/appUpdater'
 import type { LoginResult, SocialLoginCallback } from '../main/loginSessions'
+import type { KiroInstancesApi } from '../shared/kiroInstances'
 import { ElectronAPI } from '@electron-toolkit/preload'
 
 interface AccountData {
@@ -166,7 +167,7 @@ interface KiroApi {
     }
   }>, concurrency?: number, syncInfo?: boolean) => Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }>
   onBackgroundRefreshProgress: (callback: (data: { completed: number; total: number; success: number; failed: number }) => void) => () => void
-  onBackgroundRefreshResult: (callback: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void) => () => void
+  onBackgroundRefreshResult: (callback: (data: { id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }) => void) => () => void
   
   // 后台批量检查账号状态（不刷新 Token）
   backgroundBatchCheck: (accounts: Array<{
@@ -184,7 +185,7 @@ interface KiroApi {
     idp?: string
   }>, concurrency?: number) => Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }>
   onBackgroundCheckProgress: (callback: (data: { completed: number; total: number; success: number; failed: number }) => void) => () => void
-  onBackgroundCheckResult: (callback: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void) => () => void
+  onBackgroundCheckResult: (callback: (data: { id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }) => void) => () => void
   
   // 切换账号 - 写入凭证到本地 SSO 缓存
   switchAccount: (credentials: {
@@ -257,6 +258,9 @@ interface KiroApi {
 
   // 验证凭证并获取账号信息
   verifyAccountCredentials: (credentials: {
+    accessToken?: string
+    expiresIn?: number
+    profileArn?: string
     refreshToken: string
     clientId: string
     clientSecret: string
@@ -382,6 +386,10 @@ interface KiroApi {
   }>
 
   // Every login operation is bound to the caller's session, including cancellation during start.
+  kiroInstances: KiroInstancesApi
+  startPortalLogin: (sessionId: string, privateMode: boolean) => Promise<LoginResult>
+  pollPortalLogin: (sessionId: string) => Promise<LoginResult>
+  cancelPortalLogin: (sessionId: string) => Promise<{ success: boolean }>
   startBuilderIdLogin: (region: string, sessionId: string) => Promise<LoginResult>
   pollBuilderIdAuth: (sessionId: string) => Promise<LoginResult>
   cancelBuilderIdLogin: (sessionId: string) => Promise<{ success: boolean }>

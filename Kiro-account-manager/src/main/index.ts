@@ -30,9 +30,12 @@ import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
+import { createWindowsKiroInstanceService } from './kiroInstances'
+import { registerKiroInstanceIpc } from './ipc/kiroInstances'
 import { normalizeCredentialRecord } from '../shared/accountImport'
 import { AppUpdateController, type AppUpdateState, type UpdateEngine } from './appUpdater'
 import { randomUUID } from 'node:crypto'
+import { TokenRefreshService, type AuthRefreshResult } from './authRefresh'
 import { LoginSessionManager } from './loginSessions'
 import {
   createTray,
@@ -207,13 +210,7 @@ function getKProxyAgent(): Dispatcher | undefined {
 }
 
 // ============ OIDC Token 刷新 ============
-interface OidcRefreshResult {
-  success: boolean
-  accessToken?: string
-  refreshToken?: string
-  expiresIn?: number
-  error?: string
-}
+type OidcRefreshResult = AuthRefreshResult
 
 // 社交登录 (GitHub/Google) 的 Token 刷新端点
 const KIRO_AUTH_ENDPOINT = 'https://prod.us-east-1.auth.desktop.kiro.dev'
@@ -381,7 +378,8 @@ function initProxyServer(): ProxyServer {
             account.clientSecret || '',
             account.region || 'us-east-1',
             account.authMethod,
-            account.proxyUrl  // 账号绑定的代理（如有）
+            account.proxyUrl,
+            account.clientSecretExpiresAt
           )
 
           if (refreshResult.success && refreshResult.accessToken) {
@@ -663,94 +661,26 @@ function openBrowserInPrivateMode(url: string): void {
   }
 }
 
-// IdC (BuilderId) 的 OIDC Token 刷新
+// Shared across all refresh entry points; never replay a refresh POST automatically.
+const tokenRefreshService = new TokenRefreshService({
+  fetch: fetchWithAppProxy,
+  socialEndpoint: KIRO_AUTH_ENDPOINT,
+  socialUserAgent: () => getKiroUserAgent(getCurrentMachineId())
+})
+
 async function refreshOidcToken(
   refreshToken: string,
   clientId: string,
   clientSecret: string,
-  region: string = 'us-east-1',
-  proxyUrl?: string  // 账号绑定的代理 URL（可选，优先级最高）
+  region = 'us-east-1',
+  proxyUrl?: string,
+  clientSecretExpiresAt?: number
 ): Promise<OidcRefreshResult> {
-  console.log(`[OIDC] Refreshing token${proxyUrl ? ' [via bound proxy]' : ''}`)
-
-  const url = `https://oidc.${region}.amazonaws.com/token`
-
-  const payload = {
-    clientId,
-    clientSecret,
-    refreshToken,
-    grantType: 'refresh_token'
-  }
-
-  try {
-    const response = await fetchWithAppProxy(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(payload)
-    }, proxyUrl)
-    
-    if (!response.ok) {
-      const errorText = await response.text()
-      console.error(`[OIDC] Refresh failed: HTTP ${response.status}`)
-      return { success: false, error: `HTTP ${response.status}: ${errorText}` }
-    }
-    
-    const data = await response.json()
-    console.log(`[OIDC] Token refreshed successfully, expires in ${data.expiresIn}s`)
-    
-    return {
-      success: true,
-      accessToken: data.accessToken,
-      refreshToken: data.refreshToken || refreshToken, // 可能不返回新的 refreshToken
-      expiresIn: data.expiresIn
-    }
-  } catch (error) {
-    console.error('[OIDC] Refresh request failed')
-    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
-  }
+  return tokenRefreshService.refresh({ kind: 'IdC', refreshToken, clientId, clientSecret, region, proxyUrl, clientSecretExpiresAt })
 }
 
-// 社交登录 (GitHub/Google) 的 Token 刷新
-async function refreshSocialToken(
-  refreshToken: string,
-  proxyUrl?: string  // 账号绑定的代理 URL（可选，优先级最高）
-): Promise<OidcRefreshResult> {
-  console.log(`[Social] Refreshing token...${proxyUrl ? ' [via bound proxy]' : ''}`)
-
-  const url = `${KIRO_AUTH_ENDPOINT}/refreshToken`
-  const machineId = getCurrentMachineId()
-
-  try {
-    const response = await fetchWithAppProxy(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'User-Agent': getKiroUserAgent(machineId)
-      },
-      body: JSON.stringify({ refreshToken })
-    }, proxyUrl)
-    
-    if (!response.ok) {
-      const errorText = await response.text()
-      console.error(`[Social] Refresh failed: HTTP ${response.status}`)
-      return { success: false, error: `HTTP ${response.status}: ${errorText}` }
-    }
-    
-    const data = await response.json()
-    console.log(`[Social] Token refreshed successfully, expires in ${data.expiresIn}s`)
-    
-    return {
-      success: true,
-      accessToken: data.accessToken,
-      refreshToken: data.refreshToken || refreshToken,
-      expiresIn: data.expiresIn
-    }
-  } catch (error) {
-    console.error('[Social] Refresh request failed')
-    return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
-  }
+async function refreshSocialToken(refreshToken: string, proxyUrl?: string): Promise<OidcRefreshResult> {
+  return tokenRefreshService.refresh({ kind: 'social', refreshToken, proxyUrl })
 }
 
 // 通用 Token 刷新 - 根据 authMethod 选择刷新方式
@@ -760,14 +690,25 @@ async function refreshTokenByMethod(
   clientSecret: string,
   region: string = 'us-east-1',
   authMethod?: string,
-  proxyUrl?: string  // 账号绑定的代理 URL（可选，优先级最高）
+  proxyUrl?: string,
+  clientSecretExpiresAt?: number
 ): Promise<OidcRefreshResult> {
   // 如果是社交登录，使用 Kiro Auth Service 刷新
   if (authMethod === 'social') {
     return refreshSocialToken(token, proxyUrl)
   }
+  // Older callers may omit the new field; retain a known registration deadline from storage.
+  if (clientSecretExpiresAt === undefined) {
+    const saved = store?.get('accountData') as { accounts?: Record<string, { credentials?: { clientId?: string; clientSecret?: string; clientSecretExpiresAt?: number } }> } | undefined
+    const deadlines = Object.values(saved?.accounts || {}).flatMap(account => {
+      const credentials = account.credentials
+      return credentials?.clientId === clientId && credentials.clientSecret === clientSecret && typeof credentials.clientSecretExpiresAt === 'number'
+        ? [credentials.clientSecretExpiresAt] : []
+    })
+    if (deadlines.length) clientSecretExpiresAt = Math.min(...deadlines)
+  }
   // 否则使用 OIDC 刷新 (IdC/BuilderId)
-  return refreshOidcToken(token, clientId, clientSecret, region, proxyUrl)
+  return refreshOidcToken(token, clientId, clientSecret, region, proxyUrl, clientSecretExpiresAt)
 }
 
 function generateInvocationId(): string {
@@ -1891,6 +1832,7 @@ type BackgroundRefreshAccount = {
     region?: string
     authMethod?: string
     accessToken?: string
+    clientSecretExpiresAt?: number
     provider?: string
     profileArn?: string
   }
@@ -1938,6 +1880,7 @@ async function runMainPoolTokenRefreshTick(): Promise<void> {
           refreshToken?: string
           clientId?: string
           clientSecret?: string
+          clientSecretExpiresAt?: number
           region?: string
           authMethod?: string
           accessToken?: string
@@ -1976,6 +1919,7 @@ async function runMainPoolTokenRefreshTick(): Promise<void> {
           refreshToken: creds.refreshToken,
           clientId: creds.clientId,
           clientSecret: creds.clientSecret,
+          clientSecretExpiresAt: creds.clientSecretExpiresAt,
           region: creds.region,
           authMethod: creds.authMethod,
           accessToken: creds.accessToken,
@@ -2477,6 +2421,18 @@ app.whenReady().then(async () => {
 
   // ============ 注册功能 IPC ============
   registerRegistrationHandlers(() => mainWindow)
+  const kiroInstanceService = createWindowsKiroInstanceService({
+    readConfig: async () => { await initStore(); return store!.get('kiroInstances') },
+    writeConfig: async records => { await initStore(); store!.set('kiroInstances', records) },
+    trustedPublishers: ['Amazon.com, Inc.']
+  })
+  registerKiroInstanceIpc({
+    ipcMain, service: kiroInstanceService,
+    chooseExecutable: async () => {
+      const result = await dialog.showOpenDialog({ title: '选择独立 Windows 用户安装的 Kiro.exe', properties: ['openFile'], filters: [{ name: 'Kiro', extensions: ['exe'] }] })
+      return result.canceled ? null : result.filePaths[0] || null
+    }
+  })
 
   // ============ 托盘相关 IPC ============
 
@@ -2905,7 +2861,8 @@ app.whenReady().then(async () => {
         clientSecret || '',
         region || 'us-east-1',
         authMethod,
-        boundProxyUrl
+        boundProxyUrl,
+        account.credentials?.clientSecretExpiresAt
       )
 
       if (!refreshResult.success || !refreshResult.accessToken) {
@@ -3475,7 +3432,8 @@ app.whenReady().then(async () => {
             clientSecret || '',
             region || 'us-east-1',
             authMethod,
-            boundProxyUrl
+            boundProxyUrl,
+            account.credentials?.clientSecretExpiresAt
           )
           
           if (refreshResult.success && refreshResult.accessToken) {
@@ -3533,6 +3491,8 @@ app.whenReady().then(async () => {
       
       await Promise.allSettled(
         batch.map(async (account) => {
+          const expectedRefreshToken = account.credentials.refreshToken || ''
+          const expectedAccessToken = account.credentials.accessToken || ''
           // 去重：渲染进程定时器与主进程调度器可能同时触发刷新，
           // 对同一账号并发刷新会让其中一个用到被 rotate 作废的旧 refreshToken。
           // 已在途则跳过本次（不计入成败，等在途那次的结果回流即可）。
@@ -3576,7 +3536,8 @@ app.whenReady().then(async () => {
                 clientSecret || '',
                 region || 'us-east-1',
                 authMethod,
-                boundProxyUrl
+                boundProxyUrl,
+                account.credentials?.clientSecretExpiresAt
               )
 
               if (!refreshResult.success) {
@@ -3585,6 +3546,8 @@ app.whenReady().then(async () => {
                 // 通知渲染进程刷新失败
                 mainWindow?.webContents.send('background-refresh-result', {
                   id: account.id,
+              expectedRefreshToken,
+              expectedAccessToken,
                   success: false,
                   error: refreshResult.error
                 })
@@ -3851,6 +3814,8 @@ app.whenReady().then(async () => {
             // 通知渲染进程更新账号
             mainWindow?.webContents.send('background-refresh-result', {
               id: account.id,
+              expectedRefreshToken,
+              expectedAccessToken,
               success: true,
               data: {
                 accessToken: newAccessToken,
@@ -3869,6 +3834,8 @@ app.whenReady().then(async () => {
             completed++
             mainWindow?.webContents.send('background-refresh-result', {
               id: account.id,
+              expectedRefreshToken,
+              expectedAccessToken,
               success: false,
               error: e instanceof Error ? e.message : 'Unknown error'
             })
@@ -3928,6 +3895,8 @@ app.whenReady().then(async () => {
       
       await Promise.allSettled(
         batch.map(async (account) => {
+          const expectedRefreshToken = account.credentials.refreshToken || ''
+          const expectedAccessToken = account.credentials.accessToken || ''
           try {
             const { accessToken, authMethod, provider } = account.credentials
             
@@ -3936,6 +3905,8 @@ app.whenReady().then(async () => {
               completed++
               mainWindow?.webContents.send('background-check-result', {
                 id: account.id,
+              expectedRefreshToken,
+              expectedAccessToken,
                 success: false,
                 error: '缺少 accessToken'
               })
@@ -4189,6 +4160,8 @@ app.whenReady().then(async () => {
             // 通知渲染进程更新账号
             mainWindow?.webContents.send('background-check-result', {
               id: account.id,
+              expectedRefreshToken,
+              expectedAccessToken,
               success: true,
               data: {
                 usage: usageData ? { ...usageData, resourceDetail } : null,
@@ -4203,6 +4176,8 @@ app.whenReady().then(async () => {
             completed++
             mainWindow?.webContents.send('background-check-result', {
               id: account.id,
+              expectedRefreshToken,
+              expectedAccessToken,
               success: false,
               error: e instanceof Error ? e.message : 'Unknown error'
             })
@@ -4231,10 +4206,12 @@ app.whenReady().then(async () => {
   // IPC: 导出到文件
   ipcMain.handle('export-to-file', async (_event, data: string, filename: string) => {
     try {
+      if (typeof data !== 'string' || typeof filename !== 'string') throw new Error('invalid export')
+      const extension = filename.toLowerCase().endsWith('.csv') ? 'csv' : filename.toLowerCase().endsWith('.txt') ? 'txt' : 'json'
       const result = await dialog.showSaveDialog(mainWindow!, {
         title: '导出账号数据',
         defaultPath: filename,
-        filters: [{ name: 'JSON Files', extensions: ['json'] }]
+        filters: [{ name: `${extension.toUpperCase()} Files`, extensions: [extension] }]
       })
 
       if (!result.canceled && result.filePath) {
@@ -4242,9 +4219,9 @@ app.whenReady().then(async () => {
         return true
       }
       return false
-    } catch (error) {
-      console.error('Failed to export:', error)
-      return false
+    } catch {
+      // Cancellation is false; a write failure must reach the renderer's failure state.
+      throw new Error('导出文件写入失败，请检查文件权限或磁盘空间后重试')
     }
   })
 
@@ -4277,6 +4254,9 @@ app.whenReady().then(async () => {
 
   // IPC: 验证凭证并获取账号信息（用于添加账号）
   ipcMain.handle('verify-account-credentials', async (_event, credentials: {
+    accessToken?: string
+    expiresIn?: number
+    profileArn?: string
     refreshToken: string
     clientId: string
     clientSecret: string
@@ -4297,7 +4277,9 @@ app.whenReady().then(async () => {
       
       // Step 1: 使用合适的方式刷新获取 accessToken
       console.log(`[Verify] Step 1: Refreshing token (authMethod: ${authMethod || 'IdC'})...`)
-      const refreshResult = await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod)
+      const refreshResult: OidcRefreshResult = normalized.credential.accessToken && typeof credentials.expiresIn === 'number' && Number.isFinite(credentials.expiresIn) && credentials.expiresIn > 0
+        ? { success: true, accessToken: normalized.credential.accessToken, refreshToken, expiresIn: credentials.expiresIn }
+        : await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod)
       
       if (!refreshResult.success || !refreshResult.accessToken) {
         const status = typeof refreshResult.error === 'string' ? refreshResult.error.match(/HTTP \d{3}/)?.[0] : undefined
@@ -4455,7 +4437,7 @@ app.whenReady().then(async () => {
           accessToken: refreshResult.accessToken,
           refreshToken: refreshResult.refreshToken || refreshToken,
           expiresIn: refreshResult.expiresIn,
-          profileArn: enterpriseProfileArn || undefined,
+          profileArn: enterpriseProfileArn || normalized.credential.profileArn,
           subscriptionType,
           subscriptionTitle,
           subscription: {
@@ -4931,6 +4913,9 @@ app.whenReady().then(async () => {
       }
     }
   })
+  ipcMain.handle('start-portal-login', (_event, sessionId: string, privateMode: boolean) => loginSessions.startPortal(sessionId, undefined, privateMode))
+  ipcMain.handle('poll-portal-login', (_event, sessionId: string) => loginSessions.pollPortal(sessionId))
+  ipcMain.handle('cancel-portal-login', (_event, sessionId: string) => loginSessions.cancel('portal', sessionId))
   ipcMain.handle('start-builder-id-login', (_event, region: string, sessionId: string) => loginSessions.startBuilder(sessionId, region))
   ipcMain.handle('poll-builder-id-auth', (_event, sessionId: string) => loginSessions.pollBuilder(sessionId))
   ipcMain.handle('cancel-builder-id-login', (_event, sessionId: string) => loginSessions.cancel('builderid', sessionId))

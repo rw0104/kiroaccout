@@ -1,5 +1,6 @@
 import type { AppUpdateState, UpdateActionResult } from '../main/appUpdater'
 import type { LoginResult, SocialLoginCallback } from '../main/loginSessions'
+import { KIRO_INSTANCE_CHANNELS, type KiroInstancesApi } from '../shared/kiroInstances'
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
@@ -78,8 +79,8 @@ const api = {
   },
 
   // 监听后台刷新结果（单个账号）
-  onBackgroundRefreshResult: (callback: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void): (() => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, data: { id: string; success: boolean; data?: unknown; error?: string }): void => {
+  onBackgroundRefreshResult: (callback: (data: { id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: { id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }): void => {
       callback(data)
     }
     ipcRenderer.on('background-refresh-result', handler)
@@ -118,8 +119,8 @@ const api = {
   },
 
   // 监听后台检查结果（单个账号）
-  onBackgroundCheckResult: (callback: (data: { id: string; success: boolean; data?: unknown; error?: string }) => void): (() => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, data: { id: string; success: boolean; data?: unknown; error?: string }): void => {
+  onBackgroundCheckResult: (callback: (data: { id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: { id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }): void => {
       callback(data)
     }
     ipcRenderer.on('background-check-result', handler)
@@ -198,6 +199,9 @@ const api = {
 
   // 验证凭证并获取账号信息
   verifyAccountCredentials: (credentials: {
+    accessToken?: string
+    expiresIn?: number
+    profileArn?: string
     refreshToken: string
     clientId: string
     clientSecret: string
@@ -275,6 +279,16 @@ const api = {
   },
 
   // Every login operation is bound to the caller's session, including cancellation during start.
+  kiroInstances: {
+    snapshot: () => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.snapshot),
+    create: input => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.create, input),
+    remove: id => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.remove, id),
+    launch: id => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.launch, id),
+    chooseExecutable: () => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.chooseExecutable)
+  } satisfies KiroInstancesApi,
+  startPortalLogin: (sessionId: string, privateMode: boolean): Promise<LoginResult> => ipcRenderer.invoke('start-portal-login', sessionId, privateMode),
+  pollPortalLogin: (sessionId: string): Promise<LoginResult> => ipcRenderer.invoke('poll-portal-login', sessionId),
+  cancelPortalLogin: (sessionId: string): Promise<{ success: boolean }> => ipcRenderer.invoke('cancel-portal-login', sessionId),
   startBuilderIdLogin: (region: string, sessionId: string): Promise<LoginResult> => ipcRenderer.invoke('start-builder-id-login', region, sessionId),
   pollBuilderIdAuth: (sessionId: string): Promise<LoginResult> => ipcRenderer.invoke('poll-builder-id-auth', sessionId),
   cancelBuilderIdLogin: (sessionId: string): Promise<{ success: boolean }> => ipcRenderer.invoke('cancel-builder-id-login', sessionId),

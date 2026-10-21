@@ -5,6 +5,7 @@ import { Sidebar, TitleBar, type PageType } from './components/layout'
 import { HomePage, AboutPage, SettingsPage, MachineIdPage, KiroSettingsPage, ProxyPage, KProxyPage, ProxyPoolPage, WebhooksPage, DiagnosePage, ConfigSyncPage, RegisterPage, SubscriptionPage, LogsPage } from './components/pages'
 import { useWebhookStore } from './store/webhooks'
 import { UpdateDialog } from './components/UpdateDialog'
+import { KiroInstancesPanel } from './components/kiro/KiroInstancesPanel'
 import { CloseConfirmDialog } from './components/CloseConfirmDialog'
 import { useAccountsStore, isBannedAccountError } from './store/accounts'
 
@@ -235,7 +236,7 @@ function App(): React.JSX.Element {
 
   // 监听后台刷新结果：缓冲 + 批量化 flush，N 条结果合并为一次 set，消除 Map 复制风暴
   useEffect(() => {
-    const refreshBuffer: Array<{ id: string; success: boolean; data?: unknown; error?: string }> = []
+    const refreshBuffer: Array<{ id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }> = []
     let flushTimer: ReturnType<typeof setTimeout> | null = null
 
     const flush = (): void => {
@@ -263,7 +264,7 @@ function App(): React.JSX.Element {
 
   // 监听后台检查结果：同样的批量化策略
   useEffect(() => {
-    const checkBuffer: Array<{ id: string; success: boolean; data?: unknown; error?: string }> = []
+    const checkBuffer: Array<{ id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }> = []
     let flushTimer: ReturnType<typeof setTimeout> | null = null
 
     const flush = (): void => {
@@ -327,6 +328,8 @@ function App(): React.JSX.Element {
         return <MachineIdPage />
       case 'kiroSettings':
         return <KiroSettingsPage />
+      case 'kiroInstances':
+        return <div className="flex-1 p-6 overflow-auto"><KiroInstancesPanel api={window.api.kiroInstances} /></div>
       case 'proxy':
         return <ProxyPage />
       case 'kproxy':
