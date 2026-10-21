@@ -9,6 +9,7 @@
 | 官方 IDE 基线 | 返回 `KIRO_REQUEST_OK`，见[客户端记录](2026-10-20-official-client-smoke.md) |
 | 候选实现首次请求 | HTTP 400，`ValidationException`，受控错误为 `profileArn is required for this request.`；未输出文本 |
 | 修正 profile 选择后 | HTTP 200，事件流完整解析，返回固定标记 `KIRO_ADAPTER_OK` |
+| 合成工具调用 | HTTP 200；收到 6 个 `toolUseEvent` 分段，组装为 `emit_marker({marker:"KIRO_TOOL_OK"})`，完成回调一次；仅验证返回参数，没有执行工具 |
 | 功能配置查询 | `KiroRuntimeService.GetFeatureConfiguration` 返回 HTTP 200 和 configuration；直接检查未返回 `create_response_api` 字段，不据此宣称实际启用了 Responses SSE |
 
 成功请求的 method 为 `POST`，端点 `https://runtime.us-east-1.kiro.dev/`，Content-Type 为 `application/x-amz-json-1.0`，操作 target 为 `KiroRuntimeService.GenerateAssistantResponse`。成功响应 Content-Type 为 `application/vnd.amazon.eventstream`，实收 `initial-response`、`assistantResponseEvent`、`metadataEvent`、`contextUsageEvent` 和 `meteringEvent`。严格分帧与 CRC 校验通过，完成回调一次，收到预期固定响应；没有自动换账户、换端点或重放。
@@ -22,3 +23,5 @@
 ## 仍未验收
 
 本次实测只覆盖当前已登录 Social 会话的 Runtime JSON-RPC 主链路和功能配置读取；没有证明所有账户、区域和模型均可用。未执行登录授权、扫码、Token 刷新/轮换、跨 Windows 用户 GUI、候选版安装或自动更新。未把真实凭证加入测试或 Git，也未记录邮箱、用户文件路径、请求头中的 Authorization、完整 profile 值或服务器原始响应。
+
+实现提交已合入 [PR #3](https://github.com/rw0104/kiroaccout/pull/3)，Windows 候选版从固定提交 `152320f462db60a87b15e8ff95cfd0e68c22b5bd` 构建，见[发布工作流](https://github.com/rw0104/kiroaccout/actions/runs/39528512752)。本段只补充真实观察，不改变该构建的源码。
