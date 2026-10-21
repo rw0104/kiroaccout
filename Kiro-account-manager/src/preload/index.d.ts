@@ -387,7 +387,8 @@ interface KiroApi {
 
   // Every login operation is bound to the caller's session, including cancellation during start.
   kiroInstances: KiroInstancesApi
-  startPortalLogin: (sessionId: string, privateMode: boolean) => Promise<LoginResult>
+  onKiroInstanceAccountUpdate: (callback: (info: { id: string; credentials: Record<string, unknown> }) => void) => () => void
+  startPortalLogin: (sessionId: string, privateMode: boolean, expectedProvider?: 'Google' | 'Github' | 'BuilderId' | 'Enterprise') => Promise<LoginResult>
   pollPortalLogin: (sessionId: string) => Promise<LoginResult>
   cancelPortalLogin: (sessionId: string) => Promise<{ success: boolean }>
   startBuilderIdLogin: (region: string, sessionId: string) => Promise<LoginResult>

@@ -318,6 +318,12 @@ function App(): React.JSX.Element {
     }
   }, [updateAccount])
 
+  useEffect(() => window.api.onKiroInstanceAccountUpdate(info => {
+    const account = useAccountsStore.getState().accounts.get(info.id)
+    if (!account) return
+    updateAccount(info.id, { credentials: { ...account.credentials, ...info.credentials } })
+  }), [updateAccount])
+
   const renderPage = () => {
     switch (currentPage) {
       case 'home':

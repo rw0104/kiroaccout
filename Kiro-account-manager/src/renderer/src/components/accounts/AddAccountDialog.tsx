@@ -7,7 +7,7 @@ import { X, Loader2, Download, Copy, Check, ExternalLink, Info, EyeOff } from 'l
 import { parseAccountImportText } from '../../../../shared/accountImport'
 import type { ImportOutcome } from '../../../../shared/accountImport'
 import { startSerialLoginPolling } from '@/lib/loginPolling'
-import type { LoginResult, SocialLoginCallback } from '../../../../main/loginSessions'
+import type { LoginResult } from '../../../../main/loginSessions'
 
 interface AddAccountDialogProps {
   isOpen: boolean
@@ -64,15 +64,14 @@ type ImportMode = 'oidc' | 'sso' | 'login'
 type LoginType = 'builderid' | 'google' | 'github' | 'iamsso'
 interface LoginAttempt {
   id: string
-  kind: 'builderid' | 'social' | 'iamsso' | 'portal'
+  kind: 'builderid' | 'iamsso' | 'portal'
   startUrl?: string
-  unsubscribe?: () => void
   stopPolling?: () => void
   expiryTimer?: ReturnType<typeof setTimeout>
-  processing?: boolean
   adding?: boolean
   added?: boolean
   pendingTokenData?: LoginResult
+  expectedProvider?: LoginResult['provider']
   tokenExpiresAt?: number
 }
 
@@ -181,9 +180,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setLoginVerifyPending(false)
     attempt.stopPolling?.()
     if (attempt.expiryTimer) clearTimeout(attempt.expiryTimer)
-    attempt.unsubscribe?.()
     const cancel = attempt.kind === 'portal' ? window.api.cancelPortalLogin : attempt.kind === 'builderid' ? window.api.cancelBuilderIdLogin
-      : attempt.kind === 'iamsso' ? window.api.cancelIamSsoLogin : window.api.cancelSocialLogin
+      : window.api.cancelIamSsoLogin
     void cancel(attempt.id).catch(() => {})
   }
   const finishLoginAttempt = (attempt: LoginAttempt) => {
@@ -357,6 +355,15 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           return null
         }
         if (result.completed) {
+          if (attempt.kind === 'portal' && (
+            !result.provider || !['Google', 'Github', 'BuilderId', 'Enterprise'].includes(result.provider) ||
+            (attempt.expectedProvider && result.provider !== attempt.expectedProvider) ||
+            result.authMethod !== (['Google', 'Github'].includes(result.provider) ? 'social' : 'IdC')
+          )) {
+            setError('登录方式与授权结果不一致，请重新开始')
+            finishLoginAttempt(attempt)
+            return null
+          }
           if (!result.accessToken || !result.refreshToken) {
             setError('授权响应不完整，请重新开始')
           } else {
@@ -392,10 +399,11 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     })
   }
 
-  const handleStartPortalLogin = async () => {
+  const handleStartPortalLogin = async (expectedProvider?: LoginResult['provider']) => {
     const attempt = beginLoginAttempt('portal')
+    attempt.expectedProvider = expectedProvider
     try {
-      const result = await window.api.startPortalLogin(attempt.id, usePrivateMode)
+      const result = await window.api.startPortalLogin(attempt.id, usePrivateMode, expectedProvider)
       if (!isCurrentLogin(attempt) || result.sessionId !== attempt.id) return
       if (!result.success) {
         setError(result.error || '无法打开网页登录，请重试')
@@ -461,53 +469,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setError(null)
   }
 
-  const handleStartSocialLogin = async (socialProvider: 'Google' | 'Github') => {
-    const attempt = beginLoginAttempt('social')
-    const receive = async (callback: SocialLoginCallback) => {
-      if (!isCurrentLogin(attempt) || callback.sessionId !== attempt.id || attempt.processing) return
-      attempt.processing = true
-      if (callback.error) {
-        setError(callback.error)
-        finishLoginAttempt(attempt)
-        return
-      }
-      if (!callback.code || !callback.state) return
-      try {
-        const result = await window.api.exchangeSocialToken(callback.code, callback.state, attempt.id)
-        if (!isCurrentLogin(attempt) || result.sessionId !== attempt.id) return
-        if (result.success && result.completed && result.accessToken && result.refreshToken) {
-          await handleLoginSuccess(attempt, { accessToken: result.accessToken, refreshToken: result.refreshToken, provider: result.provider, authMethod: 'social' })
-          if (isCurrentLogin(attempt)) finishLoginAttempt(attempt)
-        } else if (!result.success) {
-          setError(result.error || 'Token 交换失败')
-          finishLoginAttempt(attempt)
-        }
-      } catch {
-        if (!isCurrentLogin(attempt)) return
-        setError('Token 交换失败，请重新开始')
-        finishLoginAttempt(attempt)
-      }
-    }
-    // Subscribe before start can open a browser; query the cached handoff after await as well.
-    attempt.unsubscribe = window.api.onSocialAuthCallback(callback => { void receive(callback) })
-    try {
-      const result = await window.api.startSocialLogin(socialProvider, usePrivateMode, attempt.id)
-      if (!isCurrentLogin(attempt) || attempt.processing) return
-      if (!result.success) {
-        setError(result.error || '启动登录失败')
-        finishLoginAttempt(attempt)
-        return
-      }
-      setAttemptExpiry(attempt, result.expiresIn || 600)
-      const pending = await window.api.getSocialAuthCallback(attempt.id)
-      if (!isCurrentLogin(attempt)) return
-      if (pending) await receive(pending)
-    } catch {
-      if (!isCurrentLogin(attempt)) return
-      setError('启动登录失败，请重试')
-      finishLoginAttempt(attempt)
-    }
-  }
+  // Social buttons use the same PKCE loopback flow and bind the selected provider.
+  const handleStartSocialLogin = (socialProvider: 'Google' | 'Github') => handleStartPortalLogin(socialProvider)
 
   const handleRetryLoginSave = async () => {
     setIsSubmitting(true)
@@ -1031,11 +994,11 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                   </div>
                   
                   <div className="space-y-3 px-2">
-                    <Button className="w-full h-12" onClick={handleStartPortalLogin}>
+                    <Button className="w-full h-12" onClick={() => void handleStartPortalLogin()}>
                       <ExternalLink className="mr-2 h-4 w-4" />{isEn ? 'Sign in on Kiro website' : '打开 Kiro 网页登录'}
                     </Button>
                     <p className="text-xs text-muted-foreground">{isEn ? 'Supports Builder ID, Google, GitHub and IAM Identity Center. Returns through a local callback.' : '支持 Builder ID、Google、GitHub 和 IAM Identity Center，授权后通过本地回调完成。'}</p>
-                    <p className="pt-2 text-xs text-muted-foreground">{isEn ? 'Legacy compatibility methods' : '旧版兼容方式（优先使用上方网页登录）'}</p>
+                    <p className="pt-2 text-xs text-muted-foreground">{isEn ? 'Provider shortcuts and compatibility methods' : '登录快捷入口及兼容方式'}</p>
                     {/* Google */}
                     <button 
                       className="group w-full h-14 flex items-center px-4 gap-4 bg-background hover:bg-muted border border-border rounded-xl transition-all duration-200 hover:shadow-md hover:border-primary/30"

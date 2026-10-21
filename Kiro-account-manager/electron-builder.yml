@@ -19,10 +19,6 @@ extraFiles:
     to: LICENSE.kiroaccout.txt
   - from: ../THIRD_PARTY_NOTICES.md
     to: THIRD_PARTY_NOTICES.md
-protocols:
-  name: Kiro Auth
-  schemes:
-    - kiro
 copyright: Copyright 2026 kiroaccout contributors
 win:
   artifactName: ${name}-${version}-${arch}-windows.${ext}
