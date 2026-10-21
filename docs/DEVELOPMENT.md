@@ -1,8 +1,8 @@
 # 开发与发布指南
 
-本指南适用于 `rw0104/kiroaccout`。当前源码目标为 **1.8.0 · Windows x64**，发布状态以 Releases 为准。本版将多开改为同一 Windows 用户、共用一份官方 Kiro.exe、选择管理器已有账户启动独立配置实例，补充状态、正常停止、重启和恢复识别。真实双空白实例、账户绑定回归与包内容结果分别记录；不预先宣称双真实账户登录及刷新已验收。
+本指南适用于 `rw0104/kiroaccout`。当前源码目标为 **1.8.1 · Windows x64**，发布状态以 Releases 为准。本版在 1.8.0 多开基础上补充安装位置自动发现、旧版 OIDC 字段兼容和实例级代理配置，并修复后台同步造成的状态误报。真实双空白实例、账户绑定回归与包内容结果分别记录；不预先宣称双真实账户登录及刷新已验收。
 
-先读[项目规则](../AGENTS.md)、[隔离执行规范](development-rules.md)及[1.8.0 多开需求](requirements/2026-10-20-single-client-instances-1-8.md)。**账户管理器自身没有经过验证的运行时隔离模式。不同源码、安装目录、ZIP 或单个 user-data 参数均不隔离管理器与生产资料。** Kiro 客户端的受管实例是另一个功能；只在核实完整启动环境、目录和进程边界后，对空白受管实例执行已授权的实机验收，不运行开发管理器去访问生产资料。
+先读[项目规则](../AGENTS.md)、[隔离执行规范](development-rules.md)及[1.8.1 多开需求](requirements/2026-10-20-single-client-instances-1-8.md)。**账户管理器自身没有经过验证的运行时隔离模式。不同源码、安装目录、ZIP 或单个 user-data 参数均不隔离管理器与生产资料。** Kiro 客户端的受管实例是另一个功能；只在核实完整启动环境、目录和进程边界后，对空白受管实例执行已授权的实机验收，不运行开发管理器去访问生产资料。
 
 ## 1. 准备依赖和离线验证
 
@@ -31,7 +31,7 @@ npm run build
 | `npm run dev` / `npm start` | 启动 Electron | 先满足完整运行时隔离条件，不能在生产会话直接验证 |
 | `npm run test:e2e` | 连接运行中的桌面代理 | 不属于离线测试，不能连接生产服务执行 |
 
-1.7.7-rc.1 的历史记录为 **180/180 项离线回归通过**，不能将该数量当作本次 1.8.0 的结果。1.8.0 的当前回归、类型检查、编译、包内容和发布结果以对应构建日志及实机验收记录为准。1.7.6 的 105 项及更早的 85 项同样属于各自版本，详见[历史实施记录](2026-10-19-account-import-login/05-implementation-status.md)。
+1.7.7-rc.1 的历史记录为 **180/180 项离线回归通过**，不能将该数量当作本次 1.8.1 的结果。1.8.1 的当前回归、类型检查、编译、包内容和发布结果以对应构建日志及实机验收记录为准。1.7.6 的 105 项及更早的 85 项同样属于各自版本，详见[历史实施记录](2026-10-19-account-import-login/05-implementation-status.md)。
 
 ## 2. 定位模块和测试
 
@@ -45,7 +45,7 @@ npm run build
 | `src/main/loginSessions.ts`、`src/renderer/src/lib/loginPolling.ts` | 门户、旧兼容登录和串行查询 | state/PKCE、真实提供商、超时、取消、重复及迟到回调 |
 | `src/main/authRefresh.ts`、`src/main/index.ts` | 单凭证刷新协调、轮换代际及保存 | 同凭证单次在途，旧响应不能覆盖新凭证，客户端登记到期检查 |
 | `src/main/proxy/kiroRuntime.ts`、`kiroApi.ts`、`proxyServer.ts` | 当前 Runtime 请求及流适配 | 实际协议、区域、CRC、截断、超时、取消、终结回调和不重放边界 |
-| `src/main/kiroInstances.ts`、`kiroInstancePaths.ts`、`kiroInstanceWindows.ts`、`ipc/kiroInstances.ts` | 同用户多配置目录、可信安装、进程归属及生命周期 | 空账户初始化、固定参数和环境、标记与 reparse 检查、正常关闭、恢复识别及不误操作生产进程 |
+| `src/main/kiroInstances.ts`、`kiroInstancePaths.ts`、`kiroInstanceWindows.ts`、`kiroInstanceDiscovery.ts`、`kiroInstanceProxy.ts`、`ipc/kiroInstances.ts` | 同用户多配置目录、安装发现、可信安装、实例代理、进程归属及生命周期 | 空账户初始化、自动发现并验证 Kiro.exe、代理只作用于实例、固定参数和环境、标记与 reparse 检查、正常关闭、恢复识别及不误操作生产进程 |
 | `src/main/kiroInstanceAccounts.ts`、`kiroInstanceOwnership.ts` | 所选账户的专用缓存、刷新凭证同步与持久绑定归属 | 只写绑定实例、身份校验、保留较新轮换、拒绝重复消费凭证、旧渲染快照不能覆盖新凭证 |
 | `src/shared/kiroInstances.ts`、`src/renderer/src/components/kiro/KiroInstancesPanel.tsx` | 窄 API 与独立多开页面 | 状态约三秒刷新，启动/停止/重启与失败明确反馈，不挂载旧 Kiro 设置页 |
 | `src/main/appUpdater.ts`、`UpdateDialog.tsx` | 正式版本检查和用户确认更新 | 稳定渠道、下载校验、保存 ACK、安装失败不退出 |
@@ -124,7 +124,7 @@ AWS event stream 校验 prelude/message CRC、长度、UTF-8、JSON 和事件类
 
 同一 Windows 身份、DPAPI、系统网络、代理、证书和机器级策略仍共享，这不是安全沙箱。官方 Kiro 1.4.5 的两个空白实例已完成同 SID/EXE 并行、停止/重启 A 保持 B 完整进程身份、重建控制器恢复识别及最终正常停止的实机检查，详见[本轮实机记录](requirements/2026-10-20-single-client-instances-1-8.md#本轮实机记录)。1.4.13 的启动与存储依据仍为[静态证据](evidence/2026-10-20-kiro-instance-lifecycle.md)。该结果不等于双真实账户刷新或回调已验收；未执行的双账户登录、刷新和扫码不得写成通过。
 
-## 7. 构建与发布正式 1.8.0
+## 7. 构建与发布正式 1.8.1
 
 应用 package.json、lockfile 与发布说明版本必须一致。所有 npm 命令在应用根执行；源码改动后先编译，再打包：
 
@@ -144,7 +144,7 @@ node scripts/release-version.mjs
 
 | 渠道 | 公开附件 | 发布规则 |
 | --- | --- | --- |
-| 正式 `1.8.0` | EXE、Windows ZIP、同安装器 blockmap、latest.yml、SHA256SUMS.txt | 非 prerelease，完整校验后设 latest，允许稳定客户端检查 |
+| 正式 `1.8.1` | EXE、Windows ZIP、同安装器 blockmap、latest.yml、SHA256SUMS.txt | 非 prerelease，完整校验后设 latest，允许稳定客户端检查 |
 | 历史 `1.7.7-rc.1` | 对应 EXE、Windows ZIP、SHA256SUMS.txt | GitHub prerelease，不设 latest，不公开稳定 latest.yml/blockmap |
 
 发布使用 [.github/workflows/build.yml](../.github/workflows/build.yml)，由标签或手动触发。流程在干净环境安装、测试、编译、打包、检查内容和摘要，再收集精确附件；发布任务复核下载摘要，拒绝已有标签指向其他提交，先上传完整 draft 再公开。发布后核对标签提交、渠道标记、附件名/大小/摘要和 stable latest，不能因本地存在 EXE 就宣布 GitHub 发布完成。
@@ -152,13 +152,13 @@ node scripts/release-version.mjs
 下载后，可在附件所在目录核对：
 
 ```powershell
-Get-FileHash -LiteralPath ./kiro-account-manager-1.8.0-x64-setup.exe -Algorithm SHA256
-Get-FileHash -LiteralPath ./kiro-account-manager-1.8.0-x64-windows.zip -Algorithm SHA256
+Get-FileHash -LiteralPath ./kiro-account-manager-1.8.1-x64-setup.exe -Algorithm SHA256
+Get-FileHash -LiteralPath ./kiro-account-manager-1.8.1-x64-windows.zip -Algorithm SHA256
 ```
 
-将值与同一 Release 的 SHA256SUMS.txt 比较。账户管理器未配置代码签名，不宣称已签名；被选择启动的官方 Kiro 必须通过其自身签名检查。1.8.0 安装器不再声明 kiro 协议，但管理器应用身份及默认数据仍与历史版本共用，不因不同目录或 ZIP 获得并存隔离。
+将值与同一 Release 的 SHA256SUMS.txt 比较。账户管理器未配置代码签名，不宣称已签名；被选择启动的官方 Kiro 必须通过其自身签名检查。1.8.1 安装器不再声明 kiro 协议，但管理器应用身份及默认数据仍与历史版本共用，不因不同目录或 ZIP 获得并存隔离。
 
-稳定更新由 `appUpdater.ts` 管理，默认启动及每六小时检查，用户确认下载、保存成功后再确认安装。1.8.0 仅在完整公开发布后进入稳定更新；原上游 1.7.5 不会自动改为本仓库更新源。迁移前先保留完整备份，开发期间不运行安装器覆盖现有版本。
+稳定更新由 `appUpdater.ts` 管理，默认启动及每六小时检查，用户确认下载、保存成功后再确认安装。1.8.1 仅在完整公开发布后进入稳定更新；原上游 1.7.5 不会自动改为本仓库更新源。迁移前先保留完整备份，开发期间不运行安装器覆盖现有版本。
 
 ## 8. 证据、问题与验收记录
 
@@ -171,7 +171,7 @@ Get-FileHash -LiteralPath ./kiro-account-manager-1.8.0-x64-windows.zip -Algorith
 | 官方客户端最小对话检查（2026-10-20） | 在已登录官方 Kiro 的新会话发送固定、无需文件或工具操作的提示，收到 `KIRO_REQUEST_OK`；界面显示耗时 15 秒、模型选择为 Claude Opus 5.5，未显示工具调用 | 证明官方客户端现有登录态下的一条真实 AI 请求成功；不证明候选版 Runtime 适配、门户授权、扫码或跨用户 GUI 通过 |
 | [候选 Runtime 接口检查](evidence/2026-10-20-live-interface-checks.md) | 真实请求发现并修复误删官方默认 profile 的问题；修后 HTTP 200，事件流 CRC 与预期标记通过，功能配置读取 HTTP 200 | 仅当前 Social 会话的 JSON-RPC 主链路得到真实验收，未执行刷新或缓存写回 |
 
-官方客户端 UI 检查和新 Runtime 接口探针是两条记录；前者不读取、复制或输出凭证，后者经用户授权仅在内存使用当前 access token，未刷新或写回。公开记录不包含凭证、邮箱、工作区、用户名或其截图。旧版 180 项离线回归与局部真实接口结果不能替代 1.8.0 的多开验收。
+官方客户端 UI 检查和新 Runtime 接口探针是两条记录；前者不读取、复制或输出凭证，后者经用户授权仅在内存使用当前 access token，未刷新或写回。公开记录不包含凭证、邮箱、工作区、用户名或其截图。旧版 180 项离线回归与局部真实接口结果不能替代 1.8.1 的多开验收。
 
 实机验收应分别记录：同一官方 EXE 的两个空配置并行启动、目录与设置分离、真实进程恢复识别、停止 A 不影响 B/默认 IDE、关闭等待、退出恢复；再独立记录两个已有账户的选择与直接启动、渠道/区域、缓存归属及真实轮换。门户往返、Builder/组织二阶段回调、资料和保存重试，以及 AI 文本/工具/推理/用量按各自链路验收；安装升级另列。暂不执行的扫码或双账户登录不标为通过。测试使用独立授权的账户，不复制生产账户库作为开发种子。
 

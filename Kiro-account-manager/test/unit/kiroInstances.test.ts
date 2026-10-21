@@ -420,6 +420,18 @@ test('background synchronization shares the lifecycle lock and does not launch a
   await assert.rejects(h.service.synchronize(record.id), /账户同步/)
 })
 
+test('a read-only background synchronization does not make a healthy snapshot appear unverified', async () => {
+  const h = harness(), entered = deferred<void>(), release = deferred<void>()
+  const record = await h.service.create({ label: 'Snapshot while sync', executablePath, accountId: 'synthetic-account-one' })
+  h.options.syncAccount = async () => { entered.resolve(); await release.promise }
+  const syncing = h.service.synchronize(record.id)
+  await entered.promise
+  const snapshot = await h.service.snapshot()
+  assert.equal(snapshot.instances[0].launchStatus, 'stopped')
+  release.resolve()
+  await syncing
+})
+
 test('launch plans isolate every supported directory and remove inherited authentication and module injection', async () => {
   const h = harness(), original = structuredClone(h.parentEnv)
   const record = await h.create()
@@ -436,6 +448,31 @@ test('launch plans isolate every supported directory and remove inherited authen
   const args = buildInstanceArguments(record.paths)
   for (const flag of ['--user-data-dir', '--extensions-dir', '--shared-data-dir', '--agent-plugins-dir', '--agents-user-data-dir', '--agents-extensions-dir']) assert.equal(args.filter(arg => arg === flag).length, 1)
   assert.ok(args.includes('--disable-updates'))
+})
+
+test('instance proxy is normalized, persisted, injected only into its launch environment, and can be changed while stopped', async () => {
+  const h = harness()
+  h.parentEnv.HTTP_PROXY = 'http://production-proxy:8080'
+  h.parentEnv.HTTPS_PROXY = 'http://production-proxy:8080'
+  h.parentEnv.ALL_PROXY = 'socks5://production-proxy:1080'
+  const record = await h.service.create({ label: 'Proxied', executablePath, proxy: 'socks5:127.0.0.1:1080' })
+  assert.equal(record.proxy?.url, 'socks5://127.0.0.1:1080')
+  const env = buildInstanceEnvironment(h.parentEnv, record.paths, false, record.proxy)
+  assert.equal(env.HTTP_PROXY, record.proxy?.url)
+  assert.equal(env.HTTPS_PROXY, record.proxy?.url)
+  assert.equal(env.ALL_PROXY, record.proxy?.url)
+  assert.equal(env.http_proxy, record.proxy?.url)
+  assert.equal(env.all_proxy, record.proxy?.url)
+  assert.equal(env.NO_PROXY, undefined)
+  assert.equal(h.parentEnv.HTTP_PROXY, 'http://production-proxy:8080')
+  await h.service.launch(record.id)
+  assert.equal(h.launchPlans[0].env.HTTP_PROXY, record.proxy?.url)
+  await h.service.stop(record.id)
+  await h.service.setProxy(record.id, 'http://127.0.0.1:7890')
+  const restored = (await h.recreate().snapshot()).instances[0]
+  assert.equal(restored.schemaVersion === 2 ? restored.proxy?.url : undefined, 'http://127.0.0.1:7890')
+  await assert.rejects(h.service.setProxy(record.id, 'ftp://127.0.0.1:21'), /代理仅支持/)
+  await assert.rejects(h.service.setProxy(record.id, 'http://127.0.0.1:70000'), /实例代理地址无效|代理仅支持/)
 })
 
 test('portable installations use an existing dedicated portable root and its matching user-data', async () => {

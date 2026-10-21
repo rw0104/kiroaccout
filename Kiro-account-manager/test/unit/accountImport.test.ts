@@ -324,3 +324,80 @@ test('timestamps normalize seconds, milliseconds and ISO without inventing valid
     assert.equal(normalizeTimestamp(value), undefined)
   }
 })
+
+test('legacy OIDC clipboard aliases and nested client registration fields normalize to Builder ID IdC', () => {
+  const plan = parseAccountImportText(JSON.stringify({
+    email: 'builder-alias@example.invalid',
+    oidc_credentials: {
+      RefreshToken: 'FAKE_RT_OIDC_ALIAS',
+      AccessToken: 'FAKE_AT_OIDC_ALIAS',
+      ClientId: 'FAKE_CLIENT_OIDC_ALIAS',
+      ClientSecret: 'FAKE_SECRET_OIDC_ALIAS',
+      AuthMethod: 'OLDC',
+      Provider: 'OIDC',
+      Region: 'eu-west-1'
+    }
+  }))
+  assert.equal(plan.counts.valid, 1)
+  assert.equal(plan.records[0].credential?.provider, 'BuilderId')
+  assert.equal(plan.records[0].credential?.authMethod, 'IdC')
+  assert.equal(plan.records[0].credential?.region, 'eu-west-1')
+})
+
+test('generic IdC provider label is treated as Builder ID only when OIDC clients are present', () => {
+  const plan = parseAccountImportText(JSON.stringify({
+    refreshToken: 'FAKE_RT_GENERIC_IDC',
+    clientId: 'FAKE_CLIENT_GENERIC_IDC',
+    clientSecret: 'FAKE_SECRET_GENERIC_IDC',
+    provider: 'IdC'
+  }))
+  assert.equal(plan.counts.valid, 1)
+  assert.equal(plan.records[0].credential?.provider, 'BuilderId')
+  assert.equal(plan.records[0].credential?.authMethod, 'IdC')
+})
+
+test('external_idp and AWSIdC aliases preserve Enterprise IdC identity', () => {
+  const plan = parseAccountImportText(JSON.stringify({
+    refresh_token: 'FAKE_RT_ENTERPRISE_ALIAS',
+    client_id: 'FAKE_CLIENT_ENTERPRISE_ALIAS',
+    client_secret: 'FAKE_SECRET_ENTERPRISE_ALIAS',
+    external_idp: 'awsidc'
+  }))
+  assert.equal(plan.counts.valid, 1)
+  assert.equal(plan.records[0].credential?.provider, 'Enterprise')
+  assert.equal(plan.records[0].credential?.authMethod, 'IdC')
+})
+
+test('explicit ExternalIdp legacy identity is retained on the Enterprise IdC branch', () => {
+  const plan = parseAccountImportText(JSON.stringify({
+    refreshToken: 'FAKE_RT_EXTERNAL_IDP',
+    clientId: 'FAKE_CLIENT_EXTERNAL_IDP',
+    clientSecret: 'FAKE_SECRET_EXTERNAL_IDP',
+    provider: 'ExternalIdp',
+    authMethod: 'external_idp'
+  }))
+  assert.equal(plan.counts.valid, 1)
+  assert.equal(plan.records[0].credential?.provider, 'Enterprise')
+  assert.equal(plan.records[0].credential?.authMethod, 'IdC')
+})
+
+test('OIDC typo never turns a Social provider into IdC', () => {
+  const plan = parseAccountImportText(JSON.stringify({
+    refreshToken: 'FAKE_RT_SOCIAL_CONFLICT',
+    provider: 'GitHub',
+    authMethod: 'OLDC'
+  }))
+  assert.equal(plan.counts.invalid, 1)
+  assert.ok(plan.records[0].issues.some(issue => issue.code === 'provider_auth_method_conflict'))
+})
+
+test('unknown explicit provider remains rejected instead of being inferred as Builder ID', () => {
+  const plan = parseAccountImportText(JSON.stringify({
+    refreshToken: 'FAKE_RT_UNKNOWN_PROVIDER',
+    clientId: 'FAKE_CLIENT_UNKNOWN_PROVIDER',
+    clientSecret: 'FAKE_SECRET_UNKNOWN_PROVIDER',
+    provider: 'Facebook'
+  }))
+  assert.equal(plan.counts.invalid, 1)
+  assert.ok(plan.records[0].issues.some(issue => issue.code === 'unsupported_provider'))
+})

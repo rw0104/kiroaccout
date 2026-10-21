@@ -287,6 +287,8 @@ const api = {
     launch: id => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.launch, id),
     stop: id => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.stop, id),
     restart: id => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.restart, id),
+    setProxy: (id, proxy) => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.setProxy, id, proxy),
+    discover: () => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.discover),
     chooseExecutable: () => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.chooseExecutable)
   } satisfies KiroInstancesApi,
   onKiroInstanceAccountUpdate: (callback: (info: { id: string; credentials: Record<string, unknown> }) => void): (() => void) => {

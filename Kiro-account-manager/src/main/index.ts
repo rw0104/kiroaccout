@@ -32,12 +32,14 @@ import { registerIPCHandlers as registerRegistrationHandlers } from './registrat
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import { createWindowsKiroInstanceService, KiroInstanceError } from './kiroInstances'
 import { createWindowsKiroRuntime } from './kiroInstanceWindows'
+import { createWindowsKiroInstallationDiscovery } from './kiroInstanceDiscovery'
 import { prepareKiroInstanceAccount, readKiroInstanceAccountUpdate, type InstanceBoundAccount } from './kiroInstanceAccounts'
 import { verifyKiroInstanceIdentity } from './kiroInstanceIdentity'
 import { InstanceAccountOwnership, InstanceOwnershipError, INSTANCE_ACCOUNT_REAUTH_REQUIRED, mergeInstanceOwnedAccounts, type InstanceOwnershipInput } from './kiroInstanceOwnership'
 import { applyManagerTokenRotation } from './managerAccountRefresh'
 import { registerKiroInstanceIpc } from './ipc/kiroInstances'
 import { normalizeCredentialRecord } from '../shared/accountImport'
+import { resolveIdentity } from '../shared/authIdentity'
 import { AppUpdateController, type AppUpdateState, type UpdateEngine } from './appUpdater'
 import { randomUUID } from 'node:crypto'
 import { TokenRefreshService, type AuthRefreshResult } from './authRefresh'
@@ -1408,7 +1410,24 @@ function getInstanceBoundAccount(accountId: string): InstanceBoundAccount {
   const account = data?.accounts?.[accountId]
   if (!account || account.id !== accountId) throw new Error('绑定账户已不存在，请先移除实例绑定')
   if (account.profileArn && account.credentials.profileArn && account.profileArn !== account.credentials.profileArn) throw new Error('账户 profile 资料不一致，请先核对后绑定')
-  return { ...account, credentials: { ...account.credentials, ...(account.credentials.profileArn ? {} : account.profileArn ? { profileArn: account.profileArn } : {}) } }
+  // Older manager records sometimes kept the provider on the account (`idp`)
+  // while leaving a stale authMethod in credentials. The provider is the
+  // authoritative identity for an already imported account: repair only this
+  // in-memory launch copy so a Google/GitHub account cannot be sent through the
+  // OIDC registration path. JSON import itself remains strict about conflicts.
+  const providerHint = account.credentials.provider || account.idp
+  const identity = resolveIdentity({ provider: providerHint, idp: account.idp, hasClientCredentials: !!(account.credentials.clientId && account.credentials.clientSecret) })
+  if (!identity.ok) throw new KiroInstanceError('绑定账户的登录提供商无法识别，请在账户管理中修正 provider/idp 后重试。')
+  return {
+    ...account,
+    idp: identity.provider as InstanceBoundAccount['idp'],
+    credentials: {
+      ...account.credentials,
+      ...(account.credentials.profileArn ? {} : account.profileArn ? { profileArn: account.profileArn } : {}),
+      provider: identity.provider,
+      authMethod: identity.authMethod
+    }
+  }
 }
 
 function persistInstanceAccountCredentials(accountId: string, credentials: InstanceBoundAccount['credentials'], expected?: InstanceBoundAccount['credentials']): void {
@@ -2484,6 +2503,8 @@ app.whenReady().then(async () => {
 
   // ============ 注册功能 IPC ============
   registerRegistrationHandlers(() => mainWindow)
+  const kiroInstanceRuntime = createWindowsKiroRuntime({ trustedPublishers: ['Amazon.com, Inc.'] })
+  const kiroInstallationDiscovery = createWindowsKiroInstallationDiscovery({ runtime: kiroInstanceRuntime })
   const kiroInstanceService = createWindowsKiroInstanceService({
     baseRoot: join(app.getPath('userData'), 'kiro-instances-v2'),
     readConfig: async () => { await initStore(); return store!.get('kiroInstances') },
@@ -2496,7 +2517,7 @@ app.whenReady().then(async () => {
         if (instanceAccountOwnership.isBound({ accountId: account.id, ...account })) pool!.removeAccount(account.id)
       }
     },
-    runtime: createWindowsKiroRuntime({ trustedPublishers: ['Amazon.com, Inc.'] }),
+    runtime: kiroInstanceRuntime,
     prepareAccount: async record => {
       const account = getInstanceBoundAccount(record.accountId!)
       const defaultToken = await readKiroAuthTokenFile()
@@ -2504,14 +2525,14 @@ app.whenReady().then(async () => {
         throw new KiroInstanceError('默认 Kiro 客户端仍保存着该账户的同一份凭证。请先在默认客户端切换其他账户，避免两个客户端争用刷新凭证；默认客户端资料未被改动。')
       }
       const prepared = await prepareKiroInstanceAccount({ record, account, verifyIdentity: credentials => verifyKiroInstanceIdentity(credentials, {
-        fetch: (input, options) => fetchWithAppProxy(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, options ?? {})
+        fetch: (input, options) => fetchWithAppProxy(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, options ?? {}, record.proxy?.url)
       }) })
       if (prepared.source === 'instance') persistInstanceAccountCredentials(account.id, prepared.credentials, account.credentials)
     },
     syncAccount: async record => {
       const account = getInstanceBoundAccount(record.accountId!)
       const update = await readKiroInstanceAccountUpdate({ record, account, verifyIdentity: credentials => verifyKiroInstanceIdentity(credentials, {
-        fetch: (input, options) => fetchWithAppProxy(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, options ?? {})
+        fetch: (input, options) => fetchWithAppProxy(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, options ?? {}, record.proxy?.url)
       }) })
       if (update) persistInstanceAccountCredentials(account.id, update.credentials, account.credentials)
     },
@@ -2543,7 +2564,7 @@ app.whenReady().then(async () => {
   instanceSyncTimer.unref()
   app.once('before-quit', () => clearInterval(instanceSyncTimer))
   registerKiroInstanceIpc({
-    ipcMain, service: kiroInstanceService,
+    ipcMain, service: kiroInstanceService, discovery: kiroInstallationDiscovery,
     chooseExecutable: async () => {
       const result = await dialog.showOpenDialog({ title: '选择多个实例共用的官方 Kiro.exe', properties: ['openFile'], filters: [{ name: 'Kiro', extensions: ['exe'] }] })
       return result.canceled ? null : result.filePaths[0] || null

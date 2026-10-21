@@ -163,30 +163,45 @@ type StringField =
   | 'nickname'
   | 'idp'
 
+/**
+ * The manager has historically exported a few different spellings.  Keep the
+ * compatibility aliases here (at the import boundary) instead of relaxing the
+ * canonical identity module: an unknown provider must still be rejected by the
+ * rest of the application.  `OLDC` is a common clipboard typo for OIDC and is
+ * accepted only as the IdC auth-method spelling; it never makes a Social
+ * record look like an IdC record by itself.
+ */
 const STRING_FIELD_ALIASES: Record<StringField, string[]> = {
-  refreshToken: ['refreshToken', 'refresh_token'],
-  accessToken: ['accessToken', 'access_token'],
-  clientId: ['clientId', 'client_id'],
-  clientSecret: ['clientSecret', 'client_secret'],
-  authMethod: ['authMethod', 'auth_method'],
-  provider: ['provider'],
-  region: ['region'],
-  startUrl: ['startUrl', 'start_url'],
-  profileArn: ['profileArn', 'profile_arn'],
+  refreshToken: ['refreshToken', 'refresh_token', 'RefreshToken', 'refresh-token'],
+  accessToken: ['accessToken', 'access_token', 'AccessToken', 'access-token'],
+  clientId: ['clientId', 'client_id', 'ClientId', 'client-id'],
+  clientSecret: ['clientSecret', 'client_secret', 'ClientSecret', 'client-secret'],
+  authMethod: ['authMethod', 'auth_method', 'AuthMethod', 'auth-method', 'authType', 'auth_type', 'loginType', 'login_type'],
+  provider: ['provider', 'Provider'],
+  region: ['region', 'Region'],
+  startUrl: ['startUrl', 'start_url', 'StartUrl', 'start-url'],
+  profileArn: ['profileArn', 'profile_arn', 'ProfileArn', 'profile-arn'],
   email: ['email'],
   password: ['password'],
-  userId: ['userId', 'user_id'],
-  nickname: ['nickname'],
-  idp: ['idp']
+  userId: ['userId', 'user_id', 'UserId', 'user-id'],
+  nickname: ['nickname', 'displayName', 'display_name'],
+  // Kiro 1.4.x and older exports called this external_idp.  It is an identity
+  // hint, not a credential container and is only used when provider is absent.
+  idp: ['idp', 'IdP', 'external_idp', 'externalIdp', 'external-idp', 'identityProvider']
 }
-const EXPIRES_AT_ALIASES = ['expiresAt', 'expires_at']
-const CLIENT_EXPIRY_ALIASES = ['clientSecretExpiresAt', 'client_secret_expires_at']
+const EXPIRES_AT_ALIASES = ['expiresAt', 'expires_at', 'ExpiresAt', 'expires-at', 'tokenExpiresAt', 'token_expires_at']
+const CLIENT_EXPIRY_ALIASES = ['clientSecretExpiresAt', 'client_secret_expires_at', 'ClientSecretExpiresAt', 'client-secret-expires-at']
+
+// These are the only additional credential containers we unwrap.  We do not
+// recursively search arbitrary JSON, because unrelated nested objects must not
+// be imported as accounts by accident.
+const CREDENTIAL_CONTAINER_ALIASES = ['credentials', 'credential', 'oidc', 'oidcCredentials', 'oidc_credentials', 'authCredentials', 'clientRegistration', 'client_registration']
 
 const ALL_KNOWN_KEYS = new Set<string>([
   ...Object.values(STRING_FIELD_ALIASES).flat(),
   ...EXPIRES_AT_ALIASES,
   ...CLIENT_EXPIRY_ALIASES,
-  'credentials'
+  ...CREDENTIAL_CONTAINER_ALIASES
 ])
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -202,19 +217,44 @@ function typeName(v: unknown): string {
 /** 取出某个字段在顶层与 credentials 中的所有出现 */
 function collectOccurrences(
   record: Record<string, unknown>,
-  creds: Record<string, unknown> | undefined,
+  creds: Array<{ name: string; value: Record<string, unknown> }>,
   aliases: string[]
 ): Array<{ path: string; value: unknown }> {
   const out: Array<{ path: string; value: unknown }> = []
   for (const key of aliases) {
     if (key in record && record[key] !== undefined && record[key] !== null) out.push({ path: key, value: record[key] })
   }
-  if (creds) {
+  for (const container of creds) {
     for (const key of aliases) {
-      if (key in creds && creds[key] !== undefined && creds[key] !== null) out.push({ path: `credentials.${key}`, value: creds[key] })
+      if (key in container.value && container.value[key] !== undefined && container.value[key] !== null) out.push({ path: `${container.name}.${key}`, value: container.value[key] })
     }
   }
   return out
+}
+
+function importProvider(raw: unknown): CanonicalProvider | null | undefined {
+  const normalized = normalizeProvider(raw)
+  if (normalized !== null && normalized !== undefined) return normalized
+  if (typeof raw !== 'string') return normalized
+  const key = raw.trim().toLowerCase().replace(/[\s_-]+/g, '')
+  // OIDC is an authentication protocol, not a Social provider.  Legacy
+  // exports used it as a generic provider label for Builder ID credentials.
+  if (key === 'oidc' || key === 'idc' || key === 'aws oidc'.replace(/\s/g, '') || key === 'oldc') return 'BuilderId'
+  // AccountCredentials historically has no separate ExternalIdp provider
+  // variant; preserve that explicit legacy identity as the Enterprise IdC
+  // branch instead of silently treating it as Social.
+  if (key === 'externalidp') return 'Enterprise'
+  return null
+}
+
+function importAuthMethod(raw: unknown): CanonicalAuthMethod | null | undefined {
+  const normalized = normalizeAuthMethod(raw)
+  if (normalized !== null && normalized !== undefined) return normalized
+  if (typeof raw === 'string') {
+    const key = raw.trim().toLowerCase().replace(/[\s_-]+/g, '')
+    if (key === 'oldc' || key === 'aws oidc'.replace(/\s/g, '') || key === 'externalidp') return 'IdC'
+  }
+  return normalized
 }
 
 /**
@@ -266,16 +306,14 @@ export function normalizeCredentialRecord(
     }
   }
 
-  let creds: Record<string, unknown> | undefined
-  if ('credentials' in raw && raw.credentials !== undefined && raw.credentials !== null) {
-    if (isPlainObject(raw.credentials)) {
-      creds = raw.credentials
-    } else {
-      issues.push({ field: 'credentials', code: 'invalid_type', message: `credentials 必须是对象，实际为 ${typeName(raw.credentials)}` })
-    }
+  const creds: Array<{ name: string; value: Record<string, unknown> }> = []
+  for (const key of CREDENTIAL_CONTAINER_ALIASES) {
+    if (!(key in raw) || raw[key] === undefined || raw[key] === null) continue
+    if (isPlainObject(raw[key])) creds.push({ name: key === 'credentials' ? 'credentials' : key, value: raw[key] })
+    else issues.push({ field: key, code: 'invalid_type', message: `${key} 必须是对象，实际为 ${typeName(raw[key])}` })
   }
 
-  const hasKnownField = Object.keys(raw).some(k => ALL_KNOWN_KEYS.has(k)) || (creds !== undefined && Object.keys(creds).some(k => ALL_KNOWN_KEYS.has(k)))
+  const hasKnownField = Object.keys(raw).some(k => ALL_KNOWN_KEYS.has(k)) || creds.some(container => Object.keys(container.value).some(k => ALL_KNOWN_KEYS.has(k)))
   if (!hasKnownField) {
     return { issues: [{ code: 'unrecognized_record', message: '未找到任何账户字段（refreshToken、provider、clientId 等）' }], warnings }
   }
@@ -295,8 +333,8 @@ export function normalizeCredentialRecord(
     if (strings.length === 0) continue
     // provider / authMethod / idp 以标准化后的值比较，其余按去空白后的原文比较
     const comparable = (v: string): string => {
-      if (field === 'provider' || field === 'idp') return String(normalizeProvider(v) ?? v)
-      if (field === 'authMethod') return String(normalizeAuthMethod(v) ?? v)
+      if (field === 'provider' || field === 'idp') return String(importProvider(v) ?? v)
+      if (field === 'authMethod') return String(importAuthMethod(v) ?? v)
       return v
     }
     const first = strings[0]
@@ -332,10 +370,16 @@ export function normalizeCredentialRecord(
   }
 
   // 认证身份
+  const normalizedProvider = values.provider ? importProvider(values.provider) : undefined
+  const normalizedIdp = values.idp ? importProvider(values.idp) : undefined
+  // Preserve an explicitly unknown string for resolveIdentity so it is
+  // rejected as unsupported. Passing `null` would be interpreted as a missing
+  // value by normalizeProvider and could incorrectly infer Builder ID from
+  // client credentials.
   const identity = resolveIdentity({
-    provider: values.provider,
-    authMethod: values.authMethod,
-    idp: values.provider ? undefined : values.idp,
+    provider: normalizedProvider ?? values.provider,
+    authMethod: importAuthMethod(values.authMethod),
+    idp: values.provider ? undefined : normalizedIdp ?? values.idp,
     hasClientCredentials: Boolean(values.clientId && values.clientSecret)
   })
   if (!identity.ok) {

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { win32 } from 'node:path'
 import type {
   CreateKiroInstanceInput, KiroInstanceRecord, KiroInstancesSnapshot, KiroInstanceView,
-  KiroInstancePaths, KiroProcessIdentity, KiroLaunchStatus
+  KiroInstancePaths, KiroProcessIdentity, KiroLaunchStatus, KiroInstanceProxyInput
 } from '../shared/kiroInstances'
 import type { KiroInstanceRuntime, KiroProcessInventory, KiroProcessObservation } from './kiroInstanceRuntimeTypes'
 import {
@@ -10,6 +10,7 @@ import {
   verifyInstanceDirectories, checkInstanceDirectory, instanceFileSystem, UUID, KiroInstanceError, failInstance,
   type KiroInstanceFileSystem
 } from './kiroInstancePaths'
+import { normalizeKiroInstanceProxy } from './kiroInstanceProxy'
 export { canonicalWindowsPath, makeInstancePaths, KiroInstanceError } from './kiroInstancePaths'
 
 export interface KiroInstanceDependencies {
@@ -91,10 +92,12 @@ export function buildInstanceArguments(paths: KiroInstancePaths): string[] {
     '--agents-extensions-dir', paths.agentsExtensions, '--new-window', '--disable-updates'
   ]
 }
-export function buildInstanceEnvironment(parent: NodeJS.ProcessEnv, paths: KiroInstancePaths, portableSupported: boolean): NodeJS.ProcessEnv {
+export function buildInstanceEnvironment(parent: NodeJS.ProcessEnv, paths: KiroInstancePaths, portableSupported: boolean, proxy?: { url: string }): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {}
   for (const [key, value] of Object.entries(parent)) {
-    if (/^(?:VSCODE_|ELECTRON_RUN_AS_NODE$|NODE_|AWS_|KIRO_|AMAZON_Q_|CODEWHISPERER_)/i.test(key)) continue
+    // Never leak the manager's process-wide proxy (or credentials in it) into
+    // a profile. A profile proxy is injected below only when explicitly set.
+    if (/^(?:VSCODE_|ELECTRON_RUN_AS_NODE$|NODE_|AWS_|KIRO_|AMAZON_Q_|CODEWHISPERER_|HTTP_PROXY$|HTTPS_PROXY$|ALL_PROXY$|NO_PROXY$)/i.test(key)) continue
     if (/^(?:HOME|USERPROFILE|HOMEDRIVE|HOMEPATH|APPDATA|LOCALAPPDATA|TEMP|TMP)$/i.test(key)) continue
     env[key] = value
   }
@@ -107,6 +110,14 @@ export function buildInstanceEnvironment(parent: NodeJS.ProcessEnv, paths: KiroI
     AWS_EC2_METADATA_DISABLED: 'true'
   })
   if (portableSupported) env.VSCODE_PORTABLE = paths.portable
+  if (proxy?.url) {
+    env.HTTP_PROXY = proxy.url
+    env.HTTPS_PROXY = proxy.url
+    env.ALL_PROXY = proxy.url
+    env.http_proxy = proxy.url
+    env.https_proxy = proxy.url
+    env.all_proxy = proxy.url
+  }
   return env
 }
 
@@ -157,8 +168,14 @@ export class KiroInstanceService {
         if (!equalWindowsPath(row.userDataPath, expected.userData)) return failInstance('实例进程记录不匹配。')
         return identity
       })
+      let proxy
+      if (item.proxy !== undefined) {
+        try { proxy = normalizeKiroInstanceProxy(item.proxy as KiroInstanceProxyInput) }
+        catch { return failInstance('实例代理配置无效。') }
+        if (!proxy) return failInstance('实例代理配置无效。')
+      }
       return { schemaVersion: 2, id: item.id, label: item.label.trim(), executablePath: executable, createdAt: item.createdAt, paths: expected,
-        ...(item.accountId !== undefined ? { accountId: item.accountId } : {}), ...(lastProcesses ? { lastProcesses } : {}) }
+        ...(item.accountId !== undefined ? { accountId: item.accountId } : {}), ...(proxy ? { proxy } : {}), ...(lastProcesses ? { lastProcesses } : {}) }
     })
   }
   private async record(id: string): Promise<KiroInstanceRecord> {
@@ -300,6 +317,9 @@ export class KiroInstanceService {
       if (input.accountId !== undefined && (!validAccountId(input.accountId) || records.some(row => row.schemaVersion === 2 && row.accountId === input.accountId))) {
         failInstance('账户绑定无效或该账户已绑定其他实例，请为不同实例选择不同账户。')
       }
+      let proxy
+      try { proxy = normalizeKiroInstanceProxy(input.proxy) }
+      catch (error) { failInstance(error instanceof Error ? error.message : '实例代理配置无效。') }
       const installation = await this.deps.runtime.inspectInstallation(executablePath)
       const id = (this.deps.uuid ?? randomUUID)().toLowerCase()
       if (!UUID.test(id) || records.some(row => row.id === id)) failInstance('无法生成唯一实例标识。')
@@ -312,17 +332,17 @@ export class KiroInstanceService {
       await this.io.writeMarker(win32.join(user, 'settings.json'), JSON.stringify({ 'window.title': `Kiro · ${input.label.trim()}`, 'update.mode': 'none', 'extensions.autoUpdate': false }))
       await this.deps.runtime.assertSafeDirectory?.(paths.root)
       const record: KiroInstanceRecord = { schemaVersion: 2, id, label: input.label.trim(), executablePath, createdAt: (this.deps.now ?? (() => new Date()))().toISOString(), paths,
-        ...(input.accountId !== undefined ? { accountId: input.accountId } : {}) }
+        ...(input.accountId !== undefined ? { accountId: input.accountId } : {}), ...(proxy ? { proxy } : {}) }
       await this.deps.writeConfig([...records, record] as KiroInstanceRecord[])
       return record
     })
   }
-  private operate(id: string, name: string, action: () => Promise<void>): Promise<void> {
+  private operate(id: string, name: string, action: () => Promise<void>, options: { bumpEpoch?: boolean } = {}): Promise<void> {
     this.assertWindows()
     if (typeof id !== 'string' || !/^[a-z0-9-]{1,64}$/i.test(id)) return Promise.reject(new KiroInstanceError('实例标识无效。'))
     const previous = this.operations.get(id)
     if (previous) return previous.name === name ? previous.promise : Promise.reject(new KiroInstanceError('该实例还有操作正在完成，请稍后重试。'))
-    this.epochs.set(id, (this.epochs.get(id) ?? 0) + 1)
+    if (options.bumpEpoch !== false) this.epochs.set(id, (this.epochs.get(id) ?? 0) + 1)
     const promise = Promise.resolve().then(action).finally(() => { this.operations.delete(id); this.transient.delete(id) })
     this.operations.set(id, { name, promise })
     return promise
@@ -354,7 +374,7 @@ export class KiroInstanceService {
       await this.verifyPaths(record)
     }
     await this.remember(record, [])
-    await this.deps.runtime.launch(record.executablePath, buildInstanceArguments(record.paths), buildInstanceEnvironment(this.deps.parentEnv ?? process.env, record.paths, portable), record.paths.home)
+    await this.deps.runtime.launch(record.executablePath, buildInstanceArguments(record.paths), buildInstanceEnvironment(this.deps.parentEnv ?? process.env, record.paths, portable, record.proxy), record.paths.home)
     await this.waitFor(record, 'running', this.deps.launchTimeoutMs ?? 15_000)
   }
   private async stopRecord(record: KiroInstanceRecord): Promise<void> {
@@ -373,15 +393,32 @@ export class KiroInstanceService {
   launch(id: string): Promise<void> { return this.operate(id, 'launch', async () => this.startRecord(await this.record(id))) }
   stop(id: string): Promise<void> { return this.operate(id, 'stop', async () => this.stopRecord(await this.record(id))) }
   restart(id: string): Promise<void> { return this.operate(id, 'restart', async () => { const record = await this.record(id); await this.stopRecord(record); await this.startRecord(record) }) }
+  setProxy(id: string, input?: KiroInstanceProxyInput): Promise<void> {
+    return this.operate(id, 'set-proxy', async () => {
+      const record = await this.record(id)
+      const state = await this.inspect(record)
+      if (state.status === 'running' || state.status === 'unverified' || state.draining) failInstance('请先停止并确认实例后再修改代理。')
+      let proxy
+      try { proxy = normalizeKiroInstanceProxy(input) }
+      catch (error) { failInstance(error instanceof Error ? error.message : '实例代理配置无效。') }
+      await this.mutate(async () => {
+        const records = await this.records()
+        await this.deps.writeConfig(records.map(row => row.schemaVersion === 2 && row.id === id
+          ? { ...row, ...(proxy ? { proxy } : { proxy: undefined }) } : row) as KiroInstanceRecord[])
+      })
+    })
+  }
   /** Main-process watcher entry point; shares the lifecycle lock and never launches or refreshes. */
   synchronize(id: string): Promise<void> {
+    // Synchronization only reads the instance cache; it must not invalidate a UI
+    // snapshot's lifecycle epoch and make a healthy instance appear unverified.
     return this.operate(id, 'sync', async () => {
       const record = await this.record(id)
       await this.verifyPaths(record)
       if (!record.accountId) return
       if (!this.deps.syncAccount) failInstance('当前环境尚未提供账户同步功能，未同步实例凭证。')
       await this.deps.syncAccount!(record)
-    })
+    }, { bumpEpoch: false })
   }
   remove(id: string): Promise<void> {
     return this.operate(id, 'remove', async () => {

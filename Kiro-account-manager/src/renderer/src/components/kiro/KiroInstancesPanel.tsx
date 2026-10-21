@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { FolderOpen, Play, RefreshCw, ShieldCheck, Square, Trash2 } from 'lucide-react'
 import type { KiroInstanceView, KiroInstancesApi, KiroInstancesSnapshot } from '../../../../shared/kiroInstances'
-import { Button, Card, CardContent, CardHeader, CardTitle, Input } from '../ui'
+import { Button, Card, CardContent, CardHeader, CardTitle, Input, Select } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
 
 const labels = { stopped: '未运行', starting: '正在启动', running: '运行中', stopping: '正在关闭', exited: '已退出', unverified: '状态无法确认', error: '操作失败', legacy: '旧版配置' }
@@ -15,29 +15,56 @@ export function KiroInstancesPanel({ api }: { api: KiroInstancesApi }) {
   const [label, setLabel] = useState('')
   const [executablePath, setExecutablePath] = useState('')
   const [accountId, setAccountId] = useState('')
+  const [proxyUrl, setProxyUrl] = useState('')
+  const [proxyDrafts, setProxyDrafts] = useState<Record<string, string>>({})
   const [detachTargetId, setDetachTargetId] = useState('')
   const accounts = useAccountsStore(state => state.accounts)
   const [busy, setBusy] = useState('')
   const active = useRef(true)
   const loading = useRef(false)
   const operation = useRef(false)
+  const accountOptions = [
+    ...[...accounts.values()]
+      .filter(account => !snapshot?.instances.some(instance => instance.schemaVersion === 2 && instance.accountId === account.id))
+      .map(account => ({ value: account.id, label: account.nickname || account.email || account.id, description: `${account.idp || account.credentials?.provider || '账户'} · ${account.email || account.id}` })),
+    { value: BLANK_ACCOUNT_OPTION, label: '高级：空白实例', description: '仅启动独立环境，需要在 Kiro 中另行登录' }
+  ]
   const reload = useCallback(async () => {
     if (loading.current) return
     loading.current = true
     try {
       const result = await api.snapshot()
       if (!active.current) return
-      if (result.success) { setSnapshot(result.value); if (result.value.instances.length) setExecutablePath(previous => previous || result.value.instances[0].executablePath) }
+      if (result.success) {
+        setSnapshot(result.value)
+        setProxyDrafts(previous => {
+          const next = { ...previous }
+          for (const instance of result.value.instances) if (instance.schemaVersion === 2 && !(instance.id in next)) next[instance.id] = instance.proxy?.url ?? ''
+          return next
+        })
+        if (result.value.instances.length) setExecutablePath(previous => previous || result.value.instances[0].executablePath)
+      }
       else setError(result.error)
     } finally { loading.current = false }
+  }, [api])
+  const discover = useCallback(async (showNotice = true) => {
+    const result = await api.discover()
+    if (!active.current) return
+    if (!result.success) { if (showNotice) setError(result.error); return }
+    const first = result.value.candidates[0]
+    if (first) {
+      setExecutablePath(previous => previous || first.path)
+      if (showNotice) setNotice(`已自动发现 Kiro ${first.version}：${first.path}`)
+    } else if (showNotice && result.value.message) setNotice(result.value.message)
   }, [api])
   useEffect(() => {
     active.current = true
     const refresh = () => { void reload().catch(() => { if (active.current) setError('无法读取实例状态，请重试。') }) }
     refresh()
+    void discover(false).catch(() => {})
     const timer = setInterval(refresh, 3000)
     return () => { active.current = false; clearInterval(timer) }
-  }, [reload])
+  }, [reload, discover])
 
   const perform = async (key: string, action: () => Promise<void>) => {
     if (operation.current) return
@@ -52,9 +79,9 @@ export function KiroInstancesPanel({ api }: { api: KiroInstancesApi }) {
   }
   const create = () => perform('create', async () => {
     if (!accountId) throw new Error('请选择管理器中的已有账户，或明确选择高级空白实例。')
-    const result = await api.create({ label, executablePath, accountId: accountId === BLANK_ACCOUNT_OPTION ? undefined : accountId })
+    const result = await api.create({ label, executablePath, accountId: accountId === BLANK_ACCOUNT_OPTION ? undefined : accountId, proxy: proxyUrl.trim() || undefined })
     if (!result.success) throw new Error(result.error)
-    if (active.current) { setLabel(''); setAccountId(''); setNotice(result.value.accountId ? '实例已创建。启动时将使用绑定账户，不需要再次登录。' : '空白实例已创建。') }
+    if (active.current) { setLabel(''); setAccountId(''); setProxyUrl(''); setNotice(result.value.accountId ? '实例已创建。启动时将使用绑定账户，不需要再次登录。' : '空白实例已创建。') }
   })
   const choose = () => perform('choose', async () => {
     const result = await api.chooseExecutable()
@@ -84,16 +111,13 @@ export function KiroInstancesPanel({ api }: { api: KiroInstancesApi }) {
       {snapshot?.supported && <>
         <div className="grid gap-3 md:grid-cols-2">
           <label className="text-sm space-y-1">实例名称<Input value={label} onChange={event => setLabel(event.target.value)} maxLength={60} placeholder="例如：工作账户" disabled={!!busy} /></label>
-          <label className="text-sm space-y-1">绑定已有账户<select className="flex h-9 w-full rounded-lg border border-foreground/15 bg-background px-3 text-sm" value={accountId} onChange={event => setAccountId(event.target.value)} disabled={!!busy}>
-            <option value="" disabled>请选择已有账户</option>
-            {[...accounts.values()].filter(account => !snapshot.instances.some(instance => instance.schemaVersion === 2 && instance.accountId === account.id)).map(account => <option key={account.id} value={account.id}>{account.nickname || account.email || account.id} · {account.idp}</option>)}
-            <option value={BLANK_ACCOUNT_OPTION}>高级：空白实例（需要另行登录）</option>
-          </select></label>
+          <label className="text-sm space-y-1"><span>绑定已有账户</span><Select value={accountId} options={accountOptions} onChange={setAccountId} placeholder="请选择已有账户" className={busy ? 'pointer-events-none opacity-60' : undefined} /></label>
+          <label className="text-sm space-y-1">实例代理（可选）<Input value={proxyUrl} onChange={event => setProxyUrl(event.target.value)} maxLength={2048} placeholder="http://127.0.0.1:7890 或 socks5://host:1080" disabled={!!busy} /><span className="text-xs text-muted-foreground">支持 http、https、socks4、socks5；仅此实例使用，不会修改全局代理。</span></label>
           <div className="space-y-1"><label htmlFor="kiro-instance-executable" className="text-sm">共用的官方 Kiro.exe</label>
             <div className="flex gap-2"><Input id="kiro-instance-executable" value={executablePath} onChange={event => setExecutablePath(event.target.value)} placeholder="选择已安装的 Kiro.exe" disabled={!!busy} /><Button variant="outline" onClick={choose} disabled={!!busy}><FolderOpen className="mr-2 h-4 w-4" />选择</Button></div>
           </div>
         </div>
-        <div className="flex flex-wrap items-center gap-2"><Button onClick={create} disabled={!!busy || !label.trim() || !executablePath || !accountId}>{busy === 'create' ? '正在验证…' : '创建独立实例'}</Button><Button variant="outline" disabled={!!busy} onClick={() => void perform('refresh', reload)}><RefreshCw className="mr-2 h-4 w-4" />刷新状态</Button></div>
+        <div className="flex flex-wrap items-center gap-2"><Button onClick={create} disabled={!!busy || !label.trim() || !executablePath || !accountId}>{busy === 'create' ? '正在验证…' : '创建独立实例'}</Button><Button variant="outline" disabled={!!busy} onClick={() => void perform('discover', () => discover())}><RefreshCw className="mr-2 h-4 w-4" />自动发现 Kiro</Button><Button variant="outline" disabled={!!busy} onClick={() => void perform('refresh', reload)}><RefreshCw className="mr-2 h-4 w-4" />刷新状态</Button></div>
         {snapshot.instances.length === 0 && <p className="py-2 text-sm text-muted-foreground">暂无实例。请选择账户并创建，再点击启动。</p>}
         <div className="space-y-3">{snapshot.instances.map(instance => <div key={instance.id} className="rounded-lg border border-foreground/10 p-3 space-y-2">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -111,6 +135,7 @@ export function KiroInstancesPanel({ api }: { api: KiroInstancesApi }) {
           <p className="break-all text-xs text-muted-foreground">{instance.executablePath}</p>
           {instance.schemaVersion === 2 && <p className="break-all text-xs text-muted-foreground">独立数据：{instance.paths.root}</p>}
           {instance.schemaVersion === 2 && instance.accountId && <p className="text-xs text-muted-foreground">绑定账户：{accounts.get(instance.accountId)?.nickname || accounts.get(instance.accountId)?.email || '账户已从管理器移除'}</p>}
+          {instance.schemaVersion === 2 && <div className="flex flex-wrap items-center gap-2 pt-1"><Input className="max-w-xl text-xs" value={proxyDrafts[instance.id] ?? instance.proxy?.url ?? ''} onChange={event => setProxyDrafts(previous => ({ ...previous, [instance.id]: event.target.value }))} placeholder="未设置实例代理" disabled={!!busy || !['stopped', 'exited', 'error'].includes(instance.launchStatus)} /><Button size="sm" variant="outline" disabled={!!busy || !['stopped', 'exited', 'error'].includes(instance.launchStatus)} onClick={() => void perform(`proxy:${instance.id}`, async () => { const result = await api.setProxy(instance.id, proxyDrafts[instance.id] || undefined); if (!result.success) throw new Error(result.error); if (active.current) setNotice('实例代理已保存；下次启动时生效。') })}>保存代理</Button></div>}
           {instance.message && <p role="status" className={`text-sm ${['error', 'unverified'].includes(instance.launchStatus) ? 'text-destructive' : 'text-muted-foreground'}`}>{instance.message}</p>}
           {detachTargetId === instance.id && instance.schemaVersion === 2 && instance.accountId && ['stopped', 'exited'].includes(instance.launchStatus) && <div role="alertdialog" aria-label="确认恢复解绑" className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 space-y-2">
             <p className="text-sm">仅在正常同步无法完成时使用。恢复解绑不会把未核验的实例凭证写回管理器，全部实例文件会保留，原账户将被标记为需要重新授权。</p>

@@ -21,6 +21,12 @@ export interface KiroProcessIdentity {
   startedAt: string
   userDataPath: string
 }
+/** A proxy used only by one managed Kiro profile. Credentials, when present in
+ * the URL, are never included in status messages or logs. */
+export interface KiroInstanceProxy {
+  /** Canonical URL using http, https, socks4 or socks5. */
+  url: string
+}
 export interface KiroInstanceRecord {
   schemaVersion: 2
   id: string
@@ -28,6 +34,7 @@ export interface KiroInstanceRecord {
   executablePath: string
   createdAt: string
   accountId?: string
+  proxy?: KiroInstanceProxy
   paths: KiroInstancePaths
   lastProcesses?: KiroProcessIdentity[]
 }
@@ -55,7 +62,21 @@ export interface KiroInstancesSnapshot {
   message?: string
   instances: KiroInstanceView[]
 }
-export interface CreateKiroInstanceInput { label: string; executablePath: string; accountId?: string }
+/** A locally installed official Kiro executable discovered without modifying the host. */
+export interface KiroInstallationCandidate {
+  path: string
+  version: string
+  publisher: string
+  portableSupported: boolean
+  source: 'running-process' | 'registry' | 'common-path'
+}
+export interface KiroInstallationDiscovery {
+  supported: boolean
+  candidates: KiroInstallationCandidate[]
+  message?: string
+}
+export interface CreateKiroInstanceInput { label: string; executablePath: string; accountId?: string; proxy?: string | KiroInstanceProxy }
+export type KiroInstanceProxyInput = string | KiroInstanceProxy | undefined
 export type KiroInstanceResult<T = undefined> = { success: true; value: T } | { success: false; error: string }
 export interface KiroInstancesApi {
   snapshot(): Promise<KiroInstanceResult<KiroInstancesSnapshot>>
@@ -66,10 +87,13 @@ export interface KiroInstancesApi {
   launch(id: string): Promise<KiroInstanceResult>
   stop(id: string): Promise<KiroInstanceResult>
   restart(id: string): Promise<KiroInstanceResult>
+  setProxy(id: string, proxy?: KiroInstanceProxyInput): Promise<KiroInstanceResult>
+  discover(): Promise<KiroInstanceResult<KiroInstallationDiscovery>>
   chooseExecutable(): Promise<KiroInstanceResult<string | null>>
 }
 export const KIRO_INSTANCE_CHANNELS = {
   snapshot: 'kiro-instances:snapshot', create: 'kiro-instances:create', remove: 'kiro-instances:remove', detach: 'kiro-instances:detach',
-  launch: 'kiro-instances:launch', stop: 'kiro-instances:stop', restart: 'kiro-instances:restart',
+  launch: 'kiro-instances:launch', stop: 'kiro-instances:stop', restart: 'kiro-instances:restart', setProxy: 'kiro-instances:set-proxy',
+  discover: 'kiro-instances:discover',
   chooseExecutable: 'kiro-instances:choose-executable'
 } as const
