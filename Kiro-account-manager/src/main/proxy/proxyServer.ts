@@ -335,7 +335,8 @@ export class ProxyServer {
       tokenRefreshBeforeExpiry: 300, // 5分钟提前刷新
       autoStart: false, // 是否自动启动
       clientDrivenToolExecution: true,
-      ...config
+      ...config,
+      preferredEndpoint: 'runtime'
     }
     this.accountPool = new AccountPool()
     this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
@@ -630,7 +631,7 @@ export class ProxyServer {
       proxyLogger.warn('ProxyServer', `Config change requires restart: ${restartTriggerFields.filter(k => k in config).join(', ')}`)
     }
     this.appendAuditLog('config_changed', { fields: Object.keys(config), needsRestart: willRestart })
-    this.config = { ...this.config, ...config }
+    this.config = { ...this.config, ...config, preferredEndpoint: 'runtime' }
     // 同步账号选择策略到 accountPool
     if (config.accountSelectionStrategy !== undefined) {
       this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
@@ -1377,6 +1378,9 @@ export class ProxyServer {
         return { result, account: currentAccount }
       } catch (error) {
         if (this.isAbortError(error, signal)) throw error
+        // A Runtime request may already have consumed input, produced text or executed a tool.
+        // Its structured failures forbid replay and account switching, including pre-output failures.
+        if ((error as { retryable?: boolean })?.retryable === false || (error as { outputStarted?: boolean })?.outputStarted) throw error
         lastError = error as Error
         const errMsg = lastError.message || ''
 
@@ -3331,10 +3335,11 @@ export class ProxyServer {
   private handleApiError(res: http.ServerResponse, account: { id: string }, error: Error, path: string, model?: string, startTime?: number, signal?: AbortSignal): void {
     if (this.isAbortError(error, signal) || this.isResponseClosed(res)) return
     this.recordRequestFailed()
+    const upstreamStatus = (error as { upstreamStatus?: number }).upstreamStatus
     const errCode = error.message.match(/(\d{3})/)?.[1]
-    const parsedCode = errCode ? parseInt(errCode) : 500
+    const parsedCode = upstreamStatus && upstreamStatus >= 400 && upstreamStatus < 600 ? upstreamStatus : errCode ? parseInt(errCode) : 500
     const errorType = classifyError(parsedCode)
-    const isAuthError = error.message.includes('401') || error.message.includes('403') || error.message.includes('Auth')
+    const isAuthError = (error as { retryable?: boolean }).retryable !== false && (error.message.includes('401') || error.message.includes('403') || error.message.includes('Auth'))
 
     this.accountPool.recordError(account.id, errorType, parsedCode)
 

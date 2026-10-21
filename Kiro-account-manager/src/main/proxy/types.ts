@@ -385,6 +385,8 @@ export interface ProxyAccount {
   refreshToken?: string
   clientId?: string
   clientSecret?: string
+  /** Unix seconds, if supplied by a current client registration. */
+  clientSecretExpiresAt?: number
   region?: string
   authMethod?: 'social' | 'idc' | 'IdC' | 'external_idp'
   provider?: string
@@ -497,7 +499,7 @@ export interface ProxyConfig {
   maxRetries?: number
   retryDelayMs?: number
   // 首选端点配置
-  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
+  preferredEndpoint?: 'runtime' | 'codewhisperer' | 'amazonq' | 'amazonq-cli'
   // Token 刷新提前量（秒）
   tokenRefreshBeforeExpiry?: number
   // TLS/HTTPS 配置

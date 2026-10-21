@@ -64,7 +64,7 @@ type ImportMode = 'oidc' | 'sso' | 'login'
 type LoginType = 'builderid' | 'google' | 'github' | 'iamsso'
 interface LoginAttempt {
   id: string
-  kind: 'builderid' | 'social' | 'iamsso'
+  kind: 'builderid' | 'social' | 'iamsso' | 'portal'
   startUrl?: string
   unsubscribe?: () => void
   stopPolling?: () => void
@@ -72,6 +72,8 @@ interface LoginAttempt {
   processing?: boolean
   adding?: boolean
   added?: boolean
+  pendingTokenData?: LoginResult
+  tokenExpiresAt?: number
 }
 
 
@@ -150,6 +152,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   const [loginType, setLoginType] = useState<LoginType>('builderid')
   const [isLoggingIn, setIsLoggingIn] = useState(false)
   const [loginSavePending, setLoginSavePending] = useState(false)
+  const [loginVerifyPending, setLoginVerifyPending] = useState(false)
   const [usePrivateMode, setUsePrivateMode] = useState(loginPrivateMode) // 临时隐私模式开关，默认跟随全局设置
   const [builderIdLoginData, setBuilderIdLoginData] = useState<{
     userCode: string
@@ -175,10 +178,11 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     if (!attempt) return
     // Invalidate synchronously before any IPC can settle.
     loginAttemptRef.current = null
+    setLoginVerifyPending(false)
     attempt.stopPolling?.()
     if (attempt.expiryTimer) clearTimeout(attempt.expiryTimer)
     attempt.unsubscribe?.()
-    const cancel = attempt.kind === 'builderid' ? window.api.cancelBuilderIdLogin
+    const cancel = attempt.kind === 'portal' ? window.api.cancelPortalLogin : attempt.kind === 'builderid' ? window.api.cancelBuilderIdLogin
       : attempt.kind === 'iamsso' ? window.api.cancelIamSsoLogin : window.api.cancelSocialLogin
     void cancel(attempt.id).catch(() => {})
   }
@@ -206,6 +210,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setBuilderIdLoginData(null)
     setIamSsoLoginData(null)
     setError(null)
+    setLoginVerifyPending(false)
     return attempt
   }
   useEffect(() => {
@@ -235,6 +240,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     startUrl?: string
     authMethod?: string
     provider?: string
+    profileArn?: string
+    expiresIn?: number
+    clientSecretExpiresAt?: number
   }) => {
     if (!isCurrentLogin(attempt) || attempt.adding) return
     attempt.adding = true
@@ -247,7 +255,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         clientSecret: tokenData.clientSecret || '',
         region: tokenData.region || 'us-east-1',
         authMethod: tokenData.authMethod,
-        provider: tokenData.provider
+        provider: tokenData.provider,
+        ...(attempt.kind === 'portal' ? { accessToken: tokenData.accessToken, expiresIn: tokenData.expiresIn, profileArn: tokenData.profileArn } : {})
       })
 
       if (!isCurrentLogin(attempt)) return
@@ -276,12 +285,13 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             refreshToken: result.data.refreshToken,
             clientId: tokenData.clientId || '',
             clientSecret: tokenData.clientSecret || '',
+            clientSecretExpiresAt: tokenData.clientSecretExpiresAt,
             region: tokenData.region || 'us-east-1',
             startUrl: tokenData.startUrl,
-            expiresAt: result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000,
+            expiresAt: attempt.kind === 'portal' && attempt.tokenExpiresAt ? attempt.tokenExpiresAt : result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000,
             authMethod: tokenData.authMethod as 'IdC' | 'social',
             provider: (tokenData.provider || 'BuilderId') as 'BuilderId' | 'Github' | 'Google',
-            profileArn: result.data.profileArn
+            profileArn: result.data.profileArn || tokenData.profileArn
           },
           subscription: {
             type: result.data.subscriptionType as SubscriptionType,
@@ -316,6 +326,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
         // Keep the added account in memory if persistence fails; retry saving without exchanging the code again.
         attempt.added = true
+        if (attempt.expiryTimer) clearTimeout(attempt.expiryTimer)
         setLoginSavePending(true)
         await useAccountsStore.getState().saveAccountChanges()
         if (!isCurrentLogin(attempt)) return
@@ -325,9 +336,11 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         handleDialogClose()
       } else {
         setError(result.error || '验证失败')
+        if (attempt.kind === 'portal') { attempt.adding = false; setLoginVerifyPending(true) }
       }
     } catch (e) {
       if (isCurrentLogin(attempt)) setError(attempt.added ? '账户已添加到当前会话，但保存失败；可点击重试保存。' : '添加账户失败，请重试。')
+      if (isCurrentLogin(attempt) && attempt.kind === 'portal' && !attempt.added) { attempt.adding = false; setLoginVerifyPending(true) }
     }
   }
 
@@ -335,7 +348,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     attempt.stopPolling = startSerialLoginPolling<LoginResult>({
       initialInterval: interval,
       isCurrent: () => isCurrentLogin(attempt),
-      poll: () => attempt.kind === 'builderid' ? window.api.pollBuilderIdAuth(attempt.id) : window.api.pollIamSsoAuth(attempt.id),
+      poll: () => attempt.kind === 'portal' ? window.api.pollPortalLogin(attempt.id) : attempt.kind === 'builderid' ? window.api.pollBuilderIdAuth(attempt.id) : window.api.pollIamSsoAuth(attempt.id),
       onResult: async (result) => {
         if (!isCurrentLogin(attempt) || result.sessionId !== attempt.id) return null
         if (!result.success) {
@@ -347,18 +360,26 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           if (!result.accessToken || !result.refreshToken) {
             setError('授权响应不完整，请重新开始')
           } else {
+            if (attempt.kind === 'portal') {
+              attempt.pendingTokenData = { ...result, expiresIn: result.expiresIn }
+              attempt.tokenExpiresAt = Date.now() + (result.expiresIn || 0) * 1000
+              if (attempt.expiryTimer) clearTimeout(attempt.expiryTimer)
+            }
             await handleLoginSuccess(attempt, {
               accessToken: result.accessToken,
               refreshToken: result.refreshToken,
               clientId: result.clientId,
               clientSecret: result.clientSecret,
               region: result.region,
-              startUrl: attempt.startUrl,
-              authMethod: 'IdC',
-              provider: attempt.kind === 'builderid' ? 'BuilderId' : 'Enterprise'
+              startUrl: result.startUrl || attempt.startUrl,
+              authMethod: attempt.kind === 'portal' ? result.authMethod : 'IdC',
+              provider: attempt.kind === 'portal' ? result.provider : attempt.kind === 'builderid' ? 'BuilderId' : 'Enterprise',
+              profileArn: result.profileArn,
+              expiresIn: result.expiresIn,
+              clientSecretExpiresAt: result.clientSecretExpiresAt
             })
           }
-          if (isCurrentLogin(attempt)) finishLoginAttempt(attempt)
+          if (isCurrentLogin(attempt) && !attempt.added && !attempt.pendingTokenData) finishLoginAttempt(attempt)
           return null
         }
         return result.retryAfter || result.interval || interval
@@ -369,6 +390,23 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         finishLoginAttempt(attempt)
       }
     })
+  }
+
+  const handleStartPortalLogin = async () => {
+    const attempt = beginLoginAttempt('portal')
+    try {
+      const result = await window.api.startPortalLogin(attempt.id, usePrivateMode)
+      if (!isCurrentLogin(attempt) || result.sessionId !== attempt.id) return
+      if (!result.success) {
+        setError(result.error || '无法打开网页登录，请重试')
+        finishLoginAttempt(attempt)
+        return
+      }
+      setAttemptExpiry(attempt, result.expiresIn || 600)
+      pollLogin(attempt, result.interval || 1)
+    } catch {
+      if (isCurrentLogin(attempt)) { setError('无法启动网页登录，请重试'); finishLoginAttempt(attempt) }
+    }
   }
 
   const handleStartBuilderIdLogin = async () => {
@@ -477,11 +515,23 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
       await useAccountsStore.getState().saveAccountChanges()
       setLoginSavePending(false)
       setError(null)
+      const attempt = loginAttemptRef.current
+      if (attempt?.added) { finishLoginAttempt(attempt); resetForm(); handleDialogClose() }
     } catch {
       setError('保存失败，账户仍保留在当前会话，请重试。')
     } finally {
       setIsSubmitting(false)
     }
+  }
+
+  const handleRetryPortalVerification = async () => {
+    const attempt = loginAttemptRef.current
+    const data = attempt?.pendingTokenData
+    if (!attempt || !data?.accessToken || !data.refreshToken || attempt.added || attempt.adding) return
+    const remaining = Math.floor(((attempt.tokenExpiresAt || 0) - Date.now()) / 1000)
+    if (remaining <= 0) { setError('授权凭证已过期，请重新登录'); setLoginVerifyPending(false); finishLoginAttempt(attempt); return }
+    setLoginVerifyPending(false)
+    await handleLoginSuccess(attempt, { ...data, expiresIn: remaining, accessToken: data.accessToken, refreshToken: data.refreshToken })
   }
 
   // 复制 user_code
@@ -943,9 +993,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                     <div className="w-12 h-12 bg-primary/10 rounded-full flex items-center justify-center mx-auto mb-3">
                       <Check className="w-6 h-6 text-primary" />
                     </div>
-                    <h3 className="text-lg font-semibold">{isEn ? 'Choose Login Method' : '选择登录方式'}</h3>
+                    <h3 className="text-lg font-semibold">{isEn ? 'Sign in to Kiro' : '登录 Kiro'}</h3>
                     <p className="text-sm text-muted-foreground mt-1">
-                      {isEn ? 'Multiple quick login options' : '支持多种方式快捷登录'}
+                      {isEn ? 'Choose your provider on the official sign-in page' : '在官方登录页面选择账号提供商'}
                     </p>
                   </div>
 
@@ -981,6 +1031,11 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                   </div>
                   
                   <div className="space-y-3 px-2">
+                    <Button className="w-full h-12" onClick={handleStartPortalLogin}>
+                      <ExternalLink className="mr-2 h-4 w-4" />{isEn ? 'Sign in on Kiro website' : '打开 Kiro 网页登录'}
+                    </Button>
+                    <p className="text-xs text-muted-foreground">{isEn ? 'Supports Builder ID, Google, GitHub and IAM Identity Center. Returns through a local callback.' : '支持 Builder ID、Google、GitHub 和 IAM Identity Center，授权后通过本地回调完成。'}</p>
+                    <p className="pt-2 text-xs text-muted-foreground">{isEn ? 'Legacy compatibility methods' : '旧版兼容方式（优先使用上方网页登录）'}</p>
                     {/* Google */}
                     <button 
                       className="group w-full h-14 flex items-center px-4 gap-4 bg-background hover:bg-muted border border-border rounded-xl transition-all duration-200 hover:shadow-md hover:border-primary/30"
@@ -1645,6 +1700,9 @@ email----password----refreshToken----clientId----clientSecret`
             </div>
           )}
 
+          {loginVerifyPending && <Button type="button" variant="outline" onClick={handleRetryPortalVerification} disabled={isSubmitting}>
+            {isEn ? 'Retry account information' : '重试获取已授权账户信息'}
+          </Button>}
           {loginSavePending && (
             <Button type="button" variant="outline" onClick={handleRetryLoginSave} disabled={isSubmitting}>
               {isEn ? 'Retry Saving Added Account' : '重试保存已添加账户'}

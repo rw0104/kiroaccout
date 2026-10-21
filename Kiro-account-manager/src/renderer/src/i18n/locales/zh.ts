@@ -46,6 +46,7 @@ const zh = {
     accounts: '账户管理',
     machineId: '机器码',
     kiroSettings: 'Kiro 设置',
+    kiroInstances: 'Kiro 隔离多开',
     proxy: 'API 反代',
     kproxy: 'K-Proxy',
     proxyPool: '代理池',

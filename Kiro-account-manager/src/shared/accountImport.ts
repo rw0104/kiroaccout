@@ -34,6 +34,8 @@ export interface NormalizedCredential {
   accessToken?: string
   clientId?: string
   clientSecret?: string
+  /** Unix seconds, as returned by client registration. */
+  clientSecretExpiresAt?: number
   region: string
   provider: CanonicalProvider
   authMethod: CanonicalAuthMethod
@@ -178,10 +180,12 @@ const STRING_FIELD_ALIASES: Record<StringField, string[]> = {
   idp: ['idp']
 }
 const EXPIRES_AT_ALIASES = ['expiresAt', 'expires_at']
+const CLIENT_EXPIRY_ALIASES = ['clientSecretExpiresAt', 'client_secret_expires_at']
 
 const ALL_KNOWN_KEYS = new Set<string>([
   ...Object.values(STRING_FIELD_ALIASES).flat(),
   ...EXPIRES_AT_ALIASES,
+  ...CLIENT_EXPIRY_ALIASES,
   'credentials'
 ])
 
@@ -318,6 +322,15 @@ export function normalizeCredentialRecord(
     }
   }
 
+  let clientSecretExpiresAt: number | undefined
+  const registrations = collectOccurrences(raw, creds, CLIENT_EXPIRY_ALIASES)
+  if (registrations.length) {
+    const times = registrations.map(item => normalizeTimestamp(item.value))
+    if (times.some(time => time === undefined) || new Set(times).size !== 1) {
+      warnings.push('clientSecretExpiresAt 无法识别或不一致，已忽略')
+    } else clientSecretExpiresAt = Math.floor(times[0]! / 1000)
+  }
+
   // 认证身份
   const identity = resolveIdentity({
     provider: values.provider,
@@ -376,6 +389,7 @@ export function normalizeCredentialRecord(
   if (values.startUrl) credential.startUrl = values.startUrl
   if (values.profileArn) credential.profileArn = values.profileArn
   if (expiresAt !== undefined) credential.expiresAt = expiresAt
+  if (clientSecretExpiresAt !== undefined) credential.clientSecretExpiresAt = clientSecretExpiresAt
   if (values.email) credential.email = values.email
   if (values.password && values.password !== 'no_password') credential.password = values.password
   if (values.userId) credential.userId = values.userId

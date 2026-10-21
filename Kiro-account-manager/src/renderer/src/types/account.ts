@@ -17,6 +17,8 @@ export interface AccountCredentials {
   refreshToken?: string
   clientId?: string      // OIDC 客户端 ID（用于刷新 token）
   clientSecret?: string  // OIDC 客户端密钥
+  /** Unix 秒；到期前应重新授权，不能反复刷新已失效的客户端注册。 */
+  clientSecretExpiresAt?: number
   region?: string        // AWS 区域，默认 us-east-1
   startUrl?: string      // SSO Start URL（Enterprise 账户专用）
   expiresAt: number      // 时间戳

@@ -71,7 +71,7 @@ interface ProxyConfig {
   logRequests: boolean
   logStreamEvents?: boolean
   maxRetries?: number
-  preferredEndpoint?: 'codewhisperer' | 'amazonq' | 'amazonq-cli'
+  preferredEndpoint?: 'runtime' | 'codewhisperer' | 'amazonq' | 'amazonq-cli'
   autoStart?: boolean
   clientDrivenToolExecution?: boolean
   disableTools?: boolean
@@ -952,15 +952,12 @@ export function ProxyPanel() {
               <div className="space-y-1.5 relative z-20">
                 <Label htmlFor="preferredEndpoint" className="text-xs">{isEn ? 'Preferred Endpoint' : '首选端点'}</Label>
                 <Select
-                  value={config.preferredEndpoint || ''}
+                  value="runtime"
                   options={[
-                    { value: '', label: isEn ? 'Auto Select' : '自动选择', description: isEn ? 'Auto select based on availability' : '根据可用性自动选择端点' },
-                    { value: 'codewhisperer', label: 'CodeWhisperer', description: isEn ? 'IDE mode endpoint' : 'IDE 模式端点' },
-                    { value: 'amazonq', label: 'AmazonQ', description: isEn ? 'IDE mode (q.amazonaws.com)' : 'IDE 模式 (q.amazonaws.com)' },
-                    { value: 'amazonq-cli', label: 'AmazonQ CLI', description: isEn ? 'CLI mode (SendMessageStreaming)' : 'CLI 模式 (SendMessageStreaming)' }
+                    { value: 'runtime', label: 'Kiro Runtime', description: isEn ? 'Uses the account region' : '使用账户所属区域' }
                   ]}
                   onChange={(value) => {
-                    const endpoint = (value || undefined) as 'codewhisperer' | 'amazonq' | 'amazonq-cli' | undefined
+                    const endpoint = value as 'runtime'
                     setConfig(prev => ({ ...prev, preferredEndpoint: endpoint }))
                     window.api.proxyUpdateConfig({ preferredEndpoint: endpoint })
                   }}

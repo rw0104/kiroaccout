@@ -1,13 +1,18 @@
 {
   "name": "kiro-account-manager",
-  "version": "1.7.6",
+  "version": "1.7.7-rc.1",
   "description": "Kiro Account Manager - Manage your Kiro accounts, usage and subscriptions",
   "main": "./out/main/index.js",
   "author": "rw0104",
   "license": "AGPL-3.0",
   "homepage": "https://github.com/rw0104/kiroaccout",
-  "repository": { "type": "git", "url": "https://github.com/rw0104/kiroaccout.git" },
-  "bugs": { "url": "https://github.com/rw0104/kiroaccout/issues" },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rw0104/kiroaccout.git"
+  },
+  "bugs": {
+    "url": "https://github.com/rw0104/kiroaccout/issues"
+  },
   "scripts": {
     "format": "prettier --write .",
     "lint": "eslint --cache .",
