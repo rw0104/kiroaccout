@@ -161,10 +161,13 @@ export const AccountCard = memo(function AccountCard({
     maskNickname,
     usagePrecision,
     updateAccountStatus,
+    accountOperationCounts,
     accountProxyBindings,
     proxyPool,
     unbindAccountFromProxy
   } = useAccountsStore()
+  const isAccountOperationPending = (accountOperationCounts.get(account.id) ?? 0) > 0
+  const displayStatus = isAccountOperationPending ? 'refreshing' : account.status
 
   // 该账号绑定的代理（如有）
   const boundProxy = useMemo(() => {
@@ -317,9 +320,10 @@ export const AccountCard = memo(function AccountCard({
     }
   }
 
-  const handleDelete = (): void => {
+  const handleDelete = async (): Promise<void> => {
     if (confirm(isEn ? `Delete account ${getDisplayName(account)}?` : `确定要删除账号 ${getDisplayName(account)} 吗？`)) {
-      removeAccount(account.id)
+      try { await removeAccount(account.id) }
+      catch (error) { alert((isEn ? 'Delete failed: ' : '删除失败：') + (error instanceof Error ? error.message : 'Account retained')) }
     }
   }
 
@@ -578,13 +582,13 @@ export const AccountCard = memo(function AccountCard({
                  <div className={cn(
                     "text-[10px] font-medium px-2 py-0.5 rounded-full flex items-center gap-1 flex-shrink-0",
                     isUnauthorized ? "text-destructive bg-destructive/10" :
-                    account.status === 'active' ? "text-success bg-success/10" :
-                    account.status === 'error' ? "text-destructive bg-destructive/10" :
-                    account.status === 'expired' ? "text-warning bg-warning/10" :
-                    account.status === 'refreshing' ? "text-primary bg-primary/10" :
+                    displayStatus === 'active' ? "text-success bg-success/10" :
+                    displayStatus === 'error' ? "text-destructive bg-destructive/10" :
+                    displayStatus === 'expired' ? "text-warning bg-warning/10" :
+                    displayStatus === 'refreshing' ? "text-primary bg-primary/10" :
                     "text-muted-foreground bg-muted"
                  )}>
-                    {account.status === 'refreshing' && <Loader2 className="h-3 w-3 animate-spin" />}
+                    {isAccountOperationPending && <Loader2 className="h-3 w-3 animate-spin" />}
                     {isUnauthorized && <AlertCircle className="h-3 w-3" />}
                     {isUnauthorized ? (
                       <span 
@@ -593,7 +597,7 @@ export const AccountCard = memo(function AccountCard({
                       >
                         {isEn ? 'Banned' : '已封禁'}
                       </span>
-                    ) : (isEn ? StatusLabelsEn : StatusLabelsZh)[account.status]}
+                    ) : (isEn ? StatusLabelsEn : StatusLabelsZh)[displayStatus]}
                  </div>
               </div>
               <div className="flex items-center gap-2 mt-1">
@@ -843,10 +847,10 @@ export const AccountCard = memo(function AccountCard({
                  </Button>
                )}
                
-               <Button size="icon" variant="ghost" className="h-7 w-7 text-muted-foreground hover:text-foreground" onClick={(e) => { e.stopPropagation(); handleRefresh() }} disabled={account.status === 'refreshing'} title={isEn ? 'Check account info' : '检查账户信息（用量、订阅、封禁状态）'}>
-                  <RefreshCw className={cn("h-3.5 w-3.5", account.status === 'refreshing' && "animate-spin")} />
+               <Button size="icon" variant="ghost" className="h-7 w-7 text-muted-foreground hover:text-foreground" onClick={(e) => { e.stopPropagation(); handleRefresh() }} disabled={isAccountOperationPending} title={isEn ? 'Check account info' : '检查账户信息（用量、订阅、封禁状态）'}>
+                  <RefreshCw className={cn("h-3.5 w-3.5", isAccountOperationPending && "animate-spin")} />
                </Button>
-               <Button size="icon" variant="ghost" className="h-7 w-7 text-muted-foreground hover:text-foreground" onClick={(e) => { e.stopPropagation(); handleRefreshToken() }} disabled={isRefreshingToken} title={isEn ? 'Refresh Token' : '刷新 Token（仅刷新访问令牌）'}>
+               <Button size="icon" variant="ghost" className="h-7 w-7 text-muted-foreground hover:text-foreground" onClick={(e) => { e.stopPropagation(); handleRefreshToken() }} disabled={isRefreshingToken || isAccountOperationPending} title={isEn ? 'Refresh Token' : '刷新 Token（仅刷新访问令牌）'}>
                   <KeyRound className={cn("h-3.5 w-3.5", isRefreshingToken && "animate-pulse")} />
                </Button>
                

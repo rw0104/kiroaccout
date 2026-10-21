@@ -152,6 +152,99 @@ test('a bound profile requires account preparation and preparation failures neve
   assert.equal(h.records[0].accountId, record.accountId)
 })
 
+test('creating and failing to prepare a new profile leaves the selected account pending', async () => {
+  const h = harness()
+  const record = await h.service.create({ label: 'Pending account', executablePath, accountId: 'synthetic-account-one' })
+  assert.equal(h.records[0].accountBindingState, 'pending')
+  h.options.syncAccount = async () => { assert.fail('a pending profile has no account generation to import') }
+  h.options.prepareAccount = async (_record, options) => {
+    assert.equal(h.records[0].accountBindingState, 'active', 'reserve credentials before writing the copy')
+    assert.equal(options?.resetPending, true)
+    throw new KiroInstanceError('SYNTHETIC_PREPARATION_FAILURE')
+  }
+  await assert.rejects(h.service.launch(record.id), /SYNTHETIC_PREPARATION_FAILURE/)
+  assert.equal(h.launchCount, 0)
+  assert.equal(h.records[0].accountBindingState, 'pending')
+  await h.recreate().synchronize(record.id)
+  await h.service.stop(record.id)
+  await h.service.remove(record.id)
+  assert.equal(h.records.length, 0)
+})
+
+test('a never-started pending profile detaches without changing its original account', async () => {
+  const h = harness()
+  h.options.syncAccount = async () => { assert.fail('pending detachment must not sync') }
+  h.options.markAccountReauthorizationRequired = async () => { assert.fail('pending detachment must not invalidate the account') }
+  const record = await h.service.create({ label: 'Never started', executablePath, accountId: 'synthetic-account-one' })
+  await h.service.detach(record.id)
+  assert.equal(h.records.length, 0)
+  assert.equal(h.launchCount, 0)
+  assert.ok(h.files.entries.has(key(record.paths.root)), 'profile files remain preserved')
+})
+
+test('a failed launch request retains active ownership because the client may already have started', async () => {
+  const h = harness()
+  h.options.syncAccount = async () => {}
+  h.options.prepareAccount = async () => {}
+  const record = await h.service.create({ label: 'Ambiguous launch', executablePath, accountId: 'synthetic-account-one' })
+  h.onLaunch(async () => { throw new Error('SYNTHETIC_LAUNCH_FAILURE') })
+  await assert.rejects(h.service.launch(record.id), /SYNTHETIC_LAUNCH_FAILURE/)
+  assert.equal(h.launchCount, 1)
+  assert.equal(h.records[0].accountBindingState, 'active')
+})
+
+test('pending launch retries rebuild the copy and only a successful handoff retains ownership', async () => {
+  const h = harness(), preparations: boolean[] = []
+  const record = await h.service.create({ label: 'Retry preparation', executablePath, accountId: 'synthetic-account-one' })
+  h.options.syncAccount = async () => {}
+  h.options.prepareAccount = async (_record, options) => {
+    preparations.push(options?.resetPending === true)
+    if (preparations.length === 1) throw new Error('SYNTHETIC_PREPARATION_FAILURE')
+  }
+  await assert.rejects(h.service.launch(record.id), /SYNTHETIC_PREPARATION_FAILURE/)
+  await h.recreate().launch(record.id)
+  assert.deepEqual(preparations, [true, true])
+  assert.equal(h.records[0].accountBindingState, 'active')
+  await h.service.restart(record.id)
+  assert.deepEqual(preparations, [true, true, false])
+})
+
+test('legacy active ownership is not downgraded when preparation fails', async () => {
+  const h = harness()
+  const record = await h.service.create({ label: 'Existing ownership', executablePath, accountId: 'synthetic-account-one' })
+  h.setRecords([{ ...record, accountBindingState: undefined }])
+  h.options.syncAccount = async () => {}
+  h.options.prepareAccount = async (_record, options) => {
+    assert.equal(options?.resetPending, false)
+    throw new Error('SYNTHETIC_PREPARATION_FAILURE')
+  }
+  await assert.rejects(h.service.launch(record.id), /SYNTHETIC_PREPARATION_FAILURE/)
+  assert.equal(h.records[0].accountBindingState, undefined)
+})
+
+test('pending profiles still require process ownership checks before removal or detachment', async () => {
+  const h = harness()
+  const record = await h.service.create({ label: 'External process', executablePath, accountId: 'synthetic-account-one' })
+  await h.runtime.launch(record.executablePath, buildInstanceArguments(record.paths), {}, record.paths.home)
+  await assert.rejects(h.service.remove(record.id), /先确认实例已停止/)
+  await assert.rejects(h.service.detach(record.id), /必须确认/)
+  assert.equal(h.records.length, 1)
+  assert.equal(h.closes.length, 0)
+})
+
+test('an externally started client during preparation prevents a pending ownership rollback', async () => {
+  const h = harness()
+  h.options.syncAccount = async () => {}
+  h.options.prepareAccount = async record => {
+    await h.runtime.launch(record.executablePath, buildInstanceArguments(record.paths), {}, record.paths.home)
+    throw new Error('SYNTHETIC_PREPARATION_FAILURE')
+  }
+  const record = await h.service.create({ label: 'External launch race', executablePath, accountId: 'synthetic-account-one' })
+  await assert.rejects(h.service.launch(record.id), /SYNTHETIC_PREPARATION_FAILURE/)
+  assert.equal(h.records[0].accountBindingState, 'active')
+  assert.equal((await h.service.snapshot()).instances[0].launchStatus, 'running')
+})
+
 test('a bound launch waits for selected-account preparation before creating any client process', async () => {
   const h = harness(), entered = deferred<void>(), release = deferred<void>()
   let preparedAccount: string | undefined
@@ -284,6 +377,7 @@ test('a stopped bound configuration retains its files and account until synchron
     if (!allowSync) throw new KiroInstanceError('Synthetic account validation failed')
   }
   const record = await h.service.create({ label: 'Stopped binding', executablePath, accountId: 'synthetic-account-one' })
+  h.setRecords([{ ...record, accountBindingState: undefined }]) // Persisted pre-upgrade ownership.
   const profileFiles = structuredClone([...h.files.entries])
   await assert.rejects(h.service.remove(record.id), /Synthetic account validation failed/)
   assert.equal(h.records[0].accountId, 'synthetic-account-one')
@@ -316,6 +410,7 @@ test('bound lifecycle operations fail closed when the account synchronization de
   const h = harness()
   h.options.prepareAccount = async () => {}
   const record = await h.service.create({ label: 'Incomplete binding host', executablePath, accountId: 'synthetic-account-one' })
+  h.setRecords([{ ...record, accountBindingState: undefined }])
   await assert.rejects(h.service.launch(record.id), /账户绑定准备及同步/)
   await assert.rejects(h.service.stop(record.id), /账户同步/)
   await assert.rejects(h.service.remove(record.id), /账户同步/)
@@ -335,6 +430,7 @@ test('recovery detachment marks reauthorization without synchronizing or changin
   h.options.syncAccount = async () => { assert.fail('recovery must not import unverified credentials') }
   h.options.markAccountReauthorizationRequired = async record => { marked.push(structuredClone(record)) }
   const record = await h.service.create({ label: 'Recover stopped account', executablePath, accountId: 'synthetic-account-one' })
+  h.setRecords([{ ...record, accountBindingState: undefined }])
   const profileFiles = structuredClone([...h.files.entries])
   await h.service.detach(record.id)
   assert.equal(marked.length, 1)
@@ -349,6 +445,7 @@ test('recovery detachment marks reauthorization without synchronizing or changin
 test('recovery detachment requires a durable reauthorization marker before removing a binding', async () => {
   const h = harness()
   const record = await h.service.create({ label: 'Recover failed sync', executablePath, accountId: 'synthetic-account-one' })
+  h.setRecords([{ ...record, accountBindingState: undefined }])
   const profileFiles = structuredClone([...h.files.entries])
   await assert.rejects(h.service.detach(record.id), /重新授权标记/)
   h.options.markAccountReauthorizationRequired = async () => { throw new Error('SYNTHETIC_MARK_FAILURE') }
@@ -382,6 +479,7 @@ test('recovery detachment refuses running, uncertain and draining process groups
 test('recovery detachment rechecks the stopped state after marking and rejects legacy or blank profiles', async () => {
   const h = harness()
   const record = await h.service.create({ label: 'Externally restarted', executablePath, accountId: 'synthetic-account-one' })
+  h.setRecords([{ ...record, accountBindingState: undefined }])
   h.options.markAccountReauthorizationRequired = async selected => {
     await h.runtime.launch(selected.executablePath, buildInstanceArguments(selected.paths), {}, selected.paths.home)
   }
@@ -397,6 +495,7 @@ test('recovery detachment rechecks the stopped state after marking and rejects l
 test('background synchronization shares the lifecycle lock and does not launch a client', async () => {
   const h = harness(), entered = deferred<void>(), release = deferred<void>()
   const record = await h.service.create({ label: 'Background sync', executablePath, accountId: 'synthetic-account-one' })
+  h.setRecords([{ ...record, accountBindingState: undefined }])
   let count = 0
   h.options.syncAccount = async selected => {
     assert.equal(selected.accountId, record.accountId)
@@ -423,6 +522,7 @@ test('background synchronization shares the lifecycle lock and does not launch a
 test('a read-only background synchronization does not make a healthy snapshot appear unverified', async () => {
   const h = harness(), entered = deferred<void>(), release = deferred<void>()
   const record = await h.service.create({ label: 'Snapshot while sync', executablePath, accountId: 'synthetic-account-one' })
+  h.setRecords([{ ...record, accountBindingState: undefined }])
   h.options.syncAccount = async () => { entered.resolve(); await release.promise }
   const syncing = h.service.synchronize(record.id)
   await entered.promise

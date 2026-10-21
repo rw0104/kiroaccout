@@ -134,7 +134,7 @@ function parseImportedLinks(text: string): Array<{ email: string; url: string }>
 }
 
 export function SubscriptionPage() {
-  const { accounts, selectedIds, updateAccount, removeAccount } = useAccountsStore()
+  const { accounts, selectedIds, updateAccount, removeAccounts } = useAccountsStore()
   const { actualLanguage } = useTranslation()
   const isEn = actualLanguage === 'en'
 
@@ -453,7 +453,7 @@ export function SubscriptionPage() {
   }
 
   // 批量删除"失败 + 过期"：清理无效项，保留可用链接；勾选 deleteAlsoAccount 时连带删除账号
-  const handleDeleteFailed = () => {
+  const handleDeleteFailed = async (): Promise<void> => {
     const failedLinks = links.filter(l => l.status === 'error' || l.status === 'expired')
     const count = failedLinks.length
     if (count === 0) return
@@ -470,8 +470,10 @@ export function SubscriptionPage() {
 
     // 连带删除账号（封号账号清理）
     if (deleteAlsoAccount && removedIds.length > 0) {
-      for (const id of removedIds) {
-        removeAccount(id)
+      const result = await removeAccounts(removedIds.filter(id => accounts.has(id)))
+      if (result.failed) {
+        alert((isEn ? 'Delete failed: ' : '删除失败：') + result.errors[0].error)
+        return
       }
     }
 

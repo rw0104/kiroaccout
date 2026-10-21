@@ -391,14 +391,12 @@ export function SettingsPage() {
     }
   }
 
-  const handleClearData = () => {
+  const handleClearData = async (): Promise<void> => {
     if (confirm('确定要清除所有账号数据吗？此操作不可恢复！')) {
       if (confirm('再次确认：这将删除所有账号、分组和标签数据！')) {
-        // 清除所有数据
-        Array.from(accounts.keys()).forEach(id => {
-          useAccountsStore.getState().removeAccount(id)
-        })
-        alert('所有数据已清除')
+        const result = await useAccountsStore.getState().removeAccounts(Array.from(accounts.keys()))
+        if (result.failed) alert('删除失败：' + result.errors[0].error)
+        else alert('所有账号已清除')
       }
     }
   }

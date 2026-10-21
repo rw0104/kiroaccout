@@ -1,7 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import { stripTypeScriptTypes } from 'node:module'
+import { createRequire, stripTypeScriptTypes } from 'node:module'
+
+const ts = createRequire(import.meta.url)('typescript')
 
 function persistence(saveAccounts) {
   const source = readFileSync(new URL('../../src/renderer/src/store/accounts.ts', import.meta.url), 'utf8')
@@ -9,12 +11,18 @@ function persistence(saveAccounts) {
   const end = source.indexOf('  // ==================== 设置', start)
   assert.ok(start >= 0 && end > start)
   const snippet = stripTypeScriptTypes(`({${source.slice(start, end)}})`, { mode: 'strip' })
+  const tree = ts.createSourceFile('accounts.ts', source, ts.ScriptTarget.Latest, true)
+  const helperNames = ['enqueueAccountPersistence', 'accountStorageSnapshot']
+  const helpers = tree.statements.filter(node => ts.isFunctionDeclaration(node) && helperNames.includes(node.name?.text))
+    .map(node => stripTypeScriptTypes(node.getText(tree), { mode: 'strip' })).join('\n')
   const state = { accounts: new Map([['a', { id: 'a' }]]), groups: new Map(), tags: new Map(), proxyPool: new Map() }
   const get = () => ({ ...state, flushSaveImmediately: action.flushSaveImmediately })
   const set = next => Object.assign(state, next)
   const action = new Function('get', 'set', 'window', 'console', `
     let saveDebounceTimer = null, saveMaxWaitTimer = null, saveInFlight = null, lastSaveError = null;
     let savePendingResolvers = [];
+    let accountPersistenceQueue = Promise.resolve();
+    ${helpers}
     const action = ${snippet};
     return { ...action, lastError: () => lastSaveError };
   `)(get, set, { api: { saveAccounts } }, { error() {} })

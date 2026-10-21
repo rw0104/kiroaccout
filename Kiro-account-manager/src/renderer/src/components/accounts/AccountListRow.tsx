@@ -62,10 +62,13 @@ function AccountListRowComponent({
     maskNickname,
     usagePrecision,
     updateAccountStatus,
+    accountOperationCounts,
     accountProxyBindings,
     proxyPool,
     unbindAccountFromProxy
   } = useAccountsStore()
+  const isAccountOperationPending = (accountOperationCounts.get(account.id) ?? 0) > 0
+  const displayStatus = isAccountOperationPending ? 'refreshing' : account.status
 
   // 该账号绑定的代理（如有）
   const boundProxy = useMemo(() => {
@@ -213,7 +216,7 @@ function AccountListRowComponent({
 
   const handleRefresh = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation()
-    if (isRefreshing) return
+    if (isRefreshing || isAccountOperationPending) return
     setIsRefreshing(true)
     try {
       await refreshAccountToken(account.id)
@@ -221,12 +224,13 @@ function AccountListRowComponent({
     } finally {
       setIsRefreshing(false)
     }
-  }, [account.id, isRefreshing, refreshAccountToken, checkAccountStatus])
+  }, [account.id, isRefreshing, isAccountOperationPending, refreshAccountToken, checkAccountStatus])
 
-  const handleDelete = useCallback((e: React.MouseEvent) => {
+  const handleDelete = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation()
     if (!confirm(isEn ? `Delete account "${account.email}"?` : `确定删除账号 "${account.email}"？`)) return
-    removeAccount(account.id)
+    try { await removeAccount(account.id) }
+    catch (error) { alert((isEn ? 'Delete failed: ' : '删除失败：') + (error instanceof Error ? error.message : 'Account retained')) }
   }, [account.id, account.email, isEn, removeAccount])
 
   const handleLogout = useCallback(async (e: React.MouseEvent) => {
@@ -376,10 +380,10 @@ function AccountListRowComponent({
         <div
           className={cn(
             'text-[10px] font-medium h-5 px-2 rounded-full flex items-center justify-center gap-1 min-w-[52px]',
-            getStatusBadgeClass(account.status, isUnauthorized)
+            getStatusBadgeClass(displayStatus, isUnauthorized)
           )}
         >
-          {account.status === 'refreshing' && <Loader2 className="h-3 w-3 animate-spin" />}
+          {isAccountOperationPending && <Loader2 className="h-3 w-3 animate-spin" />}
           {isUnauthorized && <AlertCircle className="h-3 w-3" />}
           {isUnauthorized ? (
             <span
@@ -389,7 +393,7 @@ function AccountListRowComponent({
               {isEn ? 'Banned' : '已封禁'}
             </span>
           ) : (
-            (isEn ? StatusLabelsEn : StatusLabelsZh)[account.status] || account.status
+            (isEn ? StatusLabelsEn : StatusLabelsZh)[displayStatus] || displayStatus
           )}
         </div>
 
@@ -564,10 +568,10 @@ function AccountListRowComponent({
           variant="ghost"
           className="h-7 w-7 text-muted-foreground hover:text-foreground"
           onClick={handleRefresh}
-          disabled={isRefreshing || account.status === 'refreshing'}
+          disabled={isRefreshing || isAccountOperationPending}
           title={isEn ? 'Check account info' : '检查账户信息'}
         >
-          <RefreshCw className={cn('h-3.5 w-3.5', isRefreshing && 'animate-spin')} />
+          <RefreshCw className={cn('h-3.5 w-3.5', (isRefreshing || isAccountOperationPending) && 'animate-spin')} />
         </Button>
 
         <Button

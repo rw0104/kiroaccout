@@ -34,6 +34,8 @@ export interface KiroInstanceRecord {
   executablePath: string
   createdAt: string
   accountId?: string
+  /** Pending selections have never been handed to a client. Missing means legacy active ownership. */
+  accountBindingState?: 'pending' | 'active'
   proxy?: KiroInstanceProxy
   paths: KiroInstancePaths
   lastProcesses?: KiroProcessIdentity[]
@@ -82,7 +84,7 @@ export interface KiroInstancesApi {
   snapshot(): Promise<KiroInstanceResult<KiroInstancesSnapshot>>
   create(input: CreateKiroInstanceInput): Promise<KiroInstanceResult<KiroInstanceRecord>>
   remove(id: string): Promise<KiroInstanceResult>
-  /** Recovery only: retain files, require account reauthorization and remove a stopped binding. */
+  /** Retain files and remove a stopped binding; only active ownership requires reauthorization. */
   detach(id: string): Promise<KiroInstanceResult>
   launch(id: string): Promise<KiroInstanceResult>
   stop(id: string): Promise<KiroInstanceResult>

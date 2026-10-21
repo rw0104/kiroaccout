@@ -52,6 +52,8 @@ interface AccountData {
 
 interface RefreshResult {
   success: boolean
+  /** Local operation refusal is distinct from an upstream credential failure. */
+  code?: string
   data?: {
     accessToken: string
     refreshToken?: string
@@ -66,7 +68,7 @@ interface RefreshResult {
     /** Enterprise 账号刷新时主进程自动获取的真实 profileArn */
     profileArn?: string
   }
-  error?: { message: string }
+  error?: { message: string; code?: string }
 }
 
 /** Kiro IDE 自己 refresh 完写回 token 文件、被反代检测到后通知 renderer 的 payload */
@@ -96,6 +98,8 @@ interface ResourceDetail {
 
 interface StatusResult {
   success: boolean
+  /** Local operation refusal is distinct from an upstream credential failure. */
+  code?: string
   data?: {
     status: string
     email?: string
@@ -135,7 +139,7 @@ interface StatusResult {
       expiresAt?: number
     }
   }
-  error?: { message: string }
+  error?: { message: string; code?: string }
 }
 
 interface KiroApi {

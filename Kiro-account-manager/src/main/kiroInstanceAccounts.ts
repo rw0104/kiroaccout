@@ -30,6 +30,8 @@ export interface InstanceAccountInput {
   record: KiroInstanceRecord
   account: InstanceBoundAccount
   now?: number
+  /** Trusted lifecycle: no launch was requested; replace an unchanged abandoned seed. */
+  resetPending?: boolean
   /** Optional trusted host identity lookup. This module never performs network requests. */
   verifyIdentity?: (credentials: InstanceAccountCredentials) => Promise<{ userId: string } | null>
 }
@@ -42,6 +44,7 @@ interface Binding {
   authMethod: string
   clientIdHash?: string
   refreshFingerprint: string
+  accessFingerprint?: string
   subjectFingerprint?: string
   userIdFingerprint?: string
 }
@@ -123,9 +126,10 @@ async function atomicJson(input: InstanceAccountInput, path: string, value: unkn
 }
 function bindingFrom(value: Record<string, unknown>, input: InstanceAccountInput): Binding {
   const identity = selectedIdentity(input.account)
-  const allowed = new Set(['schemaVersion', 'instanceId', 'accountId', 'provider', 'authMethod', 'clientIdHash', 'refreshFingerprint', 'subjectFingerprint', 'userIdFingerprint'])
+  const allowed = new Set(['schemaVersion', 'instanceId', 'accountId', 'provider', 'authMethod', 'clientIdHash', 'refreshFingerprint', 'accessFingerprint', 'subjectFingerprint', 'userIdFingerprint'])
   if (Object.keys(value).some(key => !allowed.has(key)) || value.schemaVersion !== 1 || value.instanceId !== input.record.id || value.accountId !== input.account.id ||
       value.provider !== identity.provider || value.authMethod !== identity.authMethod || typeof value.refreshFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(value.refreshFingerprint) ||
+      value.accessFingerprint !== undefined && (typeof value.accessFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(value.accessFingerprint)) ||
       value.subjectFingerprint !== undefined && (typeof value.subjectFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(value.subjectFingerprint)) ||
       value.userIdFingerprint !== undefined && (typeof value.userIdFingerprint !== 'string' || !/^[a-f0-9]{64}$/.test(value.userIdFingerprint)) ||
       value.clientIdHash !== undefined && (typeof value.clientIdHash !== 'string' || !/^[a-f0-9]{40}$/.test(value.clientIdHash))) return fail()
@@ -226,7 +230,20 @@ export async function prepareKiroInstanceAccount(input: InstanceAccountInput): P
     return await locked(input.record.paths.root, async () => {
       const paths = await verifiedPaths(input)
       const now = input.now ?? Date.now()
-      const previous = await readUpdate(input)
+      if (input.resetPending) {
+        const [bindingValue, token] = await Promise.all([readJson(paths.binding), readJson(paths.token)])
+        if (token) {
+          if (!bindingValue) return fail('实例存在未绑定缓存，未覆盖；请核对实例资料后重新创建。')
+          const binding = bindingFrom(bindingValue, input)
+          // A failed first launch may leave a seed behind while the manager is
+          // free to refresh. Reseed only that exact copy, never a client rotation.
+          if (!nonempty(token.accessToken) || !nonempty(token.refreshToken) || !binding.accessFingerprint ||
+              fingerprint(token.accessToken) !== binding.accessFingerprint || fingerprint(token.refreshToken) !== binding.refreshFingerprint) {
+            return fail('实例缓存已变化，未覆盖；请核对实例账户后重新创建。')
+          }
+        } else if (bindingValue) bindingFrom(bindingValue, input)
+      }
+      const previous = input.resetPending ? null : await readUpdate(input)
       if (previous) return { ...previous, source: 'instance' }
       const identity = selectedIdentity(input.account)
       const credentials = input.account.credentials
@@ -235,7 +252,7 @@ export async function prepareKiroInstanceAccount(input: InstanceAccountInput): P
       const token: Record<string, unknown> = { accessToken: credentials.accessToken, refreshToken: credentials.refreshToken,
         expiresAt: new Date(credentials.expiresAt).toISOString(), authMethod: identity.authMethod, provider: identity.provider, profileArn }
       const binding: Binding = { schemaVersion: 1, instanceId: input.record.id, accountId: input.account.id, provider: identity.provider,
-        authMethod: identity.authMethod, refreshFingerprint: fingerprint(credentials.refreshToken),
+        authMethod: identity.authMethod, refreshFingerprint: fingerprint(credentials.refreshToken), accessFingerprint: fingerprint(credentials.accessToken),
         ...(subjectFingerprint(credentials.accessToken) ? { subjectFingerprint: subjectFingerprint(credentials.accessToken) } : {}),
         ...(nonempty(input.account.userId) ? { userIdFingerprint: fingerprint(input.account.userId) } : {}) }
       let startUrl = credentials.startUrl

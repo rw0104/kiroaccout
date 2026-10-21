@@ -288,10 +288,11 @@ export function AccountToolbar({
     window.dispatchEvent(new CustomEvent('navigate-page', { detail: 'diagnose' }))
   }
 
-  const handleBatchDelete = (): void => {
+  const handleBatchDelete = async (): Promise<void> => {
     if (selectedCount === 0) return
     if (confirm(isEn ? `Delete ${selectedCount} selected accounts?` : `确定要删除选中的 ${selectedCount} 个账号吗？`)) {
-      removeAccounts(Array.from(selectedIds))
+      const result = await removeAccounts(Array.from(selectedIds))
+      if (result.failed) alert((isEn ? 'Delete failed: ' : '删除失败：') + result.errors[0].error)
     }
   }
 

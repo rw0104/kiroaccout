@@ -316,7 +316,7 @@ export function DiagnosePage(): React.ReactNode {
   }, [failedAccountIds, livenessBatch, updateAccount, isEn])
 
   /** 一键删除失败账号（带确认） */
-  const deleteFailed = useCallback((): void => {
+  const deleteFailed = useCallback(async (): Promise<void> => {
     const ids = failedAccountIds
     if (ids.length === 0) return
     const ok = window.confirm(
@@ -325,10 +325,12 @@ export function DiagnosePage(): React.ReactNode {
         : `确定删除 ${ids.length} 个测活失败的账号？此操作不可恢复。`
     )
     if (!ok) return
-    removeAccounts(ids)
+    const result = await removeAccounts(ids)
+    if (result.failed) alert((isEn ? 'Delete failed: ' : '删除失败：') + result.errors[0].error)
+    const retained = new Set(result.errors.map(item => item.id))
     setLivenessBatch((prev) => {
       const next = new Map(prev)
-      for (const id of ids) next.delete(id)
+      for (const id of ids) if (!retained.has(id)) next.delete(id)
       return next
     })
   }, [failedAccountIds, removeAccounts, isEn])

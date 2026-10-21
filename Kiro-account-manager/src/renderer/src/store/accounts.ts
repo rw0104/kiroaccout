@@ -57,6 +57,73 @@ let saveDebounceTimer: ReturnType<typeof setTimeout> | null = null
 let saveMaxWaitTimer: ReturnType<typeof setTimeout> | null = null
 let saveInFlight: Promise<void> | null = null
 let lastSaveError: Error | null = null
+// Every snapshot writer shares this queue. Build snapshots inside the queue so a
+// delayed autosave cannot restore an account after a confirmed deletion.
+let accountPersistenceQueue: Promise<void> = Promise.resolve()
+function enqueueAccountPersistence<T>(work: () => Promise<T>): Promise<T> {
+  const result = accountPersistenceQueue.then(work, work)
+  accountPersistenceQueue = result.then(() => undefined, () => undefined)
+  return result
+}
+function accountStorageSnapshot(state: AccountsState) {
+  return {
+    accounts: Object.fromEntries(state.accounts),
+    groups: Object.fromEntries(state.groups),
+    tags: Object.fromEntries(state.tags),
+    activeAccountId: state.activeAccountId,
+    autoRefreshEnabled: state.autoRefreshEnabled,
+    autoRefreshInterval: state.autoRefreshInterval,
+    autoRefreshConcurrency: state.autoRefreshConcurrency,
+    statusCheckInterval: state.statusCheckInterval,
+    privacyMode: state.privacyMode,
+    usagePrecision: state.usagePrecision,
+    proxyEnabled: state.proxyEnabled,
+    proxyUrl: state.proxyUrl,
+    autoSwitchEnabled: state.autoSwitchEnabled,
+    autoSwitchThreshold: state.autoSwitchThreshold,
+    autoSwitchInterval: state.autoSwitchInterval,
+    switchTarget: state.switchTarget,
+    theme: state.theme,
+    darkMode: state.darkMode,
+    language: state.language,
+    machineIdConfig: state.machineIdConfig,
+    accountMachineIds: state.accountMachineIds,
+    machineIdHistory: state.machineIdHistory,
+    proxyPool: Object.fromEntries(state.proxyPool),
+    proxyPoolConfig: state.proxyPoolConfig,
+    proxyPoolCursor: state.proxyPoolCursor,
+    accountProxyBindings: state.accountProxyBindings
+  }
+}
+// Operation progress belongs to the current UI session and must never become
+// account health in a persistence snapshot. Count calls so overlapping IPCs do
+// not clear another still-pending operation's feedback.
+function accountOperationCountsAfter(state: AccountsState, id: string, delta: 1 | -1): Map<string, number> {
+  const counts = new Map(state.accountOperationCounts)
+  const count = (counts.get(id) ?? 0) + delta
+  if (count > 0) counts.set(id, count)
+  else counts.delete(id)
+  return counts
+}
+function accountStateWithout(state: AccountsState, ids: string[]) {
+  const accounts = new Map(state.accounts)
+  const selectedIds = new Set(state.selectedIds)
+  const accountProxyBindings = { ...state.accountProxyBindings }
+  let activeAccountId = state.activeAccountId
+  for (const id of ids) {
+    accounts.delete(id)
+    selectedIds.delete(id)
+    delete accountProxyBindings[id]
+    if (activeAccountId === id) activeAccountId = null
+  }
+  return { accounts, selectedIds, activeAccountId, accountProxyBindings }
+}
+function accountDeletionError(error: unknown): string {
+  const message = error instanceof Error ? error.message : ''
+  if (message.includes('该账户已由独立 Kiro 实例管理')) return '账户仍由多开实例管理，请先停止实例并解除绑定后再删除。账户已保留。'
+  if (message.includes('实例凭证未核验')) return '账户需要重新授权，删除未保存。请先完成重新授权；账户已保留。'
+  return '删除未保存，账户已保留。请检查多开绑定与存储状态后重试。'
+}
 // Session-only aliases prevent reusing a refresh token already rotated by an import.
 const consumedImportTokens = new Map<string, string>()
 let accountImportQueue: Promise<void> = Promise.resolve()
@@ -78,6 +145,10 @@ interface BackgroundCredentialResult extends CredentialVersion {
 }
 function credentialVersion(account: Account): CredentialVersion {
   return { expectedRefreshToken: account.credentials.refreshToken, expectedAccessToken: account.credentials.accessToken }
+}
+function isDeferredAccountOperation(result: { success: boolean; code?: string; error?: { code?: string } }): boolean {
+  const code = result.error?.code ?? result.code
+  return !result.success && (code === 'instance-owned' || code === 'account-operation-in-flight')
 }
 /** Compare both tokens: a refresh need not rotate its refreshToken, so that alone is not a generation. */
 function credentialResultDisposition(
@@ -289,6 +360,7 @@ interface AccountsState {
 
   // 数据
   accounts: Map<string, Account>
+  accountOperationCounts: Map<string, number>
   groups: Map<string, AccountGroup>
   tags: Map<string, AccountTag>
 
@@ -384,8 +456,8 @@ interface AccountsActions {
   // 账号 CRUD
   addAccount: (account: Omit<Account, 'id' | 'createdAt' | 'isActive'>) => string
   updateAccount: (id: string, updates: Partial<Account>) => void
-  removeAccount: (id: string) => void
-  removeAccounts: (ids: string[]) => BatchOperationResult
+  removeAccount: (id: string) => Promise<void>
+  removeAccounts: (ids: string[]) => Promise<BatchOperationResult>
 
   // 激活账号
   setActiveAccount: (id: string | null) => void
@@ -591,6 +663,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   // 初始状态
   appVersion: '1.0.0',
   accounts: new Map(),
+  accountOperationCounts: new Map(),
   groups: new Map(),
   tags: new Map(),
   activeAccountId: null,
@@ -679,53 +752,35 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     get().saveToStorage()
   },
 
-  removeAccount: (id) => {
-    set((state) => {
-      const accounts = new Map(state.accounts)
-      accounts.delete(id)
-
-      const selectedIds = new Set(state.selectedIds)
-      selectedIds.delete(id)
-
-      const activeAccountId = state.activeAccountId === id ? null : state.activeAccountId
-
-      // 同时清理账号-代理绑定
-      const bindings = { ...state.accountProxyBindings }
-      delete bindings[id]
-
-      return { accounts, selectedIds, activeAccountId, accountProxyBindings: bindings }
-    })
-    get().saveToStorage()
+  removeAccount: async (id) => {
+    const result = await get().removeAccounts([id])
+    if (result.failed) throw new Error(result.errors[0]?.error || '删除未保存，账户已保留。')
   },
 
-  removeAccounts: (ids) => {
+  removeAccounts: async (ids) => enqueueAccountPersistence(async () => {
+    const state = get()
     const result: BatchOperationResult = { success: 0, failed: 0, errors: [] }
-
-    set((state) => {
-      const accounts = new Map(state.accounts)
-      const selectedIds = new Set(state.selectedIds)
-      let activeAccountId = state.activeAccountId
-      const bindings = { ...state.accountProxyBindings }
-
-      for (const id of ids) {
-        if (accounts.has(id)) {
-          accounts.delete(id)
-          selectedIds.delete(id)
-          delete bindings[id]
-          if (activeAccountId === id) activeAccountId = null
-          result.success++
-        } else {
-          result.failed++
-          result.errors.push({ id, error: 'Account not found' })
-        }
-      }
-
-      return { accounts, selectedIds, activeAccountId, accountProxyBindings: bindings }
-    })
-
-    get().saveToStorage()
+    const targets: string[] = []
+    for (const id of new Set(ids)) {
+      if (state.accounts.has(id)) targets.push(id)
+      else { result.failed++; result.errors.push({ id, error: 'Account not found' }) }
+    }
+    if (!targets.length) return result
+    set({ isSyncing: true })
+    try {
+      // The main process still decides whether bound/recovery accounts may be
+      // removed. Do not hide any row until that write has been acknowledged.
+      await window.api.saveAccounts(accountStorageSnapshot({ ...state, ...accountStateWithout(state, targets) }))
+      // Keep unrelated changes that arrived while IPC was pending.
+      set(current => accountStateWithout(current, targets))
+      result.success = targets.length
+    } catch (error) {
+      const message = accountDeletionError(error)
+      result.failed += targets.length
+      result.errors.push(...targets.map(id => ({ id, error: message })))
+    } finally { set({ isSyncing: false }) }
     return result
-  },
+  }),
 
   // ==================== 激活账号 ====================
 
@@ -1320,13 +1375,14 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     if (!account) return false
     const expected = credentialVersion(account)
 
-    updateAccountStatus(id, 'refreshing')
+    set(state => ({ accountOperationCounts: accountOperationCountsAfter(state, id, 1) }))
 
     try {
       // 通过主进程调用 Kiro API 刷新 Token（避免 CORS）
       const result = await window.api.refreshAccountToken(account)
       const disposition = credentialResultDisposition(get().accounts.get(id), expected, result.success ? result.data : undefined)
       if (disposition !== 'input') return disposition === 'duplicate'
+      if (isDeferredAccountOperation(result)) return false
 
       if (result.success && result.data) {
         // 当 refresh 后 main 进程检测到该账号是 IDE 当前激活账号，会自动同步到磁盘 token 文件；
@@ -1382,6 +1438,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       if (credentialResultDisposition(get().accounts.get(id), expected) !== 'input') return false
       updateAccountStatus(id, 'error', error instanceof Error ? error.message : 'Unknown error')
       return false
+    } finally {
+      set(state => ({ accountOperationCounts: accountOperationCountsAfter(state, id, -1) }))
     }
   },
 
@@ -1449,13 +1507,13 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     if (!account) return
     const expected = credentialVersion(account)
 
-    // 设置刷新状态，提供视觉反馈
-    updateAccountStatus(id, 'refreshing')
+    set(state => ({ accountOperationCounts: accountOperationCountsAfter(state, id, 1) }))
 
     try {
       // 通过主进程调用 Kiro API 获取状态（避免 CORS）
       const result = await window.api.checkAccountStatus(account)
       if (credentialResultDisposition(get().accounts.get(id), expected, result.success ? result.data?.newCredentials : undefined) !== 'input') return
+      if (isDeferredAccountOperation(result)) return
 
       if (result.success && result.data) {
         set((state) => {
@@ -1543,6 +1601,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     } catch (error) {
       if (credentialResultDisposition(get().accounts.get(id), expected) !== 'input') return
       updateAccountStatus(id, 'error', error instanceof Error ? error.message : 'Unknown error')
+    } finally {
+      set(state => ({ accountOperationCounts: accountOperationCountsAfter(state, id, -1) }))
     }
   },
 
@@ -1815,68 +1875,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       return
     }
 
-    const {
-      accounts,
-      groups,
-      tags,
-      activeAccountId,
-      autoRefreshEnabled,
-      autoRefreshInterval,
-      autoRefreshConcurrency,
-      statusCheckInterval,
-      privacyMode,
-      usagePrecision,
-      proxyEnabled,
-      proxyUrl,
-      autoSwitchEnabled,
-      autoSwitchThreshold,
-      autoSwitchInterval,
-      switchTarget,
-      theme,
-      darkMode,
-      language,
-      machineIdConfig,
-      accountMachineIds,
-      machineIdHistory,
-      proxyPool,
-      proxyPoolConfig,
-      proxyPoolCursor,
-      accountProxyBindings
-    } = get()
-
-    set({ isSyncing: true })
-
     lastSaveError = null
-    saveInFlight = Promise.resolve().then(async () => {
+    saveInFlight = enqueueAccountPersistence(async () => {
+      set({ isSyncing: true })
       try {
-        await window.api.saveAccounts({
-          accounts: Object.fromEntries(accounts),
-          groups: Object.fromEntries(groups),
-          tags: Object.fromEntries(tags),
-          activeAccountId,
-          autoRefreshEnabled,
-          autoRefreshInterval,
-          autoRefreshConcurrency,
-          statusCheckInterval,
-          privacyMode,
-          usagePrecision,
-          proxyEnabled,
-          proxyUrl,
-          autoSwitchEnabled,
-          autoSwitchThreshold,
-          autoSwitchInterval,
-          switchTarget,
-          theme,
-          darkMode,
-          language,
-          machineIdConfig,
-          accountMachineIds,
-          machineIdHistory,
-          proxyPool: Object.fromEntries(proxyPool),
-          proxyPoolConfig,
-          proxyPoolCursor,
-          accountProxyBindings
-        })
+        await window.api.saveAccounts(accountStorageSnapshot(get()))
       } catch (error) {
         lastSaveError = new Error('账户保存失败')
         console.error('Failed to save accounts')

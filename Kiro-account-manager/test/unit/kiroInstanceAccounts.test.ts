@@ -129,6 +129,28 @@ test('a different accountId cannot read or seed a bound instance', options, asyn
   assert.deepEqual(await ctx.readCache(), [])
 })
 
+test('retrying a never-launched profile copies the latest manager credentials instead of restoring an abandoned seed', options, async t => {
+  const ctx = await fixture(t)
+  await prepareKiroInstanceAccount(ctx.input)
+  const latest = { ...ctx.account, credentials: { ...ctx.account.credentials,
+    accessToken: jwt(ctx.account.id, 2), refreshToken: 'SYNTHETIC_MANAGER_REFRESH_NEW', expiresAt: now + 7200000 } }
+  const before = structuredClone(latest)
+  const retried = await prepareKiroInstanceAccount({ ...ctx.input, account: latest, resetPending: true })
+  assert.equal(retried.source, 'manager')
+  assert.equal((await ctx.token()).refreshToken, latest.credentials.refreshToken)
+  assert.equal((await ctx.token()).accessToken, latest.credentials.accessToken)
+  assert.deepEqual(latest, before)
+})
+
+test('retrying a pending profile never overwrites a foreign or rotated cache', options, async t => {
+  const ctx = await fixture(t)
+  await prepareKiroInstanceAccount(ctx.input)
+  const rotated = { ...await ctx.token(), accessToken: jwt(ctx.account.id, 2), refreshToken: 'SYNTHETIC_OFFICIAL_ROTATION' }
+  await ctx.writeToken(rotated)
+  await denied(prepareKiroInstanceAccount({ ...ctx.input, resetPending: true }))
+  assert.deepEqual(await ctx.token(), rotated)
+})
+
 test('two managed instances retain exactly the chosen account and never inherit one another credentials', options, async t => {
   const a = await fixture(t, social('synthetic-a'))
   const b = await fixture(t, social('synthetic-b'))

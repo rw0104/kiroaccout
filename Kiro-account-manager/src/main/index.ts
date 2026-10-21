@@ -39,7 +39,7 @@ import { InstanceAccountOwnership, InstanceOwnershipError, INSTANCE_ACCOUNT_REAU
 import { applyManagerTokenRotation } from './managerAccountRefresh'
 import { registerKiroInstanceIpc } from './ipc/kiroInstances'
 import { normalizeCredentialRecord } from '../shared/accountImport'
-import { resolveIdentity } from '../shared/authIdentity'
+import { normalizeProvider, resolveIdentity } from '../shared/authIdentity'
 import { AppUpdateController, type AppUpdateState, type UpdateEngine } from './appUpdater'
 import { randomUUID } from 'node:crypto'
 import { TokenRefreshService, type AuthRefreshResult } from './authRefresh'
@@ -1400,7 +1400,8 @@ function registerUnboundAccountHandler(channel: string, handler: Parameters<type
       return await handler(event, ...args)
     } catch (error) {
       const message = error instanceof InstanceOwnershipError ? error.message : '账户操作未完成，请检查账户状态后重试。'
-      return { success: false, error: channel === 'refresh-account-token' || channel === 'check-account-status' ? { message } : message }
+      const code = error instanceof InstanceOwnershipError ? error.code : undefined
+      return { success: false, ...(code ? { code } : {}), error: channel === 'refresh-account-token' || channel === 'check-account-status' ? { message, ...(code ? { code } : {}) } : message }
     } finally { release?.() }
   })
 }
@@ -1410,12 +1411,17 @@ function getInstanceBoundAccount(accountId: string): InstanceBoundAccount {
   const account = data?.accounts?.[accountId]
   if (!account || account.id !== accountId) throw new Error('绑定账户已不存在，请先移除实例绑定')
   if (account.profileArn && account.credentials.profileArn && account.profileArn !== account.credentials.profileArn) throw new Error('账户 profile 资料不一致，请先核对后绑定')
+  const provider = normalizeProvider(account.credentials.provider)
+  const idp = normalizeProvider(account.idp)
+  if (provider === null || idp === null || provider !== undefined && idp !== undefined && provider !== idp) {
+    throw new KiroInstanceError('绑定账户的 provider 与 idp 无效或不一致，请先核对账户资料后重试。')
+  }
   // Older manager records sometimes kept the provider on the account (`idp`)
   // while leaving a stale authMethod in credentials. The provider is the
   // authoritative identity for an already imported account: repair only this
   // in-memory launch copy so a Google/GitHub account cannot be sent through the
   // OIDC registration path. JSON import itself remains strict about conflicts.
-  const providerHint = account.credentials.provider || account.idp
+  const providerHint = provider ?? idp
   const identity = resolveIdentity({ provider: providerHint, idp: account.idp, hasClientCredentials: !!(account.credentials.clientId && account.credentials.clientSecret) })
   if (!identity.ok) throw new KiroInstanceError('绑定账户的登录提供商无法识别，请在账户管理中修正 provider/idp 后重试。')
   return {
@@ -1435,14 +1441,20 @@ function persistInstanceAccountCredentials(accountId: string, credentials: Insta
   const data = store.get('accountData') as { accounts?: Record<string, InstanceBoundAccount> } | undefined
   const account = data?.accounts?.[accountId]
   if (!data?.accounts || !account) throw new Error('绑定账户已不存在')
-  if (JSON.stringify(account.credentials) === JSON.stringify({ ...account.credentials, ...credentials })) return
-  if (expected && (account.credentials.accessToken !== expected.accessToken || account.credentials.refreshToken !== expected.refreshToken)) throw new Error('账户凭证刚刚变化，请重试同步')
+  // Preparing an instance normalizes its launch-only identity and registration
+  // fields. Reading that copy back is not a credential rotation and must not
+  // rewrite the manager account, even when its legacy metadata differs.
+  const rotation = { accessToken: credentials.accessToken, refreshToken: credentials.refreshToken, expiresAt: credentials.expiresAt }
+  const sameGeneration = (left: InstanceBoundAccount['credentials'], right: InstanceBoundAccount['credentials']): boolean =>
+    left.accessToken === right.accessToken && left.refreshToken === right.refreshToken && left.expiresAt === right.expiresAt
+  if (sameGeneration(account.credentials, rotation)) return
+  if (expected && !sameGeneration(account.credentials, expected)) throw new Error('账户凭证刚刚变化，请重试同步')
   if (!instanceAccountOwnership.isBound({ accountId })) return
-  const updated = { ...data, accounts: { ...data.accounts, [accountId]: { ...account, credentials: { ...account.credentials, ...credentials } } } }
+  const updated = { ...data, accounts: { ...data.accounts, [accountId]: { ...account, credentials: { ...account.credentials, ...rotation } } } }
   store.set('accountData', updated)
   pendingStoreWrites.delete('accountData')
   lastSavedData = updated
-  mainWindow?.webContents.send('kiro-instance-account-update', { id: accountId, credentials })
+  mainWindow?.webContents.send('kiro-instance-account-update', { id: accountId, credentials: rotation })
 }
 
 // 最后保存的数据（用于崩溃恢复）
@@ -2505,26 +2517,45 @@ app.whenReady().then(async () => {
   registerRegistrationHandlers(() => mainWindow)
   const kiroInstanceRuntime = createWindowsKiroRuntime({ trustedPublishers: ['Amazon.com, Inc.'] })
   const kiroInstallationDiscovery = createWindowsKiroInstallationDiscovery({ runtime: kiroInstanceRuntime })
+  // Retain only entries removed by this launch transaction, so a preparation
+  // failure can restore prior pool membership without adding unselected accounts.
+  const suspendedInstancePoolAccounts = new Map<string, ProxyAccount>()
   const kiroInstanceService = createWindowsKiroInstanceService({
     baseRoot: join(app.getPath('userData'), 'kiro-instances-v2'),
     readConfig: async () => { await initStore(); return store!.get('kiroInstances') },
     writeConfig: async records => {
       await initStore()
-      for (const record of records) if (record.schemaVersion === 2 && record.accountId) instanceAccountOwnership.assertCanBind(record.accountId, record.id)
+      for (const record of records) if (record.schemaVersion === 2 && record.accountId && record.accountBindingState !== 'pending') instanceAccountOwnership.assertCanBind(record.accountId, record.id)
       store!.set('kiroInstances', records)
       const pool = proxyServer?.getAccountPool()
       for (const account of pool?.getAllAccounts() ?? []) {
-        if (instanceAccountOwnership.isBound({ accountId: account.id, ...account })) pool!.removeAccount(account.id)
+        if (instanceAccountOwnership.isBound({ accountId: account.id, ...account })) {
+          suspendedInstancePoolAccounts.set(account.id, account)
+          pool!.removeAccount(account.id)
+        }
+      }
+      const current = store!.get('accountData') as { accounts?: Record<string, { status?: string; credentials?: InstanceBoundAccount['credentials'] }> } | undefined
+      for (const [accountId, saved] of suspendedInstancePoolAccounts) {
+        const record = records.find(row => row.schemaVersion === 2 && row.accountId === accountId)
+        if (record?.accountBindingState !== 'pending') {
+          if (!record) suspendedInstancePoolAccounts.delete(accountId)
+          continue
+        }
+        const account = current?.accounts?.[accountId]
+        if (pool && account?.status === 'active' && account.credentials?.accessToken === saved.accessToken && account.credentials.refreshToken === saved.refreshToken) {
+          pool.addAccount(saved)
+        }
+        suspendedInstancePoolAccounts.delete(accountId)
       }
     },
     runtime: kiroInstanceRuntime,
-    prepareAccount: async record => {
+    prepareAccount: async (record, options) => {
       const account = getInstanceBoundAccount(record.accountId!)
       const defaultToken = await readKiroAuthTokenFile()
       if (defaultToken && (defaultToken.refreshToken === account.credentials.refreshToken || defaultToken.accessToken === account.credentials.accessToken)) {
         throw new KiroInstanceError('默认 Kiro 客户端仍保存着该账户的同一份凭证。请先在默认客户端切换其他账户，避免两个客户端争用刷新凭证；默认客户端资料未被改动。')
       }
-      const prepared = await prepareKiroInstanceAccount({ record, account, verifyIdentity: credentials => verifyKiroInstanceIdentity(credentials, {
+      const prepared = await prepareKiroInstanceAccount({ record, account, resetPending: options?.resetPending, verifyIdentity: credentials => verifyKiroInstanceIdentity(credentials, {
         fetch: (input, options) => fetchWithAppProxy(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, options ?? {}, record.proxy?.url)
       }) })
       if (prepared.source === 'instance') persistInstanceAccountCredentials(account.id, prepared.credentials, account.credentials)
@@ -2555,7 +2586,7 @@ app.whenReady().then(async () => {
       const records = store.get('kiroInstances')
       if (!Array.isArray(records)) return
       for (const record of records) {
-        if (record?.schemaVersion !== 2 || !record.accountId || typeof record.id !== 'string') continue
+        if (record?.schemaVersion !== 2 || !record.accountId || record.accountBindingState === 'pending' || typeof record.id !== 'string') continue
         // The service validates roots and serializes this with launch/stop/detach.
         await kiroInstanceService.synchronize(record.id).catch(() => {})
       }

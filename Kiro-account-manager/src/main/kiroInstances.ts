@@ -20,7 +20,7 @@ export interface KiroInstanceDependencies {
   writeConfig(records: KiroInstanceRecord[]): Promise<void>
   runtime: KiroInstanceRuntime
   /** Writes only the explicitly bound account into this verified profile; never refreshes it. */
-  prepareAccount?: (record: KiroInstanceRecord) => Promise<void>
+  prepareAccount?: (record: KiroInstanceRecord, options?: { resetPending: boolean }) => Promise<void>
   /** Imports the profile's latest credential generation after it has completely stopped. */
   syncAccount?: (record: KiroInstanceRecord) => Promise<void>
   /** Explicit recovery: preserve unverified cache, mark the original account for reauthorization. */
@@ -155,6 +155,7 @@ export class KiroInstanceService {
         if (!validAccountId(item.accountId) || accountIds.has(item.accountId)) return failInstance('账户绑定无效或同一账户重复绑定了多个实例。')
         accountIds.add(item.accountId)
       }
+      if (item.accountBindingState !== undefined && (!item.accountId || !['pending', 'active'].includes(item.accountBindingState))) return failInstance('账户绑定状态无效。')
       const executable = canonicalWindowsPath(item.executablePath)
       if (win32.basename(executable).toLowerCase() !== 'kiro.exe') return failInstance('实例安装路径无效。')
       if (!item.paths || typeof item.paths !== 'object') return failInstance('实例目录配置无效。')
@@ -175,7 +176,9 @@ export class KiroInstanceService {
         if (!proxy) return failInstance('实例代理配置无效。')
       }
       return { schemaVersion: 2, id: item.id, label: item.label.trim(), executablePath: executable, createdAt: item.createdAt, paths: expected,
-        ...(item.accountId !== undefined ? { accountId: item.accountId } : {}), ...(proxy ? { proxy } : {}), ...(lastProcesses ? { lastProcesses } : {}) }
+        ...(item.accountId !== undefined ? { accountId: item.accountId } : {}),
+        ...(item.accountBindingState !== undefined ? { accountBindingState: item.accountBindingState } : {}),
+        ...(proxy ? { proxy } : {}), ...(lastProcesses ? { lastProcesses } : {}) }
     })
   }
   private async record(id: string): Promise<KiroInstanceRecord> {
@@ -332,7 +335,7 @@ export class KiroInstanceService {
       await this.io.writeMarker(win32.join(user, 'settings.json'), JSON.stringify({ 'window.title': `Kiro · ${input.label.trim()}`, 'update.mode': 'none', 'extensions.autoUpdate': false }))
       await this.deps.runtime.assertSafeDirectory?.(paths.root)
       const record: KiroInstanceRecord = { schemaVersion: 2, id, label: input.label.trim(), executablePath, createdAt: (this.deps.now ?? (() => new Date()))().toISOString(), paths,
-        ...(input.accountId !== undefined ? { accountId: input.accountId } : {}), ...(proxy ? { proxy } : {}) }
+        ...(input.accountId !== undefined ? { accountId: input.accountId, accountBindingState: 'pending' } : {}), ...(proxy ? { proxy } : {}) }
       await this.deps.writeConfig([...records, record] as KiroInstanceRecord[])
       return record
     })
@@ -366,29 +369,54 @@ export class KiroInstanceService {
     if (portable !== info.portableSupported) failInstance('Kiro 安装模式已变化，请重新创建实例；原实例数据保留。')
     await this.verifyPaths(record)
     this.transient.set(record.id, { status: 'starting', message: '正在等待独立 Kiro 主进程。' })
-    if (record.accountId) {
-      if (!this.deps.prepareAccount || !this.deps.syncAccount) failInstance('当前环境尚未提供完整的账户绑定准备及同步功能，未启动实例。')
-      // An externally closed IDE may own a newer rotation than the manager's last snapshot.
-      if (before.status === 'exited') await this.deps.syncAccount!(record)
-      await this.deps.prepareAccount!(record)
-      await this.verifyPaths(record)
+    const wasPending = !!record.accountId && record.accountBindingState === 'pending'
+    let launchRequested = false
+    try {
+      if (record.accountId) {
+        if (!this.deps.prepareAccount || !this.deps.syncAccount) failInstance('当前环境尚未提供完整的账户绑定准备及同步功能，未启动实例。')
+        if (wasPending) await this.setBindingState(record, 'active')
+        // Only an active client owns a newer generation. A pending copy must be
+        // rebuilt from the manager after its account may have been refreshed.
+        if (!wasPending && before.status === 'exited') await this.deps.syncAccount!(record)
+        await this.deps.prepareAccount!(record, { resetPending: wasPending })
+        await this.verifyPaths(record)
+      }
+      await this.remember(record, [])
+      // Once handed off, a thrown helper error cannot prove that no GUI started.
+      launchRequested = true
+      await this.deps.runtime.launch(record.executablePath, buildInstanceArguments(record.paths), buildInstanceEnvironment(this.deps.parentEnv ?? process.env, record.paths, portable, record.proxy), record.paths.home)
+      await this.waitFor(record, 'running', this.deps.launchTimeoutMs ?? 15_000)
+    } catch (error) {
+      if (wasPending && !launchRequested && record.accountBindingState === 'active') {
+        const after = await this.inspect(record)
+        // Keep ownership if another process appeared or its absence is uncertain.
+        if (after.status === 'stopped' || after.status === 'exited') await this.setBindingState(record, 'pending')
+      }
+      throw error
     }
-    await this.remember(record, [])
-    await this.deps.runtime.launch(record.executablePath, buildInstanceArguments(record.paths), buildInstanceEnvironment(this.deps.parentEnv ?? process.env, record.paths, portable, record.proxy), record.paths.home)
-    await this.waitFor(record, 'running', this.deps.launchTimeoutMs ?? 15_000)
+  }
+  private async setBindingState(record: KiroInstanceRecord, state: 'pending' | 'active'): Promise<void> {
+    await this.mutate(async () => {
+      const records = await this.records()
+      const current = records.find(row => row.id === record.id)
+      if (current?.schemaVersion !== 2 || current.accountId !== record.accountId || current.accountBindingState !== record.accountBindingState) failInstance('实例绑定已经变化，请刷新后重试。')
+      await this.deps.writeConfig(records.map(row => row.id === record.id ? { ...row, accountBindingState: state } : row) as KiroInstanceRecord[])
+    })
+    record.accountBindingState = state
   }
   private async stopRecord(record: KiroInstanceRecord): Promise<void> {
     const before = await this.inspect(record)
     if (before.status === 'unverified') failInstance(before.message!)
-    if (record.accountId && !this.deps.syncAccount) failInstance('当前环境尚未提供账户同步功能，未停止或解除绑定。')
+    const syncAccount = record.accountId && record.accountBindingState !== 'pending'
+    if (syncAccount && !this.deps.syncAccount) failInstance('当前环境尚未提供账户同步功能，未停止或解除绑定。')
     if (before.status !== 'running') {
-      if (record.accountId) await this.deps.syncAccount!(record)
+      if (syncAccount) await this.deps.syncAccount!(record)
       return
     }
     this.transient.set(record.id, { status: 'stopping', message: '正在等待 Kiro 保存并关闭窗口。' })
     await this.deps.runtime.requestClose(before.processes)
     await this.waitFor(record, 'stopped', this.deps.stopTimeoutMs ?? 15_000)
-    if (record.accountId) await this.deps.syncAccount!(record)
+    if (syncAccount) await this.deps.syncAccount!(record)
   }
   launch(id: string): Promise<void> { return this.operate(id, 'launch', async () => this.startRecord(await this.record(id))) }
   stop(id: string): Promise<void> { return this.operate(id, 'stop', async () => this.stopRecord(await this.record(id))) }
@@ -415,7 +443,7 @@ export class KiroInstanceService {
     return this.operate(id, 'sync', async () => {
       const record = await this.record(id)
       await this.verifyPaths(record)
-      if (!record.accountId) return
+      if (!record.accountId || record.accountBindingState === 'pending') return
       if (!this.deps.syncAccount) failInstance('当前环境尚未提供账户同步功能，未同步实例凭证。')
       await this.deps.syncAccount!(record)
     }, { bumpEpoch: false })
@@ -428,7 +456,7 @@ export class KiroInstanceService {
         const state = await this.inspect(raw as KiroInstanceRecord)
         if (state.status === 'running' || state.status === 'unverified') failInstance('请先确认实例已停止；运行中或归属未知的配置不能移除。')
         await this.verifyPaths(raw as KiroInstanceRecord)
-        if ((raw as KiroInstanceRecord).accountId) {
+        if ((raw as KiroInstanceRecord).accountId && (raw as KiroInstanceRecord).accountBindingState !== 'pending') {
           if (!this.deps.syncAccount) failInstance('当前环境尚未提供账户同步功能，未解除绑定。')
           await this.deps.syncAccount!(raw as KiroInstanceRecord)
         }
@@ -444,10 +472,12 @@ export class KiroInstanceService {
       const state = await this.inspect(record)
       if (state.status !== 'stopped' && state.status !== 'exited') failInstance('恢复解绑前必须确认实例及所有子进程均已停止。')
       await this.verifyPaths(record)
-      if (!this.deps.markAccountReauthorizationRequired) failInstance('当前环境尚未提供账户重新授权标记功能，未解除绑定。')
-      // Never import an unverified token or delete cache files to escape a failed sync.
-      // Mark the account first; failure must leave its persistent binding intact.
-      await this.deps.markAccountReauthorizationRequired!(record)
+      if (record.accountBindingState !== 'pending') {
+        if (!this.deps.markAccountReauthorizationRequired) failInstance('当前环境尚未提供账户重新授权标记功能，未解除绑定。')
+        // Never import an unverified token or delete cache files to escape a failed sync.
+        // Mark the account first; failure must leave its persistent binding intact.
+        await this.deps.markAccountReauthorizationRequired!(record)
+      }
       const after = await this.inspect(record)
       if (after.status !== 'stopped' && after.status !== 'exited') failInstance('实例状态已经变化，未解除绑定；请确认所有窗口已停止后重试。')
       await this.verifyPaths(record)

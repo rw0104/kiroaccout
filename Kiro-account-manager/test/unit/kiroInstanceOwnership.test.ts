@@ -25,6 +25,40 @@ test('persisted account bindings retain ownership regardless of stopped or runni
   }
 })
 
+test('an unlaunched pending selection neither owns credentials nor blocks account saves', () => {
+  const { state, guard } = harness()
+  state.records = [{ schemaVersion: 2, id: 'synthetic-instance', accountId: 'first', accountBindingState: 'pending' }]
+  assert.equal(guard.isBound({ accountId: 'first' }), false)
+  guard.assertAvailable({ ...account('first').credentials })
+  const current = { accounts: { first: account('first') } }
+  const changed = { accounts: { first: account('first', 'SYNTHETIC_NEW_REFRESH') } }
+  assert.equal(mergeInstanceOwnedAccounts(changed, current, state.records), changed)
+  const deleted = { accounts: {} }
+  assert.equal(mergeInstanceOwnedAccounts(deleted, current, state.records), deleted)
+  // An absent pending selection must not poison unrelated account operations.
+  state.accounts = {}
+  guard.assertAvailable({ accountId: 'second' })
+})
+
+test('activating a pending selection still waits for an in-flight manager refresh', () => {
+  const { state, guard } = harness()
+  state.records = [{ schemaVersion: 2, id: 'synthetic-instance', accountId: 'first', accountBindingState: 'pending' }]
+  const release = guard.beginOperation({ accountId: 'first', ...account('first').credentials })
+  blocked(() => guard.assertCanBind('first', 'synthetic-instance'), 'account-operation-in-flight')
+  release()
+  guard.assertCanBind('first', 'synthetic-instance')
+  state.records = [{ schemaVersion: 2, id: 'synthetic-instance', accountId: 'first', accountBindingState: 'active' }]
+  blocked(() => guard.assertAvailable({ accountId: 'first' }))
+})
+
+test('invalid binding phases never silently release an active account', () => {
+  for (const accountBindingState of [null, '', 'draft', false]) {
+    const { state, guard } = harness()
+    state.records = [{ schemaVersion: 2, id: 'synthetic-instance', accountId: 'first', accountBindingState }]
+    blocked(() => guard.assertAvailable({ accountId: 'first' }), 'invalid-ownership-state')
+  }
+})
+
 test('credential-only, differently labelled and trimmed credential inputs cannot bypass ownership', () => {
   const { guard } = harness()
   for (const input of [

@@ -90,10 +90,16 @@ function decodeBindings(value: unknown): Binding[] {
       continue
     }
     if (row.schemaVersion !== 2) return invalid()
-    if (row.accountId === undefined) continue
+    if (row.accountBindingState !== undefined && row.accountBindingState !== 'pending' && row.accountBindingState !== 'active') return invalid()
+    if (row.accountId === undefined) {
+      if (row.accountBindingState !== undefined) return invalid()
+      continue
+    }
     if (typeof row.accountId !== 'string' || !ID.test(row.accountId) || boundIds.has(row.accountId)) return invalid()
     boundIds.add(row.accountId)
-    bindings.push({ instanceId: row.id, accountId: row.accountId })
+    // Selecting an account for an unlaunched profile does not transfer its session.
+    // Historical records have no phase; retain their ownership conservatively.
+    if (row.accountBindingState !== 'pending') bindings.push({ instanceId: row.id, accountId: row.accountId })
   }
   return bindings
 }

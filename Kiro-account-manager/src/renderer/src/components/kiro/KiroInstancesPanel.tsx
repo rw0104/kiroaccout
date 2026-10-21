@@ -81,7 +81,7 @@ export function KiroInstancesPanel({ api }: { api: KiroInstancesApi }) {
     if (!accountId) throw new Error('请选择管理器中的已有账户，或明确选择高级空白实例。')
     const result = await api.create({ label, executablePath, accountId: accountId === BLANK_ACCOUNT_OPTION ? undefined : accountId, proxy: proxyUrl.trim() || undefined })
     if (!result.success) throw new Error(result.error)
-    if (active.current) { setLabel(''); setAccountId(''); setProxyUrl(''); setNotice(result.value.accountId ? '实例已创建。启动时将使用绑定账户，不需要再次登录。' : '空白实例已创建。') }
+    if (active.current) { setLabel(''); setAccountId(''); setProxyUrl(''); setNotice(result.value.accountId ? '实例已创建，所选账户尚未交接。启动前会复制最新凭证到独立目录，当前不占用原账户。' : '空白实例已创建。') }
   })
   const choose = () => perform('choose', async () => {
     const result = await api.chooseExecutable()
@@ -103,7 +103,7 @@ export function KiroInstancesPanel({ api }: { api: KiroInstancesApi }) {
     <CardContent className="space-y-4">
       <div className="rounded-lg border border-primary/20 bg-primary/5 p-3 text-sm space-y-2">
         <p>多个实例共用一份官方 Kiro 客户端，各自保存账户、配置、扩展和缓存；无需重复安装或创建 Windows 用户。</p>
-        <p className="text-muted-foreground">选择 Kiro.exe 和管理器中的已有账户，再创建并启动。每个账户只能绑定一个实例；绑定期间由实例独占凭证续期，管理器不再刷新或切换该账户。系统网络、代理和证书仍共用，这不是安全沙箱。</p>
+        <p className="text-muted-foreground">创建时只记录所选账户，不修改或占用原账户。启动前复制凭证到独立目录；交接给客户端后由实例续期，管理器暂停该账户的刷新和切换。每个账户只能交给一个实例。系统网络、代理和证书仍共用，这不是安全沙箱。</p>
       </div>
       {error && <p role="alert" className="rounded-lg bg-destructive/10 p-3 text-sm text-destructive">{error}</p>}
       {notice && <p role="status" className="text-sm text-muted-foreground">{notice}</p>}
@@ -111,7 +111,7 @@ export function KiroInstancesPanel({ api }: { api: KiroInstancesApi }) {
       {snapshot?.supported && <>
         <div className="grid gap-3 md:grid-cols-2">
           <label className="text-sm space-y-1">实例名称<Input value={label} onChange={event => setLabel(event.target.value)} maxLength={60} placeholder="例如：工作账户" disabled={!!busy} /></label>
-          <label className="text-sm space-y-1"><span>绑定已有账户</span><Select value={accountId} options={accountOptions} onChange={setAccountId} placeholder="请选择已有账户" className={busy ? 'pointer-events-none opacity-60' : undefined} /></label>
+          <label className="text-sm space-y-1"><span>选择已有账户</span><Select value={accountId} options={accountOptions} onChange={setAccountId} placeholder="请选择已有账户" className={busy ? 'pointer-events-none opacity-60' : undefined} /></label>
           <label className="text-sm space-y-1">实例代理（可选）<Input value={proxyUrl} onChange={event => setProxyUrl(event.target.value)} maxLength={2048} placeholder="http://127.0.0.1:7890 或 socks5://host:1080" disabled={!!busy} /><span className="text-xs text-muted-foreground">支持 http、https、socks4、socks5；仅此实例使用，不会修改全局代理。</span></label>
           <div className="space-y-1"><label htmlFor="kiro-instance-executable" className="text-sm">共用的官方 Kiro.exe</label>
             <div className="flex gap-2"><Input id="kiro-instance-executable" value={executablePath} onChange={event => setExecutablePath(event.target.value)} placeholder="选择已安装的 Kiro.exe" disabled={!!busy} /><Button variant="outline" onClick={choose} disabled={!!busy}><FolderOpen className="mr-2 h-4 w-4" />选择</Button></div>
@@ -129,15 +129,15 @@ export function KiroInstancesPanel({ api }: { api: KiroInstancesApi }) {
                 <Button size="sm" variant="outline" disabled={!!busy || !instance.canRestart} onClick={() => void act(instance, 'restart')}><RefreshCw className="mr-1 h-3.5 w-3.5" />重新启动</Button>
               </>}
               <Button size="sm" variant="outline" disabled={!!busy || !removable(instance)} onClick={() => void act(instance, 'remove')}><Trash2 className="mr-1 h-3.5 w-3.5" />移除配置</Button>
-              {instance.schemaVersion === 2 && instance.accountId && ['stopped', 'exited'].includes(instance.launchStatus) && <Button size="sm" variant="outline" disabled={!!busy} onClick={() => setDetachTargetId(instance.id)}>恢复解绑</Button>}
+              {instance.schemaVersion === 2 && instance.accountId && instance.accountBindingState !== 'pending' && ['stopped', 'exited'].includes(instance.launchStatus) && <Button size="sm" variant="outline" disabled={!!busy} onClick={() => setDetachTargetId(instance.id)}>恢复解绑</Button>}
             </div>
           </div>
           <p className="break-all text-xs text-muted-foreground">{instance.executablePath}</p>
           {instance.schemaVersion === 2 && <p className="break-all text-xs text-muted-foreground">独立数据：{instance.paths.root}</p>}
-          {instance.schemaVersion === 2 && instance.accountId && <p className="text-xs text-muted-foreground">绑定账户：{accounts.get(instance.accountId)?.nickname || accounts.get(instance.accountId)?.email || '账户已从管理器移除'}</p>}
+          {instance.schemaVersion === 2 && instance.accountId && <p className="text-xs text-muted-foreground">{instance.accountBindingState === 'pending' ? '所选账户' : '绑定账户'}：{accounts.get(instance.accountId)?.nickname || accounts.get(instance.accountId)?.email || '账户已从管理器移除'}{instance.accountBindingState === 'pending' ? ' · 尚未交接，不占用原账户；可直接移除配置' : ' · 已交接，由实例续期'}</p>}
           {instance.schemaVersion === 2 && <div className="flex flex-wrap items-center gap-2 pt-1"><Input className="max-w-xl text-xs" value={proxyDrafts[instance.id] ?? instance.proxy?.url ?? ''} onChange={event => setProxyDrafts(previous => ({ ...previous, [instance.id]: event.target.value }))} placeholder="未设置实例代理" disabled={!!busy || !['stopped', 'exited', 'error'].includes(instance.launchStatus)} /><Button size="sm" variant="outline" disabled={!!busy || !['stopped', 'exited', 'error'].includes(instance.launchStatus)} onClick={() => void perform(`proxy:${instance.id}`, async () => { const result = await api.setProxy(instance.id, proxyDrafts[instance.id] || undefined); if (!result.success) throw new Error(result.error); if (active.current) setNotice('实例代理已保存；下次启动时生效。') })}>保存代理</Button></div>}
           {instance.message && <p role="status" className={`text-sm ${['error', 'unverified'].includes(instance.launchStatus) ? 'text-destructive' : 'text-muted-foreground'}`}>{instance.message}</p>}
-          {detachTargetId === instance.id && instance.schemaVersion === 2 && instance.accountId && ['stopped', 'exited'].includes(instance.launchStatus) && <div role="alertdialog" aria-label="确认恢复解绑" className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 space-y-2">
+          {detachTargetId === instance.id && instance.schemaVersion === 2 && instance.accountId && instance.accountBindingState !== 'pending' && ['stopped', 'exited'].includes(instance.launchStatus) && <div role="alertdialog" aria-label="确认恢复解绑" className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 space-y-2">
             <p className="text-sm">仅在正常同步无法完成时使用。恢复解绑不会把未核验的实例凭证写回管理器，全部实例文件会保留，原账户将被标记为需要重新授权。</p>
             <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={!!busy} onClick={() => setDetachTargetId('')}>取消</Button><Button size="sm" disabled={!!busy} onClick={() => void act(instance, 'detach')}>确认解绑并要求重新授权</Button></div>
           </div>}
