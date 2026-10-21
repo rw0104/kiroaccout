@@ -4,7 +4,7 @@ Kiro 账户管理桌面应用，用于管理账户、分组和标签，导入、
 
 [正式版下载](https://github.com/rw0104/kiroaccout/releases/latest) · [全部版本](https://github.com/rw0104/kiroaccout/releases) · [源码与问题反馈](https://github.com/rw0104/kiroaccout) · [开发文档](docs/DEVELOPMENT.md)
 
-当前源码目标为 **1.8.0 · Windows x64**，发布状态及附件以 Releases 为准。升级前先备份原有资料。安装到其他目录或使用 ZIP 不会隔离账户管理器自身的数据，不要同时运行新旧管理器。
+当前源码目标为 **1.8.1 · Windows x64**，发布状态及附件以 Releases 为准。升级前先备份原有资料。安装到其他目录或使用 ZIP 不会隔离账户管理器自身的数据，不要同时运行新旧管理器。
 
 ## 使用
 
@@ -19,7 +19,7 @@ Kiro 账户管理桌面应用，用于管理账户、分组和标签，导入、
 
 若缓存丢失、过期或改登导致无法同步，可在停止实例后选择“恢复解绑”并确认。全部实例文件保留，原账户需重新授权，未核验凭证不会回写。
 
-[1.8.0 发布说明](docs/releases/v1.8.0.md) · [多开需求与验收](docs/requirements/2026-10-20-single-client-instances-1-8.md) · [当前客户端多开证据](docs/evidence/2026-10-20-kiro-instance-lifecycle.md)
+[1.8.1 发布说明](docs/releases/v1.8.1.md) · [多开需求与验收](docs/requirements/2026-10-20-single-client-instances-1-8.md) · [当前客户端多开证据](docs/evidence/2026-10-20-kiro-instance-lifecycle.md)
 
 账户绑定与轮换保护已做合成数据回归；双真实账户登录及刷新尚未完成验收，具体范围见发布说明。
 

@@ -1539,7 +1539,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
                 <>
                   <div className="p-3 bg-primary/[0.04] rounded-xl border border-primary/15">
                     <p className="text-xs text-primary">
-                      {isEn ? 'Supports account objects, arrays, accounts/data containers, complete backups and Card Key lines. Builder ID requires refreshToken, clientId and clientSecret. Google/Github require an explicit provider.' : '支持单账户、数组、accounts/data 容器、完整备份及卡密行。Builder ID 需 refreshToken、clientId 和 clientSecret；Google/Github 需明确填写 provider。'}
+                      {isEn ? 'Supports account objects, arrays, accounts/data containers, complete backups and Card Key lines. Builder ID requires refreshToken, clientId and clientSecret. Google/Github require an explicit provider. Legacy OIDC/IdC, Builder ID, awsidc and external_idp field aliases are accepted.' : '支持单账户、数组、accounts/data 容器、完整备份及卡密行。Builder ID 需 refreshToken、clientId 和 clientSecret；Google/Github 需明确填写 provider；兼容旧版 OIDC/IdC、Builder ID、awsidc 和 external_idp 字段别名。'}
                     </p>
                   </div>
 

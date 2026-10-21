@@ -2,7 +2,7 @@
 
 本目录为 Electron 应用源码。使用说明见[项目首页](../README.md)，开发与构建见[开发文档](../docs/DEVELOPMENT.md)，安装包见 [Releases](https://github.com/rw0104/kiroaccout/releases)。
 
-当前源码目标为 **1.8.0 · Windows x64**，发布状态与附件以 Releases 为准。账户绑定与轮换保护已做合成数据回归，双真实账户登录及刷新尚未完成验收。单个 Social 会话的 Runtime 检查已实测成功；完整验收范围见发布说明。
+当前源码目标为 **1.8.1 · Windows x64**，发布状态与附件以 Releases 为准。账户绑定与轮换保护已做合成数据回归，双真实账户登录及刷新尚未完成验收。单个 Social 会话的 Runtime 检查已实测成功；完整验收范围见发布说明。
 
 在“添加账户 → 在线登录 → 打开 Kiro 网页登录”进行门户登录。在“账户管理”或“设置 → 数据管理 → 导出”选择全部/选中、完整备份 JSON 或精简凭证 JSON。默认不含凭证，不能恢复登录；需要迁移登录信息时明确勾选包含凭证，并妥善保存明文文件。
 
@@ -14,4 +14,4 @@
 
 页面提供运行状态、正常停止和重启。未保存编辑可能阻止关闭，不会自动强杀；移除配置保留资料。旧 RC 的 Windows 用户配置已停用，需移除后重建。系统网络、代理、证书、Windows 身份和 DPAPI 仍共享，不是安全沙箱。
 
-[1.8.0 说明](../docs/releases/v1.8.0.md) · [多开需求](../docs/requirements/2026-10-20-single-client-instances-1-8.md) · [AGPL-3.0](../LICENSE) · [开源来源说明](../docs/NOTICE.md) · [English](README.md)
+[1.8.1 说明](../docs/releases/v1.8.1.md) · [多开需求](../docs/requirements/2026-10-20-single-client-instances-1-8.md) · [AGPL-3.0](../LICENSE) · [开源来源说明](../docs/NOTICE.md) · [English](README.md)
