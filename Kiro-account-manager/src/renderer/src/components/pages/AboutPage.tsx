@@ -188,6 +188,10 @@ export function AboutPage() {
               {isEn ? 'Report an issue' : '反馈问题'}
               <ExternalLink className="h-3 w-3" />
             </Button>
+            <Button variant="outline" size="sm" className="gap-2" onClick={() => window.api.openExternal('https://12312356.xyz/')}>
+              {isEn ? 'Inventory Monitor' : '库存监控'}
+              <ExternalLink className="h-3 w-3" />
+            </Button>
           </div>
         </CardContent>
       </Card>

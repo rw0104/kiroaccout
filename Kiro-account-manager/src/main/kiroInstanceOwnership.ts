@@ -151,6 +151,31 @@ export function mergeInstanceOwnedAccounts<T>(incoming: T, current: unknown, rec
 }
 
 /**
+ * An update flush must retain protected accounts already persisted by the main
+ * process, even if an older window hid them after a rejected deletion. This is
+ * only used during the same renderer's pending installation-save handshake;
+ * ordinary deletion saves continue to reject removal of protected identities.
+ */
+export function mergeInstanceOwnedAccountsForUpdate<T>(incoming: T, current: unknown, records: unknown): T {
+  const bindings = decodeBindings(records)
+  const recoveryIds = plain(current) && plain(current.accounts)
+    ? Object.entries(current.accounts).filter(([, account]) => plain(account) && account.lastError === INSTANCE_ACCOUNT_REAUTH_REQUIRED).map(([id]) => id)
+    : []
+  if (!bindings.length && !recoveryIds.length) return mergeInstanceOwnedAccounts(incoming, current, records)
+  if (!plain(incoming) || !plain(current) || !plain(incoming.accounts) || !plain(current.accounts)) return invalid()
+  const accounts: Record<string, unknown> = { ...incoming.accounts }
+  for (const accountId of new Set([...bindings.map(binding => binding.accountId), ...recoveryIds])) {
+    const authoritative = current.accounts[accountId]
+    if (!plain(authoritative) || !plain(authoritative.credentials)) return invalid()
+    const proposed = accounts[accountId]
+    if (!plain(proposed) || ['id', 'idp', 'userId', 'provider', 'authMethod'].some(name => proposed[name] !== authoritative[name])) {
+      accounts[accountId] = { ...authoritative, credentials: { ...authoritative.credentials } }
+    }
+  }
+  return mergeInstanceOwnedAccounts({ ...incoming, accounts } as T, current, records)
+}
+
+/**
  * A persisted instance binding owns refreshes even while its IDE is stopped. Guard every
  * manager refresh/switch entry point, including credential-only verification/import paths.
  * Seen token hashes remain aliases until that account is unbound; no secrets are retained

@@ -35,12 +35,12 @@ import { createWindowsKiroRuntime } from './kiroInstanceWindows'
 import { createWindowsKiroInstallationDiscovery } from './kiroInstanceDiscovery'
 import { prepareKiroInstanceAccount, readKiroInstanceAccountUpdate, type InstanceBoundAccount } from './kiroInstanceAccounts'
 import { verifyKiroInstanceIdentity } from './kiroInstanceIdentity'
-import { InstanceAccountOwnership, InstanceOwnershipError, INSTANCE_ACCOUNT_REAUTH_REQUIRED, mergeInstanceOwnedAccounts, type InstanceOwnershipInput } from './kiroInstanceOwnership'
+import { InstanceAccountOwnership, InstanceOwnershipError, INSTANCE_ACCOUNT_REAUTH_REQUIRED, mergeInstanceOwnedAccounts, mergeInstanceOwnedAccountsForUpdate, type InstanceOwnershipInput } from './kiroInstanceOwnership'
 import { applyManagerTokenRotation } from './managerAccountRefresh'
 import { registerKiroInstanceIpc } from './ipc/kiroInstances'
 import { normalizeCredentialRecord } from '../shared/accountImport'
 import { normalizeProvider, resolveIdentity } from '../shared/authIdentity'
-import { AppUpdateController, type AppUpdateState, type UpdateEngine } from './appUpdater'
+import { AppUpdateController, UpdatePreparationError, type UpdatePreparationErrorCode, type AppUpdateState, type UpdateEngine } from './appUpdater'
 import { randomUUID } from 'node:crypto'
 import { TokenRefreshService, type AuthRefreshResult } from './authRefresh'
 import { LoginSessionManager } from './loginSessions'
@@ -58,7 +58,7 @@ import {
 
 // ============ 软件自动更新 ============
 let appUpdateController: AppUpdateController | null = null
-let updateInstallSave: { requestId: string; senderId: number; timer: ReturnType<typeof setTimeout>; resolve: () => void; reject: () => void } | null = null
+let updateInstallSave: { requestId: string; senderId: number; timer: ReturnType<typeof setTimeout>; resolve: () => void; reject: (code: UpdatePreparationErrorCode) => void } | null = null
 let updatePoolWasRunning = false
 let updateQuitRequested = false
 nativeAutoUpdater.on('before-quit-for-update', () => { updateQuitRequested = true })
@@ -70,21 +70,21 @@ function publishUpdateState(state: AppUpdateState): void {
 
 function prepareUpdateInstall(): Promise<void> {
   const window = mainWindow
-  if (!window || window.isDestroyed()) return Promise.reject(new Error('Window unavailable'))
-  if (updateInstallSave) return Promise.reject(new Error('Save already pending'))
+  if (!window || window.isDestroyed()) return Promise.reject(new UpdatePreparationError('window-unavailable'))
+  if (updateInstallSave) return Promise.reject(new UpdatePreparationError('save-pending'))
   return new Promise<void>((resolve, reject) => {
     const requestId = randomUUID()
     const timer = setTimeout(() => {
       if (updateInstallSave?.requestId !== requestId) return
       updateInstallSave = null
-      reject(new Error('Save acknowledgment timed out'))
+      reject(new UpdatePreparationError('save-timeout'))
     }, 15000)
-    updateInstallSave = { requestId, senderId: window.webContents.id, timer, resolve, reject: () => reject(new Error('Save failed')) }
+    updateInstallSave = { requestId, senderId: window.webContents.id, timer, resolve, reject: code => reject(new UpdatePreparationError(code)) }
     try { window.webContents.send('app-update-prepare-install', { requestId }) }
     catch {
       clearTimeout(timer)
       updateInstallSave = null
-      reject(new Error('Window unavailable'))
+      reject(new UpdatePreparationError('window-unavailable'))
     }
   })
 }
@@ -2743,7 +2743,7 @@ app.whenReady().then(async () => {
     clearTimeout(pending.timer)
     updateInstallSave = null
     if (response.success === true) pending.resolve()
-    else pending.reject()
+    else pending.reject('save-rejected')
   })
 
   // ============ 一键诊断 ============
@@ -2985,10 +2985,11 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 保存账号数据
-  ipcMain.handle('save-accounts', async (_event, data) => {
+  ipcMain.handle('save-accounts', async (event, data, updateRequestId?: string) => {
     try {
       await initStore()
-      data = mergeInstanceOwnedAccounts(data, store!.get('accountData'), store!.get('kiroInstances'))
+      const merge = updateInstallSave?.senderId === event.sender.id && updateRequestId === updateInstallSave.requestId ? mergeInstanceOwnedAccountsForUpdate : mergeInstanceOwnedAccounts
+      data = merge(data, store!.get('accountData'), store!.get('kiroInstances'))
       store!.set('accountData', data)
       
       // 保存最后的数据（用于崩溃恢复）
@@ -6805,7 +6806,7 @@ app.on('before-quit', (event) => {
   appUpdateController?.dispose()
   if (updateInstallSave) {
     clearTimeout(updateInstallSave.timer)
-    updateInstallSave.reject()
+    updateInstallSave.reject('window-unavailable')
     updateInstallSave = null
   }
 })

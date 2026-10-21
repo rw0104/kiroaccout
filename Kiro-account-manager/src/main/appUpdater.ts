@@ -17,6 +17,29 @@ export interface AppUpdateState {
   installRequiresRestart?: boolean
 }
 export interface UpdateActionResult { success: boolean; state: AppUpdateState; error?: string }
+export type UpdatePreparationErrorCode = 'save-rejected' | 'save-timeout' | 'window-unavailable' | 'save-pending'
+export class UpdatePreparationError extends Error {
+  readonly code: UpdatePreparationErrorCode
+
+  constructor(code: UpdatePreparationErrorCode) {
+    super(code)
+    this.name = 'UpdatePreparationError'
+    this.code = code
+  }
+}
+
+function preparationErrorMessage(error: unknown): string {
+  if (error instanceof UpdatePreparationError) {
+    switch (error.code) {
+      case 'save-rejected': return '更新前账户保存未完成，请检查多开绑定或存储状态后重试；应用不会自动退出'
+      case 'save-timeout': return '更新前未收到保存确认，请稍后重试；应用不会自动退出'
+      case 'window-unavailable': return '更新前保存窗口不可用，请重新打开主窗口后重试；应用不会自动退出'
+      case 'save-pending': return '更新前账户保存正在进行，请稍后重试；应用不会自动退出'
+    }
+  }
+  return '更新前账户保存失败，请重试；应用不会自动退出'
+}
+
 export interface UpdateEngine {
   autoDownload: boolean
   autoInstallOnAppQuit: boolean
@@ -195,7 +218,12 @@ export class AppUpdateController {
     this.installTask = Promise.resolve().then(async () => {
       try {
         await this.deps.prepareInstall()
-        if (this.disposed) return { success: false, state: this.getState(), error: '应用正在退出' }
+      } catch (error) {
+        this.fail('install', preparationErrorMessage(error))
+        return { success: false, state: this.getState(), error: this.state.error }
+      }
+      if (this.disposed) return { success: false, state: this.getState(), error: '应用正在退出' }
+      try {
         this.installationPrepared = true
         this.deps.beforeInstall()
         this.invokingInstall = true
@@ -204,7 +232,7 @@ export class AppUpdateController {
         return { success: this.state.status !== 'error', state: this.getState(), error: this.state.error }
       } catch {
         this.rollbackInstall()
-        this.fail('install', '更新前保存或安装准备失败，请重试；应用不会自动退出')
+        this.fail('install', '更新安装准备失败，请重试；应用不会自动退出')
         return { success: false, state: this.getState(), error: this.state.error }
       }
     }).finally(() => { this.installTask = null })

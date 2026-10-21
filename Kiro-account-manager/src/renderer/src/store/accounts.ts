@@ -512,9 +512,9 @@ interface AccountsActions {
   /** 防抖触发持久化（推荐：高频 mutation 自动合并写盘） */
   saveToStorage: () => Promise<void>
   /** 立即持久化（用于 beforeunload 或关键操作场景） */
-  flushSaveImmediately: () => Promise<void>
+  flushSaveImmediately: (updateRequestId?: string) => Promise<void>
   /** Critical account operations require an explicit persistence acknowledgment. */
-  saveAccountChanges: () => Promise<void>
+  saveAccountChanges: (updateRequestId?: string) => Promise<void>
 
   // 设置
   setAutoRefresh: (enabled: boolean, interval?: number) => void
@@ -1861,7 +1861,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
    * 并发调用会自动等待同一次 in-flight 保存，避免重入。
    * 同时会唤醒所有走 saveToStorage 在等本次窗口落盘的调用方。
    */
-  flushSaveImmediately: async () => {
+  flushSaveImmediately: async (updateRequestId) => {
     if (saveDebounceTimer) { clearTimeout(saveDebounceTimer); saveDebounceTimer = null }
     if (saveMaxWaitTimer) { clearTimeout(saveMaxWaitTimer); saveMaxWaitTimer = null }
     const pending = savePendingResolvers
@@ -1870,7 +1870,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       await saveInFlight
       // A mutation can arrive while the previous snapshot is being saved.
       // Persist a fresh snapshot before acknowledging this flush.
-      await get().flushSaveImmediately()
+      await get().flushSaveImmediately(updateRequestId)
       for (const resolve of pending) resolve()
       return
     }
@@ -1879,7 +1879,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     saveInFlight = enqueueAccountPersistence(async () => {
       set({ isSyncing: true })
       try {
-        await window.api.saveAccounts(accountStorageSnapshot(get()))
+        await window.api.saveAccounts(accountStorageSnapshot(get()), updateRequestId)
       } catch (error) {
         lastSaveError = new Error('账户保存失败')
         console.error('Failed to save accounts')
@@ -1893,8 +1893,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     return saveInFlight
   },
 
-  saveAccountChanges: async () => {
-    await get().flushSaveImmediately()
+  saveAccountChanges: async (updateRequestId) => {
+    await get().flushSaveImmediately(updateRequestId)
     if (lastSaveError) throw lastSaveError
   },
 

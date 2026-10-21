@@ -7,7 +7,7 @@ const ts = createRequire(import.meta.url)('typescript')
 
 function persistence(saveAccounts) {
   const source = readFileSync(new URL('../../src/renderer/src/store/accounts.ts', import.meta.url), 'utf8')
-  const start = source.indexOf('  flushSaveImmediately: async () => {')
+  const start = source.indexOf('  flushSaveImmediately: async (')
   const end = source.indexOf('  // ==================== 设置', start)
   assert.ok(start >= 0 && end > start)
   const snippet = stripTypeScriptTypes(`({${source.slice(start, end)}})`, { mode: 'strip' })
@@ -66,4 +66,22 @@ test('a synchronous save exception is recorded and the next save can recover', a
   await action.flushSaveImmediately()
   assert.equal(attempts, 2)
   assert.equal(action.lastError(), null)
+})
+
+test('update-save request identity reaches the fresh snapshot after an in-flight ordinary save', async () => {
+  const requests = [], releases = []
+  const { action } = persistence((_data, requestId) => {
+    requests.push(requestId)
+    return new Promise(resolve => releases.push(resolve))
+  })
+  const first = action.flushSaveImmediately()
+  await Promise.resolve()
+  const update = action.flushSaveImmediately('synthetic-update-request')
+  assert.equal(requests[0], undefined)
+  releases[0]()
+  await first
+  await Promise.resolve()
+  assert.equal(requests[1], 'synthetic-update-request')
+  releases[1]()
+  await update
 })

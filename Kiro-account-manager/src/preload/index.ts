@@ -33,8 +33,8 @@ const api = {
   },
 
   // 账号管理 - 保存账号数据
-  saveAccounts: (data: unknown): Promise<void> => {
-    return ipcRenderer.invoke('save-accounts', data)
+  saveAccounts: (data: unknown, updateRequestId?: string): Promise<void> => {
+    return ipcRenderer.invoke('save-accounts', data, updateRequestId)
   },
 
   // 账号管理 - 刷新 Token
