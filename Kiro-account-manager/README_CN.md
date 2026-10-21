@@ -1,6 +1,6 @@
 # kiroaccout 应用源码
 
-本目录为 Electron 应用源码。使用说明见[项目首页](../README.md)，开发与构建见[开发文档](../docs/DEVELOPMENT.md)，安装包见 [Releases](https://github.com/rw0104/kiroaccout/releases)。
+本目录为 Electron 应用源码。使用说明见[项目首页](../README.md)，安装包见 [Releases](https://github.com/rw0104/kiroaccout/releases)。
 
 当前源码目标为 **1.8.1 · Windows x64**，发布状态与附件以 Releases 为准。账户绑定与轮换保护已做合成数据回归，双真实账户登录及刷新尚未完成验收。单个 Social 会话的 Runtime 检查已实测成功；完整验收范围见发布说明。
 
@@ -14,4 +14,4 @@
 
 页面提供运行状态、正常停止和重启。未保存编辑可能阻止关闭，不会自动强杀；移除配置保留资料。旧 RC 的 Windows 用户配置已停用，需移除后重建。系统网络、代理、证书、Windows 身份和 DPAPI 仍共享，不是安全沙箱。
 
-[1.8.1 说明](../docs/releases/v1.8.1.md) · [多开需求](../docs/requirements/2026-10-20-single-client-instances-1-8.md) · [AGPL-3.0](../LICENSE) · [开源来源说明](../docs/NOTICE.md) · [English](README.md)
+[1.8.1 说明](../docs/releases/v1.8.1.md) · [AGPL-3.0](../LICENSE) · [开源来源说明](../docs/NOTICE.md) · [English](README.md)

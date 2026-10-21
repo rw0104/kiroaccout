@@ -43,6 +43,7 @@ Kiro register
 
 # 本地隔离调试数据、缓存、日志与取证资料
 /.local/
+# 私人开发文档必须放在 .local/private-docs/，不得提交到公开仓库
 
 # 抓包数据（可能含 token/cookie 等敏感信息，不入库）
 docs/mail.chatgpt.org.uk.har

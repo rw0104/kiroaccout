@@ -8,7 +8,7 @@
 - Electron 应用目录：`Kiro-account-manager/`；npm 命令在此目录执行，文档和下述离线诊断命令在仓库根执行。
 - 用户故障版本为 `1.7.5`，对应标签 `v1.7.5` / `56310443f73ea535836a51a7170e2e027d1df1ea`。
 - 本轮拉取的 main 基线为 `8f11db50f64cc4faf3f9c0dff8eca543c01cdc15`，应用版本 `1.7.6`。修复前复核当前 HEAD，不把 main 版本当成用户正在运行的版本。
-- 现有需求、分析和修复方案位于 [docs/2026-10-19-account-import-login](docs/2026-10-19-account-import-login/01-requirements.md)。发现新事实时更新对应文档，区分已验证事实、候选原因和待验收项。
+- 现有需求、分析和修复方案位于本地忽略目录 `.local/private-docs/docs/2026-10-19-account-import-login/`。发现新事实时更新对应文档，区分已验证事实、候选原因和待验收项。
 
 ## 2. 先确认最新 Kiro 请求方式，再修复
 
@@ -57,7 +57,7 @@
 
 **当前源码没有经过验证的运行时隔离模式。直接 `npm run dev`、`npm start` 或启动打包客户端并不安全隔离。** 不把单独源码目录、不同窗口标题、只加 `--user-data-dir`、仅修改 HOME/APPDATA 环境变量当作隔离完成。
 
-允许执行源码分析、依赖/类型检查、构建和已核实无外部副作用的离线测试。现有 `npm run test:e2e` 会连接运行中的桌面代理，不能默认对其执行；只有显式指定经过验证的隔离服务地址和独立测试账户时才可使用。启动 Electron 调试版前必须满足 [隔离执行规范](docs/development-rules.md) 的全部运行条件：独立数据和凭证根、实例锁、日志/备份/缓存/更新路径、端口，以及针对共享协议和系统操作的明确保护。
+允许执行源码分析、依赖/类型检查、构建和已核实无外部副作用的离线测试。现有 `npm run test:e2e` 会连接运行中的桌面代理，不能默认对其执行；只有显式指定经过验证的隔离服务地址和独立测试账户时才可使用。启动 Electron 调试版前必须满足本地 `.local/private-docs/docs/development-rules.md` 的全部运行条件：独立数据和凭证根、实例锁、日志/备份/缓存/更新路径、端口，以及针对共享协议和系统操作的明确保护。
 
 隔离状态与临时资料统一放仓库根 `.local/isolated/`，默认空账户；该目录不入 Git。运行时保护必须在实例锁、存储初始化和启动副作用发生前生效；涉及模块初始化时要检查静态 import 的执行时序。主进程对相关 IPC 也要校验隔离边界，不能只隐藏 UI 按钮。
 
@@ -73,9 +73,16 @@ GUI/真实授权测试需要生产共享资源时，在独立 OS 用户或隔离
 - 公开 README 只说明已存在的用户功能、下载和操作入口。禁止写入本机绝对目录、私人用户名、原始客户文件名、进程 ID 或内部交接记录；必要的本机资料只留在 Git 忽略的 `.local/` 中。清理当前内容不等于清理 Git 历史，不得擅自改写已发布历史。
 - 交付中说明改动、验证结果、真实授权是否验收，以及隔离边界是否保持；不宣称未执行的桌面测试通过。
 
+### 5.1 本地开发文档不得进入 Git
+
+- 开发指南、隔离规范、E2E 记录、需求/分析/修复方案、请求证据、实机证据和本地复现脚本均属于私人开发资料，统一放在 `.local/private-docs/docs/`，不得提交、发布或在公开 README 中链接。
+- `/.local/` 已由根 `.gitignore` 忽略；即使本地文件存在，也不能使用 `git add -f` 强制加入。已跟踪的私人文档必须从 Git 索引移除，但保留本地副本。
+- 允许进入公开仓库的文档仅限用户使用所需的 README、许可证/来源声明和正式 Release 说明；Release 说明不得链接已经移除的私人开发文档。
+- 规则文件本身（`AGENTS.md`）可以公开，但不得写入本机绝对路径、真实账户、凭证或私人开发目录细节。
+
 ### 1.8 同程序多实例补充
 
-用户已明确要求同一 Windows 用户复用同一份官方 Kiro，选择管理器已有账户直接启动。依据 [当前官方启动与存储证据](docs/evidence/2026-10-20-kiro-instance-lifecycle.md)，受管官方 IDE 可在专用根启动；不得沿用旧 RC 必须创建额外 Windows 用户或逐窗手动登录的方案。此补充只适用于经过验证的受管 IDE 启动器，不代表账户管理器调试版已具备运行时隔离，不解除上面对生产管理器的保护。
+用户已明确要求同一 Windows 用户复用同一份官方 Kiro，选择管理器已有账户直接启动。依据本地 `.local/private-docs/docs/evidence/2026-10-20-kiro-instance-lifecycle.md`，受管官方 IDE 可在专用根启动；不得沿用旧 RC 必须创建额外 Windows 用户或逐窗手动登录的方案。此补充只适用于经过验证的受管 IDE 启动器，不代表账户管理器调试版已具备运行时隔离，不解除上面对生产管理器的保护。
 
 - 专用 user data、home、shared data、扩展、Agent 数据/插件与临时目录必须全部传入；用路径、SID、EXE、PID、创建时间确认实例，正常关闭，不按名称批量结束。
 - 账户凭证只能来自用户明确选择的管理器账户，写入对应专用缓存。允许只读比较默认 IDE 缓存来拒绝同凭证复用，不以其作为新实例的数据种子；不刷新或改写默认缓存。
@@ -89,9 +96,9 @@ GUI/真实授权测试需要生产共享资源时，在独立 OS 用户或隔离
 在仓库根、Node.js 24.16.0 环境运行，无需启动客户端：
 
 ```powershell
-node --disable-warning=ExperimentalWarning docs/2026-10-19-account-import-login/evidence/json-import-repro.mjs --source-ref v1.7.5
-node --disable-warning=ExperimentalWarning docs/2026-10-19-account-import-login/evidence/oidc-batch-repro.mjs --ref v1.7.5
-node --disable-warning=ExperimentalWarning docs/2026-10-19-account-import-login/evidence/online-login-repro.mjs --ref v1.7.5
+node --disable-warning=ExperimentalWarning .local/private-docs/docs/2026-10-19-account-import-login/evidence/json-import-repro.mjs --source-ref v1.7.5
+node --disable-warning=ExperimentalWarning .local/private-docs/docs/2026-10-19-account-import-login/evidence/oidc-batch-repro.mjs --ref v1.7.5
+node --disable-warning=ExperimentalWarning .local/private-docs/docs/2026-10-19-account-import-login/evidence/online-login-repro.mjs --ref v1.7.5
 ```
 
 ## graphify
