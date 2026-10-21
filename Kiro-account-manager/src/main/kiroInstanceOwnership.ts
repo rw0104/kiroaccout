@@ -175,6 +175,24 @@ export function mergeInstanceOwnedAccountsForUpdate<T>(incoming: T, current: unk
   return mergeInstanceOwnedAccounts({ ...incoming, accounts } as T, current, records)
 }
 
+/** An explicit deletion may discard an unbound recovery record without reusing its credentials. */
+export function mergeInstanceOwnedAccountsForDeletion<T>(incoming: T, current: unknown, records: unknown, deleteAccountIds: unknown): T {
+  const bindings = decodeBindings(records)
+  if (!plain(incoming) || !plain(current) || !plain(incoming.accounts) || !plain(current.accounts) ||
+      !Array.isArray(deleteAccountIds) || !deleteAccountIds.length ||
+      deleteAccountIds.some(id => typeof id !== 'string' || !ID.test(id)) || new Set(deleteAccountIds).size !== deleteAccountIds.length) return invalid()
+  const accounts = { ...current.accounts }
+  for (const accountId of deleteAccountIds as string[]) {
+    // Stopped persistent owners are still owners; a recovery marker alone is not.
+    if (bindings.some(binding => binding.accountId === accountId)) return owned()
+    if (Object.hasOwn(incoming.accounts, accountId)) return invalid()
+    delete accounts[accountId]
+  }
+  // Only the named removals may bypass the recovery-record preservation rule.
+  // Every unrelated binding and marker still goes through the usual merge.
+  return mergeInstanceOwnedAccounts(incoming, { ...current, accounts }, records)
+}
+
 /**
  * A persisted instance binding owns refreshes even while its IDE is stopped. Guard every
  * manager refresh/switch entry point, including credential-only verification/import paths.

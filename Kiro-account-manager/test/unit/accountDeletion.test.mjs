@@ -3,7 +3,11 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
-import { mergeInstanceOwnedAccounts, INSTANCE_ACCOUNT_REAUTH_REQUIRED } from '../../src/main/kiroInstanceOwnership.ts'
+import * as ownership from '../../src/main/kiroInstanceOwnership.ts'
+
+const { mergeInstanceOwnedAccounts, INSTANCE_ACCOUNT_REAUTH_REQUIRED } = ownership
+// Falling back reproduces the pre-fix guard until the explicit-deletion helper exists.
+const mergeDeletion = (...args) => (ownership.mergeInstanceOwnedAccountsForDeletion ?? mergeInstanceOwnedAccounts)(...args)
 
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
@@ -25,6 +29,23 @@ let savePendingResolvers = [], accountPersistenceQueue = Promise.resolve();
 ${helpers.join('\n')}
 const actions = {${actions.join(',\n')}};
 `, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
+const preloadSource = readFileSync(new URL('../../src/preload/index.ts', import.meta.url), 'utf8')
+const preloadTree = ts.createSourceFile('preload.ts', preloadSource, ts.ScriptTarget.Latest, true)
+let saveAccountsProperty
+function visitPreload(node) {
+  if (ts.isPropertyAssignment(node) && node.name?.getText(preloadTree) === 'saveAccounts') saveAccountsProperty = node.getText(preloadTree)
+  ts.forEachChild(node, visitPreload)
+}
+visitPreload(preloadTree)
+assert.ok(saveAccountsProperty)
+const preloadScript = ts.transpileModule(`const api = { ${saveAccountsProperty} };`, {
+  compilerOptions: { target: ts.ScriptTarget.ES2022 }
+}).outputText
+function preloadSaveAccounts(invoke) {
+  const context = vm.createContext({ ipcRenderer: { invoke } })
+  vm.runInContext(preloadScript, context)
+  return vm.runInContext('api.saveAccounts', context)
+}
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no }); return { promise, resolve, reject } }
 const tick = () => new Promise(resolve => setImmediate(resolve))
 function fixture(saveAccounts) {
@@ -36,7 +57,7 @@ function fixture(saveAccounts) {
   let actions
   const get = () => ({ ...state, ...actions, saveToStorage: () => actions.flushSaveImmediately() })
   const set = value => Object.assign(state, typeof value === 'function' ? value(state) : value)
-  const context = vm.createContext({ get, set, window: { api: { saveAccounts } }, console: { error() {} }, clearTimeout })
+  const context = vm.createContext({ get, set, window: { api: { saveAccounts } }, console: { error() {} }, clearTimeout, Error })
   vm.runInContext(script, context)
   actions = vm.runInContext('actions', context)
   return { state, actions, first, second }
@@ -69,15 +90,17 @@ test('rejected bound-account deletion rejects visibly and leaves renderer and pe
   assert.equal(ctx.state.accountProxyBindings.first, 'proxy-one')
 })
 
-test('the real ownership save guard rejects bound and recovery deletions without removing the visible account', async () => {
-  for (const recovery of [false, true]) {
-    const records = recovery ? [] : [{ schemaVersion: 2, id: 'synthetic-instance', accountId: 'first' }]
+test('explicit deletion still rejects active and legacy instance bindings without removing the visible account', async () => {
+  for (const accountBindingState of ['active', undefined]) {
+    const records = [{ schemaVersion: 2, id: 'synthetic-instance', accountId: 'first', accountBindingState }]
     let persisted
-    const ctx = fixture(async data => {
+    const ctx = fixture(preloadSaveAccounts(async (channel, data, updateRequestId, deleteAccountIds) => {
+      assert.equal(channel, 'save-accounts')
+      assert.equal(updateRequestId, undefined)
       // IPC serializes renderer objects into the main process realm.
-      persisted = mergeInstanceOwnedAccounts(structuredClone(data), persisted, records)
-    })
-    if (recovery) ctx.first.lastError = INSTANCE_ACCOUNT_REAUTH_REQUIRED
+      persisted = mergeDeletion(structuredClone(data), persisted, records, structuredClone(deleteAccountIds))
+    }))
+    ctx.first.lastError = INSTANCE_ACCOUNT_REAUTH_REQUIRED
     persisted = structuredClone({ accounts: Object.fromEntries(ctx.state.accounts) })
     const result = await ctx.actions.removeAccounts(['first'])
     assert.equal(result.success, 0)
@@ -85,6 +108,88 @@ test('the real ownership save guard rejects bound and recovery deletions without
     assert.equal(ctx.state.accounts.get('first'), ctx.first)
     assert.equal(persisted.accounts.first.credentials.refreshToken, 'SYNTHETIC_FIRST')
   }
+})
+
+test('explicit deletion crosses the real renderer and preload IPC and removes an unbound recovery account only after persistence succeeds', async () => {
+  const wait = deferred(), calls = []
+  let persisted
+  const ctx = fixture(preloadSaveAccounts(async (channel, data, updateRequestId, deleteAccountIds) => {
+    calls.push({ channel, data: structuredClone(data), updateRequestId, deleteAccountIds: structuredClone(deleteAccountIds) })
+    const next = mergeDeletion(structuredClone(data), persisted, [], structuredClone(deleteAccountIds))
+    await wait.promise
+    persisted = next
+  }))
+  ctx.first.status = 'error'
+  ctx.first.lastError = INSTANCE_ACCOUNT_REAUTH_REQUIRED
+  ctx.second.lastError = INSTANCE_ACCOUNT_REAUTH_REQUIRED
+  persisted = structuredClone({ accounts: Object.fromEntries(ctx.state.accounts) })
+  const deletion = ctx.actions.removeAccounts(['first', 'first'])
+  await tick()
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].channel, 'save-accounts')
+  assert.equal(calls[0].updateRequestId, undefined)
+  assert.deepEqual(calls[0].deleteAccountIds, ['first'])
+  assert.equal(calls[0].data.accounts.first, undefined)
+  assert.equal(ctx.state.accounts.get('first'), ctx.first)
+  assert.equal(persisted.accounts.first.lastError, INSTANCE_ACCOUNT_REAUTH_REQUIRED)
+  wait.resolve()
+  const result = await deletion
+  assert.equal(result.success, 1)
+  assert.equal(result.failed, 0)
+  assert.equal(ctx.state.accounts.has('first'), false)
+  assert.equal(persisted.accounts.first, undefined)
+  assert.equal(persisted.accounts.second.credentials.refreshToken, 'SYNTHETIC_SECOND')
+  assert.equal(persisted.accounts.second.lastError, INSTANCE_ACCOUNT_REAUTH_REQUIRED)
+})
+
+test('a stale renderer cannot attach another recovery account deletion to the selected deletion intent', async () => {
+  let persisted
+  const ctx = fixture(preloadSaveAccounts(async (_channel, data, _updateRequestId, deleteAccountIds) => {
+    persisted = mergeDeletion(structuredClone(data), persisted, [], structuredClone(deleteAccountIds))
+  }))
+  ctx.first.lastError = INSTANCE_ACCOUNT_REAUTH_REQUIRED
+  ctx.second.lastError = INSTANCE_ACCOUNT_REAUTH_REQUIRED
+  persisted = structuredClone({ accounts: Object.fromEntries(ctx.state.accounts) })
+  // An old window has already lost the other protected row from its snapshot.
+  ctx.state.accounts.delete('second')
+  const result = await ctx.actions.removeAccounts(['first'])
+  assert.equal(result.success, 0)
+  assert.equal(result.failed, 1)
+  assert.equal(ctx.state.accounts.get('first'), ctx.first)
+  assert.equal(persisted.accounts.first.lastError, INSTANCE_ACCOUNT_REAUTH_REQUIRED)
+  assert.equal(persisted.accounts.second.lastError, INSTANCE_ACCOUNT_REAUTH_REQUIRED)
+  assert.match(result.errors[0].error, /恢复记录.*重新加载/)
+  assert.doesNotMatch(result.errors[0].error, /先完成重新授权/)
+})
+
+test('a real save failure after the recovery deletion guard succeeds retains the row and reports failure', async () => {
+  let persisted, guardSucceeded = false
+  const ctx = fixture(preloadSaveAccounts(async (_channel, data, _updateRequestId, deleteAccountIds) => {
+    mergeDeletion(structuredClone(data), persisted, [], structuredClone(deleteAccountIds))
+    guardSucceeded = true
+    throw new Error('synthetic disk write failure')
+  }))
+  ctx.first.lastError = INSTANCE_ACCOUNT_REAUTH_REQUIRED
+  persisted = structuredClone({ accounts: Object.fromEntries(ctx.state.accounts) })
+  const result = await ctx.actions.removeAccounts(['first'])
+  assert.equal(guardSucceeded, true)
+  assert.equal(result.success, 0)
+  assert.equal(result.failed, 1)
+  assert.equal(ctx.state.accounts.get('first'), ctx.first)
+  assert.equal(persisted.accounts.first.lastError, INSTANCE_ACCOUNT_REAUTH_REQUIRED)
+})
+
+test('ordinary and update saves send no deletion intent through preload', async () => {
+  const calls = []
+  const ctx = fixture(preloadSaveAccounts(async (...args) => { calls.push(structuredClone(args)) }))
+  await ctx.actions.flushSaveImmediately()
+  await ctx.actions.saveAccountChanges('synthetic-update-request')
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0][0], 'save-accounts')
+  assert.equal(calls[0][2], undefined)
+  assert.equal(calls[0][3], undefined)
+  assert.equal(calls[1][2], 'synthetic-update-request')
+  assert.equal(calls[1][3], undefined)
 })
 
 test('batch persistence failure reports zero deletions and preserves every selected account', async () => {

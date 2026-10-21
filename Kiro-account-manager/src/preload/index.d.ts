@@ -149,7 +149,7 @@ interface KiroApi {
 
   // 账号管理
   loadAccounts: () => Promise<AccountData | null>
-  saveAccounts: (data: AccountData, updateRequestId?: string) => Promise<void>
+  saveAccounts: (data: AccountData, updateRequestId?: string, deleteAccountIds?: string[]) => Promise<void>
   refreshAccountToken: (account: unknown) => Promise<RefreshResult>
   checkAccountStatus: (account: unknown) => Promise<StatusResult>
   

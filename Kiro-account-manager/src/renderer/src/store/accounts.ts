@@ -121,7 +121,7 @@ function accountStateWithout(state: AccountsState, ids: string[]) {
 function accountDeletionError(error: unknown): string {
   const message = error instanceof Error ? error.message : ''
   if (message.includes('该账户已由独立 Kiro 实例管理')) return '账户仍由多开实例管理，请先停止实例并解除绑定后再删除。账户已保留。'
-  if (message.includes('实例凭证未核验')) return '账户需要重新授权，删除未保存。请先完成重新授权；账户已保留。'
+  if (message.includes('实例凭证未核验')) return '恢复记录与当前列表不一致，请重新加载账户后重试；账户已保留。'
   return '删除未保存，账户已保留。请检查多开绑定与存储状态后重试。'
 }
 // Session-only aliases prevent reusing a refresh token already rotated by an import.
@@ -768,9 +768,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     if (!targets.length) return result
     set({ isSyncing: true })
     try {
-      // The main process still decides whether bound/recovery accounts may be
-      // removed. Do not hide any row until that write has been acknowledged.
-      await window.api.saveAccounts(accountStorageSnapshot({ ...state, ...accountStateWithout(state, targets) }))
+      // Only this explicit operation authorizes deleting the selected recovery
+      // accounts. Keep every row visible until the main process confirms the write.
+      await window.api.saveAccounts(accountStorageSnapshot({ ...state, ...accountStateWithout(state, targets) }), undefined, targets)
       // Keep unrelated changes that arrived while IPC was pending.
       set(current => accountStateWithout(current, targets))
       result.success = targets.length

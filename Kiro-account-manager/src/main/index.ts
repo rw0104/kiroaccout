@@ -35,7 +35,7 @@ import { createWindowsKiroRuntime } from './kiroInstanceWindows'
 import { createWindowsKiroInstallationDiscovery } from './kiroInstanceDiscovery'
 import { prepareKiroInstanceAccount, readKiroInstanceAccountUpdate, type InstanceBoundAccount } from './kiroInstanceAccounts'
 import { verifyKiroInstanceIdentity } from './kiroInstanceIdentity'
-import { InstanceAccountOwnership, InstanceOwnershipError, INSTANCE_ACCOUNT_REAUTH_REQUIRED, mergeInstanceOwnedAccounts, mergeInstanceOwnedAccountsForUpdate, type InstanceOwnershipInput } from './kiroInstanceOwnership'
+import { InstanceAccountOwnership, InstanceOwnershipError, INSTANCE_ACCOUNT_REAUTH_REQUIRED, mergeInstanceOwnedAccounts, mergeInstanceOwnedAccountsForUpdate, mergeInstanceOwnedAccountsForDeletion, type InstanceOwnershipInput } from './kiroInstanceOwnership'
 import { applyManagerTokenRotation } from './managerAccountRefresh'
 import { registerKiroInstanceIpc } from './ipc/kiroInstances'
 import { normalizeCredentialRecord } from '../shared/accountImport'
@@ -2985,15 +2985,27 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 保存账号数据
-  ipcMain.handle('save-accounts', async (event, data, updateRequestId?: string) => {
+  ipcMain.handle('save-accounts', async (event, data, updateRequestId?: string, deleteAccountIds?: string[]) => {
     try {
       await initStore()
-      const merge = updateInstallSave?.senderId === event.sender.id && updateRequestId === updateInstallSave.requestId ? mergeInstanceOwnedAccountsForUpdate : mergeInstanceOwnedAccounts
-      data = merge(data, store!.get('accountData'), store!.get('kiroInstances'))
+      if (deleteAccountIds !== undefined) {
+        if (updateRequestId !== undefined) throw new InstanceOwnershipError('invalid-ownership-state')
+        data = mergeInstanceOwnedAccountsForDeletion(data, store!.get('accountData'), store!.get('kiroInstances'), deleteAccountIds)
+      } else {
+        const merge = updateInstallSave?.senderId === event.sender.id && updateRequestId === updateInstallSave.requestId ? mergeInstanceOwnedAccountsForUpdate : mergeInstanceOwnedAccounts
+        data = merge(data, store!.get('accountData'), store!.get('kiroInstances'))
+      }
       store!.set('accountData', data)
       
       // 保存最后的数据（用于崩溃恢复）
       lastSavedData = data
+
+      // Persist first. A deleted account must not remain usable by the proxy or
+      // a suspended prelaunch snapshot after its visible row has been removed.
+      for (const accountId of deleteAccountIds ?? []) {
+        proxyServer?.getAccountPool().removeAccount(accountId)
+        suspendedInstancePoolAccounts.delete(accountId)
+      }
       
       // 每次保存时也创建备份
       await createBackup(data)
