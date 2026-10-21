@@ -30,7 +30,12 @@ import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
-import { createWindowsKiroInstanceService } from './kiroInstances'
+import { createWindowsKiroInstanceService, KiroInstanceError } from './kiroInstances'
+import { createWindowsKiroRuntime } from './kiroInstanceWindows'
+import { prepareKiroInstanceAccount, readKiroInstanceAccountUpdate, type InstanceBoundAccount } from './kiroInstanceAccounts'
+import { verifyKiroInstanceIdentity } from './kiroInstanceIdentity'
+import { InstanceAccountOwnership, InstanceOwnershipError, INSTANCE_ACCOUNT_REAUTH_REQUIRED, mergeInstanceOwnedAccounts, type InstanceOwnershipInput } from './kiroInstanceOwnership'
+import { applyManagerTokenRotation } from './managerAccountRefresh'
 import { registerKiroInstanceIpc } from './ipc/kiroInstances'
 import { normalizeCredentialRecord } from '../shared/accountImport'
 import { AppUpdateController, type AppUpdateState, type UpdateEngine } from './appUpdater'
@@ -475,7 +480,7 @@ function initProxyServer(): ProxyServer {
         }
 
         const proxyAccounts = Object.values(accountData.accounts)
-          .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
+          .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken && !instanceAccountOwnership.isBound({ accountId: acc.id, ...acc.credentials }))
           .map((acc: any) => ({
             id: acc.id,
             email: acc.email,
@@ -693,10 +698,15 @@ async function refreshTokenByMethod(
   proxyUrl?: string,
   clientSecretExpiresAt?: number
 ): Promise<OidcRefreshResult> {
+  let release: (() => void) | undefined
+  try { release = instanceAccountOwnership.beginOperation({ refreshToken: token }) }
+  catch (error) { return { success: false, error: error instanceof InstanceOwnershipError ? error.message : '无法确认账户的刷新归属，请检查账户状态。' } }
+  try {
+  let result: OidcRefreshResult
   // 如果是社交登录，使用 Kiro Auth Service 刷新
   if (authMethod === 'social') {
-    return refreshSocialToken(token, proxyUrl)
-  }
+    result = await refreshSocialToken(token, proxyUrl)
+  } else {
   // Older callers may omit the new field; retain a known registration deadline from storage.
   if (clientSecretExpiresAt === undefined) {
     const saved = store?.get('accountData') as { accounts?: Record<string, { credentials?: { clientId?: string; clientSecret?: string; clientSecretExpiresAt?: number } }> } | undefined
@@ -708,7 +718,21 @@ async function refreshTokenByMethod(
     if (deadlines.length) clientSecretExpiresAt = Math.min(...deadlines)
   }
   // 否则使用 OIDC 刷新 (IdC/BuilderId)
-  return refreshOidcToken(token, clientId, clientSecret, region, proxyUrl, clientSecretExpiresAt)
+    result = await refreshOidcToken(token, clientId, clientSecret, region, proxyUrl, clientSecretExpiresAt)
+  }
+  // Persist a rotation before releasing ownership or returning to a delayed renderer.
+  // Otherwise a new instance could seed the old refresh token in the IPC round trip.
+  if (result.success && result.accessToken && store) {
+    const rotation = applyManagerTokenRotation(store.get('accountData'), token, result)
+    if (rotation.updates.length) {
+      store.set('accountData', rotation.data)
+      pendingStoreWrites.delete('accountData')
+      lastSavedData = rotation.data
+      for (const update of rotation.updates) mainWindow?.webContents.send('kiro-instance-account-update', update)
+    }
+  }
+  return result
+  } finally { release() }
 }
 
 function generateInvocationId(): string {
@@ -1352,6 +1376,56 @@ let store: {
   path: string
 } | null = null
 
+const instanceAccountOwnership = new InstanceAccountOwnership({
+  records: () => store?.get('kiroInstances'),
+  accounts: () => (store?.get('accountData') as { accounts?: Record<string, unknown> } | undefined)?.accounts || {}
+})
+
+// The lease covers the complete handler, including post-refresh cache and store writes.
+// Binding cannot begin while a preceding manager operation still owns the credential.
+function registerUnboundAccountHandler(channel: string, handler: Parameters<typeof ipcMain.handle>[1]): void {
+  ipcMain.handle(channel, async (event, ...args) => {
+    let release: (() => void) | undefined
+    try {
+      const raw = args[0]
+      const account = channel === 'diagnose:account-liveness' ? raw?.account : raw
+      const input: InstanceOwnershipInput = {
+        accountId: account?.accountId ?? account?.id,
+        accessToken: (account?.credentials ?? account)?.accessToken,
+        refreshToken: (account?.credentials ?? account)?.refreshToken
+      }
+      release = instanceAccountOwnership.beginOperation(input)
+      return await handler(event, ...args)
+    } catch (error) {
+      const message = error instanceof InstanceOwnershipError ? error.message : '账户操作未完成，请检查账户状态后重试。'
+      return { success: false, error: channel === 'refresh-account-token' || channel === 'check-account-status' ? { message } : message }
+    } finally { release?.() }
+  })
+}
+
+function getInstanceBoundAccount(accountId: string): InstanceBoundAccount {
+  const data = store?.get('accountData') as { accounts?: Record<string, InstanceBoundAccount & { profileArn?: string }> } | undefined
+  const account = data?.accounts?.[accountId]
+  if (!account || account.id !== accountId) throw new Error('绑定账户已不存在，请先移除实例绑定')
+  if (account.profileArn && account.credentials.profileArn && account.profileArn !== account.credentials.profileArn) throw new Error('账户 profile 资料不一致，请先核对后绑定')
+  return { ...account, credentials: { ...account.credentials, ...(account.credentials.profileArn ? {} : account.profileArn ? { profileArn: account.profileArn } : {}) } }
+}
+
+function persistInstanceAccountCredentials(accountId: string, credentials: InstanceBoundAccount['credentials'], expected?: InstanceBoundAccount['credentials']): void {
+  if (!store) throw new Error('账户存储尚未就绪')
+  const data = store.get('accountData') as { accounts?: Record<string, InstanceBoundAccount> } | undefined
+  const account = data?.accounts?.[accountId]
+  if (!data?.accounts || !account) throw new Error('绑定账户已不存在')
+  if (JSON.stringify(account.credentials) === JSON.stringify({ ...account.credentials, ...credentials })) return
+  if (expected && (account.credentials.accessToken !== expected.accessToken || account.credentials.refreshToken !== expected.refreshToken)) throw new Error('账户凭证刚刚变化，请重试同步')
+  if (!instanceAccountOwnership.isBound({ accountId })) return
+  const updated = { ...data, accounts: { ...data.accounts, [accountId]: { ...account, credentials: { ...account.credentials, ...credentials } } } }
+  store.set('accountData', updated)
+  pendingStoreWrites.delete('accountData')
+  lastSavedData = updated
+  mainWindow?.webContents.send('kiro-instance-account-update', { id: accountId, credentials })
+}
+
 // 最后保存的数据（用于崩溃恢复）
 let lastSavedData: unknown = null
 
@@ -1520,6 +1594,7 @@ async function syncIdeTokenChangeToStore(token: {
     return
   }
 
+  if (instanceAccountOwnership.isBound({ accountId: matchedId })) return
   const accountToUpdate = accountData.accounts[matchedId]
   if (!accountToUpdate) return
   accountToUpdate.credentials = {
@@ -1583,6 +1658,17 @@ function scheduleProactiveRenewal(accountId: string, expiresAtMs: number): void 
 }
 
 async function runProactiveRenewal(accountId: string): Promise<void> {
+  let release: (() => void) | undefined
+  try {
+    await initStore()
+    release = instanceAccountOwnership.beginOperation({ accountId })
+    await runUnboundProactiveRenewal(accountId)
+  } catch { /* A bound account is refreshed exclusively by its own IDE. */ }
+  finally { release?.() }
+}
+
+async function runUnboundProactiveRenewal(accountId: string): Promise<void> {
+  if (instanceAccountOwnership.isBound({ accountId })) return
   if (!proactiveRenewalEnabled) {
     console.log('[ProactiveRenewal] Disabled, skip run')
     return
@@ -1667,13 +1753,18 @@ async function runProactiveRenewal(accountId: string): Promise<void> {
 
   // 2. 写 store（同步反代/UI）
   if (store) {
-    account.credentials = {
+    const current = store.get('accountData') as typeof accountData
+    const currentAccount = current?.accounts?.[accountId]
+    if (!current?.accounts || !currentAccount) return
+    const credentials = {
       ...creds,
       accessToken: newAccess,
       refreshToken: newRefresh,
       expiresAt: newExpiresAt
     }
-    store.set('accountData', accountData)
+    const updated = { ...current, accounts: { ...current.accounts, [accountId]: { ...currentAccount, credentials } } }
+    store.set('accountData', updated)
+    lastSavedData = updated
   }
 
   // 3. 通知 renderer reload
@@ -1904,6 +1995,7 @@ async function runMainPoolTokenRefreshTick(): Promise<void> {
     const toRefresh: BackgroundRefreshAccount[] = []
     for (const [id, acc] of Object.entries(data.accounts)) {
       const creds = acc?.credentials
+    if (instanceAccountOwnership.isBound({ accountId: id, ...creds })) continue
       if (!creds?.refreshToken) continue
       if (isBannedAccountErrorMain(acc.lastError)) continue
       const expiresAt = creds.expiresAt
@@ -2175,7 +2267,7 @@ function createWindow(): void {
           }
 
           const proxyAccounts = Object.values(accountData.accounts)
-            .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
+            .filter((acc: any) => acc.status === 'active' && acc.credentials?.accessToken && !instanceAccountOwnership.isBound({ accountId: acc.id, ...acc.credentials }))
             .map((acc: any) => {
               const provider = acc.credentials?.provider || acc.idp
               const authMethod = acc.credentials?.authMethod
@@ -2324,35 +2416,7 @@ function createWindow(): void {
   }
 }
 
-// 注册自定义协议
-function registerProtocol(): void {
-  // A failed registration must not be logged as success.
-  let registered = false
-  if (process.defaultApp) {
-    if (process.argv.length >= 2) {
-      registered = app.setAsDefaultProtocolClient(PROTOCOL_PREFIX, process.execPath, [join(process.argv[1])])
-    }
-  } else {
-    registered = app.setAsDefaultProtocolClient(PROTOCOL_PREFIX)
-  }
-  if (registered) console.log(`[Protocol] Registered ${PROTOCOL_PREFIX}:// protocol`)
-  else console.warn(`[Protocol] Unable to register ${PROTOCOL_PREFIX}:// protocol`)
-}
-
-// 注销自定义协议 (应用退出时调用)
-function unregisterProtocol(): void {
-  if (process.defaultApp) {
-    if (process.argv.length >= 2) {
-      app.removeAsDefaultProtocolClient(PROTOCOL_PREFIX, process.execPath, [
-        join(process.argv[1])
-      ])
-    }
-  } else {
-    app.removeAsDefaultProtocolClient(PROTOCOL_PREFIX)
-  }
-  console.log(`[Protocol] Unregistered ${PROTOCOL_PREFIX}:// protocol`)
-}
-
+// Portal PKCE uses instance-owned loopback callbacks; never take the official IDE URI scheme.
 // 处理协议 URL (用于 OAuth 回调)
 function handleProtocolUrl(url: string): void {
   if (!url.startsWith(`${PROTOCOL_PREFIX}://`)) return
@@ -2388,8 +2452,7 @@ app.whenReady().then(async () => {
   // 见 syncIdeTokenChangeToStore 注释
   startKiroAuthTokenWatcher()
 
-  // 注册自定义协议
-  registerProtocol()
+  // Keep the official IDE URI scheme untouched. Portal login owns its loopback listener.
 
   // 加载托盘设置并初始化托盘
   await loadTraySettings()
@@ -2422,14 +2485,67 @@ app.whenReady().then(async () => {
   // ============ 注册功能 IPC ============
   registerRegistrationHandlers(() => mainWindow)
   const kiroInstanceService = createWindowsKiroInstanceService({
+    baseRoot: join(app.getPath('userData'), 'kiro-instances-v2'),
     readConfig: async () => { await initStore(); return store!.get('kiroInstances') },
-    writeConfig: async records => { await initStore(); store!.set('kiroInstances', records) },
-    trustedPublishers: ['Amazon.com, Inc.']
+    writeConfig: async records => {
+      await initStore()
+      for (const record of records) if (record.schemaVersion === 2 && record.accountId) instanceAccountOwnership.assertCanBind(record.accountId, record.id)
+      store!.set('kiroInstances', records)
+      const pool = proxyServer?.getAccountPool()
+      for (const account of pool?.getAllAccounts() ?? []) {
+        if (instanceAccountOwnership.isBound({ accountId: account.id, ...account })) pool!.removeAccount(account.id)
+      }
+    },
+    runtime: createWindowsKiroRuntime({ trustedPublishers: ['Amazon.com, Inc.'] }),
+    prepareAccount: async record => {
+      const account = getInstanceBoundAccount(record.accountId!)
+      const defaultToken = await readKiroAuthTokenFile()
+      if (defaultToken && (defaultToken.refreshToken === account.credentials.refreshToken || defaultToken.accessToken === account.credentials.accessToken)) {
+        throw new KiroInstanceError('默认 Kiro 客户端仍保存着该账户的同一份凭证。请先在默认客户端切换其他账户，避免两个客户端争用刷新凭证；默认客户端资料未被改动。')
+      }
+      const prepared = await prepareKiroInstanceAccount({ record, account, verifyIdentity: credentials => verifyKiroInstanceIdentity(credentials, {
+        fetch: (input, options) => fetchWithAppProxy(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, options ?? {})
+      }) })
+      if (prepared.source === 'instance') persistInstanceAccountCredentials(account.id, prepared.credentials, account.credentials)
+    },
+    syncAccount: async record => {
+      const account = getInstanceBoundAccount(record.accountId!)
+      const update = await readKiroInstanceAccountUpdate({ record, account, verifyIdentity: credentials => verifyKiroInstanceIdentity(credentials, {
+        fetch: (input, options) => fetchWithAppProxy(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, options ?? {})
+      }) })
+      if (update) persistInstanceAccountCredentials(account.id, update.credentials, account.credentials)
+    },
+    markAccountReauthorizationRequired: async record => {
+      const current = store!.get('accountData') as { accounts?: Record<string, InstanceBoundAccount> } | undefined
+      const account = current?.accounts?.[record.accountId!]
+      if (!current?.accounts || !account) throw new KiroInstanceError('绑定账户已不存在，无法记录重新授权状态。')
+      const updated = { ...current, accounts: { ...current.accounts, [account.id]: { ...account, status: 'error', lastError: INSTANCE_ACCOUNT_REAUTH_REQUIRED } } }
+      store!.set('accountData', updated)
+      pendingStoreWrites.delete('accountData')
+      lastSavedData = updated
+      mainWindow?.webContents.send('kiro-ide-token-changed', { accountId: account.id, reason: 'instance-reauthorization-required' })
+    }
   })
+  let instanceSyncBusy = false
+  const instanceSyncTimer = setInterval(async () => {
+    if (instanceSyncBusy || isQuitting || !store) return
+    instanceSyncBusy = true
+    try {
+      const records = store.get('kiroInstances')
+      if (!Array.isArray(records)) return
+      for (const record of records) {
+        if (record?.schemaVersion !== 2 || !record.accountId || typeof record.id !== 'string') continue
+        // The service validates roots and serializes this with launch/stop/detach.
+        await kiroInstanceService.synchronize(record.id).catch(() => {})
+      }
+    } finally { instanceSyncBusy = false }
+  }, 30_000)
+  instanceSyncTimer.unref()
+  app.once('before-quit', () => clearInterval(instanceSyncTimer))
   registerKiroInstanceIpc({
     ipcMain, service: kiroInstanceService,
     chooseExecutable: async () => {
-      const result = await dialog.showOpenDialog({ title: '选择独立 Windows 用户安装的 Kiro.exe', properties: ['openFile'], filters: [{ name: 'Kiro', extensions: ['exe'] }] })
+      const result = await dialog.showOpenDialog({ title: '选择多个实例共用的官方 Kiro.exe', properties: ['openFile'], filters: [{ name: 'Kiro', extensions: ['exe'] }] })
       return result.canceled ? null : result.filePaths[0] || null
     }
   })
@@ -2701,7 +2817,7 @@ app.whenReady().then(async () => {
 
   // IPC: 账号测活 —— 指定账号走反代逻辑（callKiroApi，与反代服务器同一底层调用）
   // 给指定模型发一条测试消息，验证账号是否能正常返回，用于一键诊断"账号测活"功能
-  ipcMain.handle('diagnose:account-liveness', async (_event, params: {
+  registerUnboundAccountHandler('diagnose:account-liveness', async (_event, params: {
     account: {
       id?: string
       email?: string
@@ -2820,6 +2936,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('save-accounts', async (_event, data) => {
     try {
       await initStore()
+      data = mergeInstanceOwnedAccounts(data, store!.get('accountData'), store!.get('kiroInstances'))
       store!.set('accountData', data)
       
       // 保存最后的数据（用于崩溃恢复）
@@ -2834,8 +2951,9 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 刷新账号 Token（支持 IdC 和社交登录）
-  ipcMain.handle('refresh-account-token', async (_event, account) => {
+  registerUnboundAccountHandler('refresh-account-token', async (_event, account) => {
     try {
+      instanceAccountOwnership.assertAvailable({ accountId: account.id, ...account.credentials })
       const { refreshToken, clientId, clientSecret, region, authMethod, startUrl, provider } = account.credentials || {}
 
       if (!refreshToken) {
@@ -3175,7 +3293,7 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 检查账号状态（支持自动刷新 Token）
-  ipcMain.handle('check-account-status', async (_event, account) => {
+  registerUnboundAccountHandler('check-account-status', async (_event, account) => {
     console.log(`[IPC] check-account-status [${account?.email || 'unknown'}]`)
 
     interface Bonus {
@@ -3481,6 +3599,8 @@ app.whenReady().then(async () => {
   const backgroundBatchRefresh = async (accounts: BackgroundRefreshAccount[], concurrency: number = 10, syncInfo: boolean = true): Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }> => {
     console.log(`[BackgroundRefresh] Starting batch refresh for ${accounts.length} accounts, concurrency: ${concurrency}, syncInfo: ${syncInfo}`)
     
+    accounts = accounts.filter(account => !instanceAccountOwnership.isBound({ accountId: account.id, ...account.credentials }))
+
     let completed = 0
     let success = 0
     let failed = 0
@@ -3500,7 +3620,9 @@ app.whenReady().then(async () => {
             return
           }
           if (account.id) poolRefreshInFlightIds.add(account.id)
+          let releaseOwnership: (() => void) | undefined
           try {
+            releaseOwnership = instanceAccountOwnership.beginOperation({ accountId: account.id, ...account.credentials })
             const { refreshToken, clientId, clientSecret, region, authMethod, accessToken, provider } = account.credentials
             const needsTokenRefresh = account.needsTokenRefresh !== false // 默认为 true（兼容旧版本）
 
@@ -3840,6 +3962,7 @@ app.whenReady().then(async () => {
               error: e instanceof Error ? e.message : 'Unknown error'
             })
           } finally {
+            releaseOwnership?.()
             if (account.id) poolRefreshInFlightIds.delete(account.id)
           }
         })
@@ -3885,6 +4008,8 @@ app.whenReady().then(async () => {
   }>, concurrency: number = 10) => {
     console.log(`[BackgroundCheck] Starting batch check for ${accounts.length} accounts, concurrency: ${concurrency}`)
     
+    accounts = accounts.filter(account => !instanceAccountOwnership.isBound({ accountId: account.id, ...account.credentials }))
+
     let completed = 0
     let success = 0
     let failed = 0
@@ -4253,7 +4378,7 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 验证凭证并获取账号信息（用于添加账号）
-  ipcMain.handle('verify-account-credentials', async (_event, credentials: {
+  registerUnboundAccountHandler('verify-account-credentials', async (_event, credentials: {
     accessToken?: string
     expiresIn?: number
     profileArn?: string
@@ -4625,7 +4750,7 @@ app.whenReady().then(async () => {
   //   3. (bug D 修复) refresh 失败时直接报错并拒绝写入文件，避免埋雷
   //   4. (bug F 支持) 通过 refreshedCredentials 把新 refresh 回传 renderer，让反代 store 同步
   //   5. 记录 lastSwitchedAccountId，供 fs.watch 反向同步时用作账号匹配兜底
-  ipcMain.handle('switch-account', async (_event, credentials: {
+  registerUnboundAccountHandler('switch-account', async (_event, credentials: {
     accessToken: string
     refreshToken: string
     clientId: string
@@ -4649,6 +4774,7 @@ app.whenReady().then(async () => {
         profileArn,
         accountId
       } = credentials
+      instanceAccountOwnership.assertAvailable({ accountId: credentials.accountId, ...credentials })
       let finalAccessToken = credentials.accessToken
       let finalRefreshToken = refreshToken
       let finalExpiresIn = 3600
@@ -4730,7 +4856,7 @@ app.whenReady().then(async () => {
 
   // IPC: 切换账号到 Kiro CLI - 写入凭证到 SQLite 数据库
   // kiro-cli 使用 ~/.local/share/kiro-cli/data.sqlite3 中的 auth_kv 表
-  ipcMain.handle('switch-account-cli', async (_event, credentials: {
+  registerUnboundAccountHandler('switch-account-cli', async (_event, credentials: {
     accessToken: string
     refreshToken: string
     clientId?: string
@@ -4745,6 +4871,7 @@ app.whenReady().then(async () => {
     const { mkdir } = await import('fs/promises')
 
     try {
+      instanceAccountOwnership.assertAvailable(credentials)
       const {
         refreshToken,
         clientId,
@@ -4913,7 +5040,7 @@ app.whenReady().then(async () => {
       }
     }
   })
-  ipcMain.handle('start-portal-login', (_event, sessionId: string, privateMode: boolean) => loginSessions.startPortal(sessionId, undefined, privateMode))
+  ipcMain.handle('start-portal-login', (_event, sessionId: string, privateMode: boolean, expectedProvider?: import('./loginSessions').PortalProvider) => loginSessions.startPortal(sessionId, expectedProvider, privateMode))
   ipcMain.handle('poll-portal-login', (_event, sessionId: string) => loginSessions.pollPortal(sessionId))
   ipcMain.handle('cancel-portal-login', (_event, sessionId: string) => loginSessions.cancel('portal', sessionId))
   ipcMain.handle('start-builder-id-login', (_event, region: string, sessionId: string) => loginSessions.startBuilder(sessionId, region))
@@ -5738,6 +5865,7 @@ app.whenReady().then(async () => {
   // IPC: 添加账号到反代池
   ipcMain.handle('proxy-add-account', (_event, account: ProxyAccount) => {
     try {
+      instanceAccountOwnership.assertAvailable({ accountId: account.id, ...account })
       const server = initProxyServer()
       server.getAccountPool().addAccount(account)
       return { success: true, accountCount: server.getAccountPool().size }
@@ -5766,6 +5894,7 @@ app.whenReady().then(async () => {
       const pool = server.getAccountPool()
       pool.clear()
       for (const account of accounts) {
+        if (instanceAccountOwnership.isBound({ accountId: account.id, ...account })) continue
         pool.addAccount(account)
       }
       return { success: true, accountCount: pool.size }
@@ -6629,7 +6758,7 @@ app.on('before-quit', (event) => {
   }
 })
 
-// 应用退出前注销 URI 协议处理器并保存数据
+// 应用退出前保存数据；不修改官方 IDE 的 URI 协议归属
 app.on('will-quit', async (event) => {
   // 防止重复处理
   if (isQuitting) return
@@ -6645,7 +6774,6 @@ app.on('will-quit', async (event) => {
     // 设置超时，确保 3 秒后强制退出（防止关机阻塞）
     const forceQuitTimer = setTimeout(() => {
       console.log('[Exit] Force quit due to timeout')
-      unregisterProtocol()
       app.exit(0)
     }, 3000)
     
@@ -6677,10 +6805,7 @@ app.on('will-quit', async (event) => {
     }
     
     clearTimeout(forceQuitTimer)
-    unregisterProtocol()
     app.exit(0)
-  } else {
-    unregisterProtocol()
   }
 })
 

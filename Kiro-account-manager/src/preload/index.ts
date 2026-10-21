@@ -283,10 +283,18 @@ const api = {
     snapshot: () => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.snapshot),
     create: input => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.create, input),
     remove: id => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.remove, id),
+    detach: id => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.detach, id),
     launch: id => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.launch, id),
+    stop: id => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.stop, id),
+    restart: id => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.restart, id),
     chooseExecutable: () => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.chooseExecutable)
   } satisfies KiroInstancesApi,
-  startPortalLogin: (sessionId: string, privateMode: boolean): Promise<LoginResult> => ipcRenderer.invoke('start-portal-login', sessionId, privateMode),
+  onKiroInstanceAccountUpdate: (callback: (info: { id: string; credentials: Record<string, unknown> }) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, info: { id: string; credentials: Record<string, unknown> }) => callback(info)
+    ipcRenderer.on('kiro-instance-account-update', listener)
+    return () => ipcRenderer.removeListener('kiro-instance-account-update', listener)
+  },
+  startPortalLogin: (sessionId: string, privateMode: boolean, expectedProvider?: 'Google' | 'Github' | 'BuilderId' | 'Enterprise'): Promise<LoginResult> => ipcRenderer.invoke('start-portal-login', sessionId, privateMode, expectedProvider),
   pollPortalLogin: (sessionId: string): Promise<LoginResult> => ipcRenderer.invoke('poll-portal-login', sessionId),
   cancelPortalLogin: (sessionId: string): Promise<{ success: boolean }> => ipcRenderer.invoke('cancel-portal-login', sessionId),
   startBuilderIdLogin: (region: string, sessionId: string): Promise<LoginResult> => ipcRenderer.invoke('start-builder-id-login', region, sessionId),
