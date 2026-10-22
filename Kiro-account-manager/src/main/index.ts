@@ -33,6 +33,7 @@ import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import { createWindowsKiroInstanceService, KiroInstanceError } from './kiroInstances'
 import { createWindowsKiroRuntime } from './kiroInstanceWindows'
 import { createWindowsKiroInstallationDiscovery } from './kiroInstanceDiscovery'
+import { resolveKiroSettingsPath } from './kiroSettingsPath'
 import { prepareKiroInstanceAccount, readKiroInstanceAccountUpdate, type InstanceBoundAccount } from './kiroInstanceAccounts'
 import { verifyKiroInstanceIdentity } from './kiroInstanceIdentity'
 import { InstanceAccountOwnership, InstanceOwnershipError, INSTANCE_ACCOUNT_REAUTH_REQUIRED, mergeInstanceOwnedAccounts, mergeInstanceOwnedAccountsForUpdate, mergeInstanceOwnedAccountsForDeletion, type InstanceOwnershipInput } from './kiroInstanceOwnership'
@@ -5153,7 +5154,7 @@ app.whenReady().then(async () => {
       const path = await import('path')
       
       const homeDir = os.homedir()
-      const kiroSettingsPath = path.join(homeDir, 'AppData', 'Roaming', 'Kiro', 'User', 'settings.json')
+      const kiroSettingsPath = resolveKiroSettingsPath(process.platform, homeDir, process.env)
       const kiroSteeringPath = path.join(homeDir, '.kiro', 'steering')
       const kiroMcpUserPath = path.join(homeDir, '.kiro', 'settings', 'mcp.json')
       
@@ -5262,7 +5263,7 @@ app.whenReady().then(async () => {
       const path = await import('path')
       
       const homeDir = os.homedir()
-      const kiroSettingsPath = path.join(homeDir, 'AppData', 'Roaming', 'Kiro', 'User', 'settings.json')
+      const kiroSettingsPath = resolveKiroSettingsPath(process.platform, homeDir, process.env)
       
       let existingSettings = {}
       if (fs.existsSync(kiroSettingsPath)) {

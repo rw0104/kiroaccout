@@ -13,6 +13,14 @@ assert.equal(lock.packages[''].version, version, 'Lockfile package version diffe
 const tag = `v${version}`
 if (process.env.GITHUB_REF_TYPE === 'tag') assert.equal(process.env.GITHUB_REF_NAME, tag, 'Tag and package version differ')
 assert.ok(existsSync(join(appRoot, '..', 'docs', 'releases', `${tag}.md`)), 'Versioned release notes are required')
-const output = `version=${version}\ntag=${tag}\nprerelease=${version.includes('-')}\n`
+const targets = [
+  { platform: 'win32', arch: 'x64', runner: 'windows-latest', package: 'npm run package:win' },
+  { platform: 'darwin', arch: 'x64', runner: 'macos-15-intel', package: 'npm run package:mac -- --x64' },
+  { platform: 'darwin', arch: 'arm64', runner: 'macos-15', package: 'npm run package:mac -- --arm64' },
+  { platform: 'linux', arch: 'x64', runner: 'ubuntu-22.04', package: 'npm run package:linux' }
+]
+// New platforms remain opt-in previews until desktop acceptance is complete.
+const matrix = { include: version.includes('-') ? targets : targets.slice(0, 1) }
+const output = `version=${version}\ntag=${tag}\nprerelease=${version.includes('-')}\nmatrix=${JSON.stringify(matrix)}\n`
 if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, output)
 console.log(output.trim())

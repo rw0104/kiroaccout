@@ -2,12 +2,14 @@ import assert from 'node:assert/strict'
 import { readFileSync, readdirSync, statSync, mkdirSync, copyFileSync } from 'node:fs'
 import { resolve, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { releaseArtifactNames } from './lib/releaseArtifacts.mjs'
+import { releaseArtifactNames, checksumFilename } from './lib/releaseArtifacts.mjs'
+import { releaseOptions } from './lib/releaseOptions.mjs'
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const metadata = JSON.parse(readFileSync(join(appRoot, 'package.json'), 'utf8'))
-const files = [...releaseArtifactNames(metadata), 'SHA256SUMS.txt']
-const dist = join(appRoot, 'dist')
+const options = releaseOptions(process.argv.slice(2), appRoot)
+const files = [...releaseArtifactNames({ ...metadata, ...options }), checksumFilename(options)]
+const dist = options.dist
 const destination = join(dist, 'release-assets', metadata.version)
 mkdirSync(destination, { recursive: true })
 for (const file of files) {

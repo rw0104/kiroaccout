@@ -1,4 +1,4 @@
-name: Windows x64 build and release
+name: Desktop build and release
 
 on:
   push:
@@ -13,16 +13,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    runs-on: windows-latest
+  version:
+    runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.version.outputs.tag }}
       version: ${{ steps.version.outputs.version }}
       prerelease: ${{ steps.version.outputs.prerelease }}
+      matrix: ${{ steps.version.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.16.0'
+      - name: Validate version and release notes
+        id: version
+        working-directory: Kiro-account-manager
+        run: node scripts/release-version.mjs
+
+  build:
+    needs: version
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.version.outputs.matrix) }}
     defaults:
       run:
         working-directory: Kiro-account-manager
-        shell: pwsh
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -30,48 +48,55 @@ jobs:
           node-version: '24.16.0'
           cache: npm
           cache-dependency-path: Kiro-account-manager/package-lock.json
-      - name: Validate version and release notes
-        id: version
-        run: node scripts/release-version.mjs
       - name: Install locked dependencies
         run: npm ci
       - name: Offline regressions
         run: npm run test:unit
       - name: Typecheck and compile
         run: npm run build
+      - name: Prepare matching native resources
+        run: npm run prepare:resources -- --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Package without installing or publishing
-        run: npm run package:win
+        run: ${{ matrix.package }}
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
       - name: Verify packaged application contents
-        run: npm run verify:package
+        run: npm run verify:platform -- --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
       - name: Generate exact artifact checksums
-        run: npm run release:checksums
+        run: npm run release:checksums -- --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
       - name: Stage exact assets for release channel
-        run: npm run release:stage
+        run: npm run release:stage -- --platform ${{ matrix.platform }} --arch ${{ matrix.arch }}
       - uses: actions/upload-artifact@v4
         with:
-          name: windows-x64-release
+          name: desktop-${{ matrix.platform }}-${{ matrix.arch }}
           if-no-files-found: error
-          path: Kiro-account-manager/dist/release-assets/${{ steps.version.outputs.version }}/*
+          path: Kiro-account-manager/dist/release-assets/${{ needs.version.outputs.version }}/*
 
   release:
-    needs: build
+    needs: [version, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      RELEASE_TAG: ${{ needs.build.outputs.tag }}
-      RELEASE_VERSION: ${{ needs.build.outputs.version }}
-      PRERELEASE: ${{ needs.build.outputs.prerelease }}
+      RELEASE_TAG: ${{ needs.version.outputs.tag }}
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24.16.0'
       - uses: actions/download-artifact@v4
         with:
-          name: windows-x64-release
+          pattern: desktop-*
+          merge-multiple: true
           path: release-assets
+      - name: Verify complete release and generate combined checksums
+        run: node Kiro-account-manager/scripts/release-checksums.mjs --all --dist release-assets
       - name: Verify downloaded checksums
         working-directory: release-assets
         run: sha256sum --check SHA256SUMS.txt
@@ -79,7 +104,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # --target only applies to a new tag. Reject any existing tag at another commit.
           remote_refs="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")"
           if [[ -n "$remote_refs" ]]; then
             git fetch --depth=1 origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
@@ -94,9 +118,14 @@ jobs:
           fi
           flags=(--latest=true)
           draft_flags=(--latest=false)
-          if [[ "$PRERELEASE" == "true" ]]; then flags=(--latest=false --prerelease); draft_flags+=(--prerelease); fi
+          platforms="Windows x64"
+          if [[ "$PRERELEASE" == "true" ]]; then
+            flags=(--latest=false --prerelease)
+            draft_flags+=(--prerelease)
+            platforms="Windows · macOS · Linux Preview"
+          fi
           gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --draft "${draft_flags[@]}" \
-            --title "kiroaccout $RELEASE_VERSION · Windows x64" \
+            --title "kiroaccout $RELEASE_VERSION · $platforms" \
             --notes-file "docs/releases/$RELEASE_TAG.md" \
             release-assets/*
           gh release edit "$RELEASE_TAG" --draft=false "${flags[@]}"
