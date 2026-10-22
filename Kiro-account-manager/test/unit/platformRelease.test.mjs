@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import { createRequire } from 'node:module'
 import { releaseArtifactNames, releaseTargets, checksumFilename } from '../../scripts/lib/releaseArtifacts.mjs'
 import { verifyBinaryArchitecture } from '../../scripts/lib/platformResources.mjs'
 
@@ -47,6 +48,26 @@ test('stable matrix includes all four targets and preserves only the Windows upd
     'kiro-account-manager-1.8.5-x64-linux.AppImage', 'kiro-account-manager-1.8.5-x64-linux.deb'
   ])
   assert.ok(manualAssets.every(file => !/\.yml$|\.blockmap$/.test(file)))
+})
+
+test('installed builder expands Linux target filenames to the release allowlist despite arch normalization', () => {
+  const require = createRequire(import.meta.url)
+  const { PlatformPackager } = require('app-builder-lib')
+  const { Arch } = require('builder-util')
+  const config = require('js-yaml').load(readFileSync(join(appRoot, 'electron-builder.yml'), 'utf8'))
+  // Exercise builder's actual artifact expansion without initializing a build or launching Electron.
+  const packager = Object.assign(Object.create(PlatformPackager.prototype), {
+    info: { config }, platform: { buildConfigurationKey: 'linux' },
+    platformSpecificBuildOptions: config.linux, appInfo: metadata
+  })
+  const unqualified = ['AppImage', 'deb'].map(ext => packager.expandArtifactNamePattern({}, ext, Arch.x64))
+  assert.match(unqualified[0], /-x86_64-linux\.AppImage$/)
+  assert.match(unqualified[1], /-amd64-linux\.deb$/)
+  const files = [
+    packager.expandArtifactNamePattern(config.appImage, 'AppImage', Arch.x64),
+    packager.expandArtifactNamePattern(config.deb, 'deb', Arch.x64)
+  ]
+  assert.deepEqual(files, releaseArtifactNames({ ...metadata, platform: 'linux', arch: 'x64' }))
 })
 
 test('checksum aggregation validates each payload and rejects extra assets before release', () => temporary(dist => {
