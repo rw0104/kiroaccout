@@ -6,9 +6,8 @@ export function releaseTarget(platform = 'win32', arch = 'x64') {
 }
 
 export function releaseTargets(version) {
-  return version.includes('-')
-    ? [releaseTarget(), releaseTarget('darwin', 'x64'), releaseTarget('darwin', 'arm64'), releaseTarget('linux', 'x64')]
-    : [releaseTarget()]
+  assert.match(version, /^\d+\.\d+\.\d+(?:-[a-z0-9.]+)?$/)
+  return [releaseTarget(), releaseTarget('darwin', 'x64'), releaseTarget('darwin', 'arm64'), releaseTarget('linux', 'x64')]
 }
 
 export function checksumFilename({ platform = 'win32', arch = 'x64' } = {}) {
@@ -20,7 +19,6 @@ export function releaseArtifactNames({ name, version, platform = 'win32', arch =
   assert.match(name, /^[a-z0-9-]+$/)
   assert.match(version, /^\d+\.\d+\.\d+(?:-[a-z0-9.]+)?$/)
   releaseTarget(platform, arch)
-  assert.ok(version.includes('-') || platform === 'win32', 'Stable non-Windows releases require separate updater validation')
   const base = `${name}-${version}-${arch}`
   if (platform === 'darwin') return [`${base}-mac.dmg`, `${base}-mac.zip`]
   if (platform === 'linux') return [`${base}-linux.AppImage`, `${base}-linux.deb`]

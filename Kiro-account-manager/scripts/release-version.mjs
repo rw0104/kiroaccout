@@ -19,8 +19,7 @@ const targets = [
   { platform: 'darwin', arch: 'arm64', runner: 'macos-15', package: 'npm run package:mac -- --arm64' },
   { platform: 'linux', arch: 'x64', runner: 'ubuntu-22.04', package: 'npm run package:linux' }
 ]
-// New platforms remain opt-in previews until desktop acceptance is complete.
-const matrix = { include: version.includes('-') ? targets : targets.slice(0, 1) }
+const matrix = { include: targets }
 const output = `version=${version}\ntag=${tag}\nprerelease=${version.includes('-')}\nmatrix=${JSON.stringify(matrix)}\n`
 if (process.env.GITHUB_OUTPUT) appendFileSync(process.env.GITHUB_OUTPUT, output)
 console.log(output.trim())

@@ -28,12 +28,29 @@ test('preview matrix has unique target payloads and excludes every updater chann
     'kiro-account-manager-1.8.5-rc.1-x64-linux.AppImage', 'kiro-account-manager-1.8.5-rc.1-x64-linux.deb'
   ])
   assert.equal(new Set(targets.map(checksumFilename)).size, 4)
-  assert.deepEqual(releaseTargets('1.8.5'), [{ platform: 'win32', arch: 'x64' }])
   assert.throws(() => releaseArtifactNames({ ...preview, platform: 'linux', arch: 'arm64' }), /Unsupported/)
-  assert.throws(() => releaseArtifactNames({ ...preview, platform: 'darwin', arch: 'x64', version: '1.8.5' }), /updater validation/)
+})
+
+test('stable matrix includes all four targets and preserves only the Windows updater payload', () => {
+  const stable = { name: preview.name, version: '1.8.5' }
+  const targets = releaseTargets(stable.version)
+  assert.deepEqual(targets, releaseTargets(preview.version))
+  assert.deepEqual(releaseArtifactNames(stable), [
+    'kiro-account-manager-1.8.5-x64-setup.exe', 'kiro-account-manager-1.8.5-x64-windows.zip',
+    'kiro-account-manager-1.8.5-x64-setup.exe.blockmap', 'latest.yml'
+  ])
+  const manualAssets = targets.filter(target => target.platform !== 'win32')
+    .flatMap(target => releaseArtifactNames({ ...stable, ...target }))
+  assert.deepEqual(manualAssets, [
+    'kiro-account-manager-1.8.5-x64-mac.dmg', 'kiro-account-manager-1.8.5-x64-mac.zip',
+    'kiro-account-manager-1.8.5-arm64-mac.dmg', 'kiro-account-manager-1.8.5-arm64-mac.zip',
+    'kiro-account-manager-1.8.5-x64-linux.AppImage', 'kiro-account-manager-1.8.5-x64-linux.deb'
+  ])
+  assert.ok(manualAssets.every(file => !/\.yml$|\.blockmap$/.test(file)))
 })
 
 test('checksum aggregation validates each payload and rejects extra assets before release', () => temporary(dist => {
+  assert.equal(releaseTargets(metadata.version).length, 4)
   for (const target of releaseTargets(metadata.version)) {
     for (const file of releaseArtifactNames({ ...metadata, ...target })) writeFileSync(join(dist, file), `synthetic payload: ${file}`)
     const result = run('release-checksums.mjs', ['--dist', dist, '--platform', target.platform, '--arch', target.arch])
@@ -42,11 +59,13 @@ test('checksum aggregation validates each payload and rejects extra assets befor
   let result = run('release-checksums.mjs', ['--all', '--dist', dist])
   assert.equal(result.status, 0, result.stderr)
   assert.ok(readFileSync(join(dist, 'SHA256SUMS.txt'), 'utf8').includes(metadata.version))
-  writeFileSync(join(dist, 'rc.yml'), 'unexpected updater metadata')
-  result = run('release-checksums.mjs', ['--all', '--dist', dist])
-  assert.notEqual(result.status, 0)
-  assert.match(result.stderr, /unexpected or missing assets/)
-  rmSync(join(dist, 'rc.yml'))
+  for (const unexpected of ['latest-mac.yml', 'latest-linux.yml', 'rc.yml']) {
+    writeFileSync(join(dist, unexpected), 'unexpected updater metadata')
+    result = run('release-checksums.mjs', ['--all', '--dist', dist])
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /unexpected or missing assets/)
+    rmSync(join(dist, unexpected))
+  }
   const artifact = releaseArtifactNames(metadata)[0]
   writeFileSync(join(dist, artifact), 'changed payload')
   result = run('release-checksums.mjs', ['--all', '--dist', dist])

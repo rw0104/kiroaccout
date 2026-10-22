@@ -69,7 +69,7 @@ assert.equal(updateConfig.repo, 'kiroaccout')
 for (const file of releaseArtifactNames({ ...metadata, platform, arch })) {
   assert.ok(statSync(join(dist, file)).size > 0, `Release artifact missing: ${file}`)
 }
-if (!metadata.version.includes('-')) {
+if (platform === 'win32' && !metadata.version.includes('-')) {
   const installer = `${metadata.name}-${metadata.version}-x64-setup.exe`
   const payload = readFileSync(join(dist, installer))
   validateStableManifest(yaml.load(readFileSync(join(dist, 'latest.yml'), 'utf8')), {

@@ -118,7 +118,7 @@ jobs:
           fi
           flags=(--latest=true)
           draft_flags=(--latest=false)
-          platforms="Windows x64"
+          platforms="Windows · macOS · Linux"
           if [[ "$PRERELEASE" == "true" ]]; then
             flags=(--latest=false --prerelease)
             draft_flags+=(--prerelease)
