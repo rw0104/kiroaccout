@@ -3,14 +3,8 @@ import { Button, Badge, Input } from '../ui'
 import { Trash2, RefreshCw, Download, Search, X, Copy, ChevronDown, ChevronUp, ChevronsDown, ArrowDown, Filter } from 'lucide-react'
 import { useTranslation } from '../../hooks/useTranslation'
 import { useVirtualizer } from '@tanstack/react-virtual'
-
-interface LogEntry {
-  timestamp: string
-  level: string
-  category: string
-  message: string
-  data?: unknown
-}
+import type { LogEntry } from '../../../../shared/logHistory'
+import { useProxyLogs } from '../../hooks/useProxyLogs'
 
 interface ProxyDetailedLogsDialogProps {
   open: boolean
@@ -92,15 +86,12 @@ function CustomDropdown({ value, options, onChange, placeholder, className }: Cu
 export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLogsDialogProps) {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
-  const [logs, setLogs] = useState<LogEntry[]>([])
-  const [loading, setLoading] = useState(false)
   const [searchText, setSearchText] = useState('')
   const [levelFilter, setLevelFilter] = useState<string>('all')
   const [categoryFilter, setCategoryFilter] = useState<string>('all')
   const [isAtBottom, setIsAtBottom] = useState(true)
   const [newLogCount, setNewLogCount] = useState(0)
   const [expandedLogs, setExpandedLogs] = useState<Set<number>>(new Set())
-  const prevLogCount = useRef(0)
   const [timeRange, setTimeRange] = useState<string>(() => {
     return localStorage.getItem('proxyLogs_timeRange') || 'all'
   })
@@ -108,41 +99,17 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
     return localStorage.getItem('proxyLogs_displayLimit') || 'all'
   })
   const scrollRef = useRef<HTMLDivElement>(null)
-  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null)
-
-  const loadLogs = useCallback(async () => {
-    try {
-      const result = await window.api.proxyGetLogs()
-      setLogs(result)
-    } catch (error) {
-      console.error('Failed to load logs:', error)
-    }
-  }, [])
+  // Search and export cover all bounded retained history; displayLimit applies
+  // only after filtering, as it did before incremental transport was introduced.
+  const { logs, loading, error: logError, received, refresh: loadLogs, clear } = useProxyLogs(open, 'all')
+  const prevReceived = useRef(0)
 
   useEffect(() => {
-    if (open) {
-      setLoading(true)
-      loadLogs().finally(() => setLoading(false))
-      
-      // 每 1.5 秒刷新一次
-      pollIntervalRef.current = setInterval(() => {
-        loadLogs().then(() => {
-          // 如果用户不在底部，累计新日志数
-          if (!isAtBottom && logs.length > prevLogCount.current) {
-            setNewLogCount(prev => prev + (logs.length - prevLogCount.current))
-          }
-          prevLogCount.current = logs.length
-        })
-      }, 1500)
-    }
-
-    return () => {
-      if (pollIntervalRef.current) {
-        clearInterval(pollIntervalRef.current)
-        pollIntervalRef.current = null
-      }
-    }
-  }, [open, loadLogs, isAtBottom, logs.length])
+    if (!open) { setExpandedLogs(new Set()); setNewLogCount(0); prevReceived.current = 0; return }
+    if (!isAtBottom && received > prevReceived.current) setNewLogCount(prev => prev + received - prevReceived.current)
+    if (received < prevReceived.current) { setExpandedLogs(new Set()); setNewLogCount(0) }
+    prevReceived.current = received
+  }, [open, received, isAtBottom])
 
   // 监听滚动位置判断是否在底部
   const handleScroll = useCallback(() => {
@@ -171,8 +138,9 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
 
   const handleClearLogs = async () => {
     try {
-      await window.api.proxyClearLogs()
-      setLogs([])
+      await clear()
+      setExpandedLogs(new Set())
+      setNewLogCount(0)
     } catch (error) {
       console.error('Failed to clear logs:', error)
     }
@@ -336,6 +304,7 @@ export function ProxyDetailedLogsDialog({ open, onOpenChange }: ProxyDetailedLog
         className="glass-card-strong rounded-2xl shadow-2xl max-w-[90vw] w-[1200px] h-[80vh] flex flex-col overflow-hidden animate-in zoom-in-95 duration-200"
         onClick={(e) => e.stopPropagation()}
       >
+        {logError && <p role="status" className="px-5 py-2 text-xs text-muted-foreground">{isEn ? 'Log updates are delayed. Existing logs remain available; retry after the current request finishes.' : '日志更新延迟，已有日志仍可查看；当前请求结束后可重试。'}</p>}
         {/* 标题栏 */}
         <div className="flex-shrink-0 flex items-center justify-between px-5 py-4 border-b border-border">
           <div className="flex items-center gap-3">

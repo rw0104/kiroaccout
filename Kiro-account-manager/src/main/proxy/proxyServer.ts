@@ -18,7 +18,8 @@ import type {
   TokenRefreshCallback
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
-import { callKiroApiStream, callKiroApi, fetchKiroModels, mapModelId, setModelContextWindow, type KiroModel } from './kiroApi'
+import { RequestAdmission, RequestAdmissionError, requiresRequestAdmission } from './requestAdmission'
+import { callKiroApiStream, callKiroApi, fetchKiroModels, mapModelId, setModelContextWindow, cleanupConversationCache, clearAllCaches, type KiroModel } from './kiroApi'
 import { proxyLogger } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
@@ -258,6 +259,7 @@ export class ProxyServer {
   private isHttps: boolean = false
   private isStopping: boolean = false
   private activeRequests: Set<AbortController> = new Set()
+  private requestAdmission = new RequestAdmission()
   private sockets: Set<Socket> = new Set()
   /** P1-7 按 API Key/IP 的滑动窗口限流（每分钟桶） */
   private rateLimitBuckets: Map<string, { count: number; windowStart: number }> = new Map()
@@ -355,6 +357,7 @@ export class ProxyServer {
       startTime: 0
     }
     this.events = events
+    this.requestAdmission.configure(this.config.maxConcurrent)
   }
 
   /**
@@ -395,6 +398,7 @@ export class ProxyServer {
 
     return new Promise((resolve, reject) => {
       this.isStopping = false
+      this.requestAdmission.open()
       const requestHandler = (req: http.IncomingMessage, res: http.ServerResponse) => 
         this.handleRequest(req, res)
 
@@ -565,6 +569,9 @@ export class ProxyServer {
    * - 同时停 fallback HTTP 服务器
    */
   async stop(gracefulMs: number = 5000): Promise<void> {
+    this.requestAdmission.close()
+    this.clearModelCache()
+    clearAllCaches()
     if (!this.server) {
       return
     }
@@ -623,6 +630,7 @@ export class ProxyServer {
     }
     this.appendAuditLog('config_changed', { fields: Object.keys(config), needsRestart: willRestart })
     this.config = { ...this.config, ...config, preferredEndpoint: 'runtime' }
+    this.requestAdmission.configure(this.config.maxConcurrent)
     // 同步账号选择策略到 accountPool
     if (config.accountSelectionStrategy !== undefined) {
       this.accountPool.setStrategy(this.config.accountSelectionStrategy || 'round-robin')
@@ -1027,6 +1035,18 @@ export class ProxyServer {
   // Catalogs are isolated by account, credential generation, profile and Region.
   clearModelCache(): void {
     this.modelCache.clear()
+    this.modelCacheBytes = 0
+    this.modelCacheGeneration++
+  }
+
+  private cleanupModelCache(now: number = Date.now()): void {
+    for (const [key, entry] of this.modelCache) {
+      if (now - entry.timestamp >= this.MODEL_CACHE_TTL) {
+        this.modelCache.delete(key)
+        this.modelCacheBytes -= entry.bytes
+      }
+    }
+    this.modelCacheBytes = Math.max(0, this.modelCacheBytes)
   }
 
   private modelCacheKey(account: ProxyAccount): string {
@@ -1038,17 +1058,37 @@ export class ProxyServer {
   private async loadModelCatalog(account: ProxyAccount, signal?: AbortSignal): Promise<{ models: KiroModel[]; fromCache: boolean }> {
     this.throwIfAborted(signal)
     const key = this.modelCacheKey(account)
-    const cached = this.modelCache.get(key)
     const now = Date.now()
-    if (cached && now - cached.timestamp < this.MODEL_CACHE_TTL) return { models: cached.models, fromCache: true }
+    this.cleanupModelCache(now)
+    const cached = this.modelCache.get(key)
+    if (cached) {
+      this.modelCache.delete(key)
+      this.modelCache.set(key, cached)
+      return { models: cached.models, fromCache: true }
+    }
+    const generation = this.modelCacheGeneration
     const models = await fetchKiroModels(account, signal)
     this.throwIfAborted(signal)
-    // Cache a successful empty response too; errors never produce a catalog.
-    for (const [oldKey, entry] of this.modelCache) {
-      if (now - entry.timestamp >= this.MODEL_CACHE_TTL) this.modelCache.delete(oldKey)
+    // The budget measures serialized UTF-8 bytes, including metadata and schema,
+    // rather than directory count or JS character count. Oversized catalogs are
+    // returned intact to the caller and simply bypass the cache.
+    const bytes = Buffer.byteLength(JSON.stringify(models), 'utf8') + Buffer.byteLength(key, 'utf8')
+    if (generation === this.modelCacheGeneration && bytes <= this.MODEL_CACHE_BYTE_LIMIT) {
+      this.cleanupModelCache()
+      const replaced = this.modelCache.get(key)
+      if (replaced) {
+        this.modelCacheBytes -= replaced.bytes
+        this.modelCache.delete(key)
+      }
+      while (this.modelCache.size >= this.MODEL_CACHE_MAX || this.modelCacheBytes + bytes > this.MODEL_CACHE_BYTE_LIMIT) {
+        const oldest = this.modelCache.entries().next().value
+        if (!oldest) break
+        this.modelCache.delete(oldest[0])
+        this.modelCacheBytes -= oldest[1].bytes
+      }
+      this.modelCache.set(key, { models, timestamp: Date.now(), bytes })
+      this.modelCacheBytes += bytes
     }
-    if (this.modelCache.size >= 100) this.modelCache.delete(this.modelCache.keys().next().value!)
-    this.modelCache.set(key, { models, timestamp: now })
     for (const model of filterAvailableModels(models)) {
       if (model.tokenLimits?.maxInputTokens) setModelContextWindow(model.modelId, model.tokenLimits.maxInputTokens)
     }
@@ -1750,6 +1790,7 @@ export class ProxyServer {
     const method = req.method || 'GET'
     const clientIP = this.getClientIP(req)
     const controller = new AbortController()
+    let releaseAdmission: (() => void) | undefined
     const abortRequest = () => {
       if (!this.isStopping && res.writableEnded) return
       if (!controller.signal.aborted) {
@@ -1817,6 +1858,14 @@ export class ProxyServer {
 
       // 路由（移除查询参数）
       const pathWithoutQuery = path.split('?')[0]
+      if (requiresRequestAdmission(method, pathWithoutQuery)) {
+        // Pause before waiting: queued requests must not accumulate parsed body
+        // buffers. readBody resumes only after all of its listeners are ready.
+        req.pause()
+        this.requestAdmission.configure(this.config.maxConcurrent)
+        releaseAdmission = await this.requestAdmission.acquire(controller.signal)
+        if (controller.signal.aborted) throw this.getAbortError(controller.signal)
+      }
       
       if (pathWithoutQuery === '/v1/models' || pathWithoutQuery === '/models') {
         await this.handleModels(res, controller.signal)
@@ -1858,6 +1907,12 @@ export class ProxyServer {
         proxyLogger.info('ProxyServer', `Request aborted: ${method} ${path}`)
         return
       }
+      if (error instanceof RequestAdmissionError) {
+        res.setHeader('Retry-After', '1')
+        res.setHeader('Connection', 'close')
+        this.sendError(res, 503, error.message, this.isAnthropicPath(path) ? 'anthropic' : 'openai', false)
+        return
+      }
       // P0-1 body 超限 → 413
       if (error instanceof BodyTooLargeError) {
         proxyLogger.warn('ProxyServer', `Body too large from ${clientIP}: ${error.received}/${error.limit} bytes (${path})`)
@@ -1870,6 +1925,7 @@ export class ProxyServer {
       this.sendError(res, 500, 'Internal server error', this.isAnthropicPath(path) ? 'anthropic' : 'openai')
       this.events.onError?.(error as Error)
     } finally {
+      releaseAdmission?.()
       req.off('aborted', abortRequest)
       res.off('close', abortRequest)
       this.activeRequests.delete(controller)
@@ -1918,8 +1974,9 @@ export class ProxyServer {
       this.handleAdminLogs(res)
     } else if (path === '/admin/cache/clear' && method === 'POST') {
       // 清除内存缓存（conversationId 映射、模型缓存、prompt cache）
-      const { clearAllCaches } = require('./kiroApi')
       const cleared = clearAllCaches()
+      cleared.model = this.modelCache.size
+      this.clearModelCache()
       const promptCacheCleared = promptCacheTracker.clear()
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ success: true, cleared: { ...cleared, promptCache: promptCacheCleared } }))
@@ -2277,7 +2334,11 @@ export class ProxyServer {
   }
 
   // 模型列表缓存
-  private modelCache = new Map<string, { models: KiroModel[]; timestamp: number }>()
+  private modelCache = new Map<string, { models: KiroModel[]; timestamp: number; bytes: number }>()
+  private modelCacheBytes = 0
+  private modelCacheGeneration = 0
+  private readonly MODEL_CACHE_MAX = 100
+  private readonly MODEL_CACHE_BYTE_LIMIT = 16 * 1024 * 1024
   private readonly MODEL_CACHE_TTL = 5 * 60 * 1000 // 5 分钟缓存
 
   // Steering 文件缓存（从 config.workspacePath 加载）
@@ -2648,7 +2709,6 @@ export class ProxyServer {
     const id = streamId || `chatcmpl-${uuidv4()}`
     let toolCallIndex = 0
     const pendingToolCalls: Map<string, { index: number; name: string; arguments: string }> = new Map()
-    let collectedContent = ''
     // 发送初始 chunk（仅首轮）
     if (currentRound === 0) {
       const initialChunk = createOpenaiStreamChunk(id, model, { role: 'assistant' })
@@ -2668,7 +2728,6 @@ export class ProxyServer {
               res.write(`data: ${JSON.stringify(chunk)}\n\n`)
             } else {
               // 普通文本内容
-              collectedContent += text
               const chunk = createOpenaiStreamChunk(id, model, { content: text })
               res.write(`data: ${JSON.stringify(chunk)}\n\n`)
             }
@@ -2949,7 +3008,6 @@ export class ProxyServer {
     let hasStartedTextBlock = false
     let hasStartedThinkingBlock = false
     let pendingThinkingSignature: string | undefined
-    let collectedContent = ''
     const pendingToolCalls: Map<string, { name: string; input: Record<string, unknown> }> = new Map()
 
     const flushThinkingSignature = () => {
@@ -3047,7 +3105,6 @@ export class ProxyServer {
                 currentBlockIndex++
                 hasStartedThinkingBlock = false
               }
-              collectedContent += text
               if (!hasStartedTextBlock) {
                 const blockStart = createClaudeStreamEvent('content_block_start', {
                   index: currentBlockIndex,
@@ -3295,19 +3352,20 @@ export class ProxyServer {
       req.on('error', onError)
       req.on('aborted', onAborted)
       signal?.addEventListener('abort', onAbort, { once: true })
+      req.resume()
     })
   }
 
   // 发送错误响应
   // P0-5 自动 sanitize：500 类不吐 message 详情；4xx 客户端错误正常返回
-  private sendError(res: http.ServerResponse, status: number, message: string, format: 'openai' | 'anthropic' = 'openai'): void {
+  private sendError(res: http.ServerResponse, status: number, message: string, format: 'openai' | 'anthropic' = 'openai', notifyQuotaExhausted: boolean = true): void {
     if (res.writableEnded || res.destroyed) return
     // 500-599 强制使用通用消息（防止泄露内部信息）
     const safeMessage = status >= 500 && status < 600
       ? this.sanitizeErrorMessage(message) || 'Internal server error'
       : message
     // P1-6 503 → 触发 webhook（已有 5 分钟去重）
-    if (status === 503) {
+    if (status === 503 && notifyQuotaExhausted) {
       this.notifyAllAccountsExhausted('unknown')
     }
     res.writeHead(status, { 'Content-Type': 'application/json' })
@@ -3368,6 +3426,8 @@ export class ProxyServer {
   /** 定期清理过期的限流桶 / 会话粘性条目（避免内存泄漏） */
   private cleanupExpiredCaches(): void {
     const now = Date.now()
+    cleanupConversationCache(now)
+    this.cleanupModelCache(now)
     // 限流桶过期 2 分钟
     for (const [key, bucket] of this.rateLimitBuckets) {
       if (now - bucket.windowStart > 120_000) this.rateLimitBuckets.delete(key)
@@ -3388,7 +3448,8 @@ export class ProxyServer {
    */
   private pickAccountWithAffinity(sessionHint: string | undefined): ProxyAccount | null {
     if (!this.config.sessionAffinityEnabled || !sessionHint) return null
-    const entry = this.sessionAffinity.get(sessionHint)
+    const key = crypto.createHash('sha256').update(sessionHint).digest('hex')
+    const entry = this.sessionAffinity.get(key)
     if (entry) {
       const account = this.accountPool.getAccount(entry.accountId)
       // 校验账号仍可用且未被封禁
@@ -3397,7 +3458,7 @@ export class ProxyServer {
         return account
       }
       // 已失效 → 清掉粘性
-      this.sessionAffinity.delete(sessionHint)
+      this.sessionAffinity.delete(key)
     }
     return null
   }
@@ -3405,7 +3466,8 @@ export class ProxyServer {
   /** 记录粘性映射 */
   private rememberAffinity(sessionHint: string | undefined, accountId: string): void {
     if (!this.config.sessionAffinityEnabled || !sessionHint) return
-    this.sessionAffinity.set(sessionHint, { accountId, lastAt: Date.now() })
+    const key = crypto.createHash('sha256').update(sessionHint).digest('hex')
+    this.sessionAffinity.set(key, { accountId, lastAt: Date.now() })
   }
 
   /** P2-17 审计日志 */

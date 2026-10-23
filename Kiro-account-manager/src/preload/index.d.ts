@@ -1,4 +1,6 @@
 import type { AccountModelInfo } from '../shared/modelCatalog'
+import type { LogPage } from '../shared/logHistory'
+import type { WindowVisibilityState } from '../shared/windowVisibility'
 import type { AppUpdateState, UpdateActionResult } from '../main/appUpdater'
 import type { LoginResult, SocialLoginCallback } from '../main/loginSessions'
 import type { KiroInstancesApi } from '../shared/kiroInstances'
@@ -148,6 +150,8 @@ interface StatusResult {
 }
 
 interface KiroApi {
+  getWindowVisibility: () => Promise<WindowVisibilityState>
+  onWindowVisibilityChanged: (callback: (state: WindowVisibilityState) => void) => () => void
   openExternal: (url: string, usePrivateMode?: boolean) => void
   getAppVersion: () => Promise<string>
   onAuthCallback: (callback: (data: { code: string; state: string }) => void) => () => void
@@ -559,6 +563,7 @@ interface KiroApi {
   proxyResetRequestStats: () => Promise<{ success: boolean }>
 
   // 获取反代详细日志
+  proxyGetLogPage: (cursor?: string, limit?: number) => Promise<LogPage>
   proxyGetLogs: (count?: number) => Promise<Array<{ timestamp: string; level: string; category: string; message: string; data?: unknown }>>
 
   // 清除反代详细日志

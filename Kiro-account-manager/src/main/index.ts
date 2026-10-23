@@ -45,6 +45,7 @@ import { parseAccountUsage, normalizeUsageDate, type ParsedAccountUsage } from '
 import { normalizeSubscriptionType } from '../shared/accountSubscription'
 import { requestControlPlane } from './kiroControlPlane'
 import { SwitchHandoffStore } from './switchHandoff'
+import { trackWindowVisibility } from './windowVisibility'
 import { filterAvailableModels, toAccountModel } from '../shared/modelCatalog'
 import { normalizeProvider, resolveIdentity } from '../shared/authIdentity'
 import { AppUpdateController, UpdatePreparationError, type UpdatePreparationErrorCode, type AppUpdateState, type UpdateEngine } from './appUpdater'
@@ -1789,6 +1790,7 @@ async function flushBackupNow(): Promise<void> {
 }
 
 let mainWindow: BrowserWindow | null = null
+let mainWindowVisibility: ReturnType<typeof trackWindowVisibility> | null = null
 
 // ============ Kiro IDE Auth 同步状态 ============
 // 账号管理器上一次写入 kiro-auth-token.json 时对应的 accountId，watcher 反向同步时优先用它
@@ -2136,6 +2138,8 @@ function createWindow(): void {
   })
 
   // ============ 自定义 titlebar IPC ============
+  mainWindowVisibility?.dispose()
+  mainWindowVisibility = trackWindowVisibility(mainWindow)
   mainWindow.on('maximize', () => mainWindow?.webContents.send('window-maximize-changed', true))
   mainWindow.on('unmaximize', () => mainWindow?.webContents.send('window-maximize-changed', false))
 
@@ -2309,6 +2313,8 @@ function createWindow(): void {
   })
 
   mainWindow.on('closed', () => {
+    mainWindowVisibility?.dispose()
+    mainWindowVisibility = null
     mainWindow = null
   })
 
@@ -2497,6 +2503,7 @@ app.whenReady().then(async () => {
   })
   ipcMain.on('window-close', () => mainWindow?.close())
   ipcMain.handle('window-is-maximized', () => !!mainWindow?.isMaximized())
+  ipcMain.handle('window-get-visibility', () => mainWindowVisibility?.getSnapshot() ?? { visible: false, revision: 0 })
   ipcMain.handle('window-get-platform', () => process.platform)
 
   // IPC: 获取显示主窗口快捷键
@@ -5394,6 +5401,9 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 获取反代日志
+  ipcMain.handle('proxy-get-log-page', (_event, cursor?: string, limit?: number) => {
+    return proxyLogStore.getPage(cursor, limit)
+  })
   ipcMain.handle('proxy-get-logs', (_event, count?: number) => {
     if (count) {
       return proxyLogStore.getLast(count)

@@ -88,6 +88,31 @@ type TasksStore = TasksState & TasksActions
 const STORAGE_KEY = 'kiro-task-history'
 const MAX_PERSISTED = 200  // 最多持久化最近 200 条已完成任务
 
+function retainTaskHistory(tasks: Map<string, TaskEntry>): Map<string, TaskEntry> {
+  const active = new Map<string, TaskEntry>()
+  const finished: TaskEntry[] = []
+  for (const task of tasks.values()) {
+    if (task.status === 'running' || task.status === 'paused') active.set(task.id, task)
+    else {
+      // Terminal controls must not keep the registration page/Fiber reachable.
+      const { onCancel, onPause, onResume, ...entry } = task
+      void onCancel; void onPause; void onResume
+      finished.push(entry)
+    }
+  }
+  // Reverse provides newest insertion first when several completions share a millisecond.
+  finished.reverse().sort((a, b) => b.updatedAt - a.updatedAt)
+  for (const task of finished.slice(0, MAX_PERSISTED)) active.set(task.id, task)
+  // Preserve the original insertion order for the next tie-break. Returning the
+  // sorted history would reverse equal timestamps again on every state update.
+  const retained = new Map<string, TaskEntry>()
+  for (const id of tasks.keys()) {
+    const task = active.get(id)
+    if (task) retained.set(id, task)
+  }
+  return retained
+}
+
 /** 持久化任务（仅完成的任务，运行中任务不存） */
 function persistTasks(tasks: Map<string, TaskEntry>): void {
   try {
@@ -115,7 +140,7 @@ function loadPersistedTasks(): Map<string, TaskEntry> {
       const status: TaskStatus = (t.status === 'running' || t.status === 'paused') ? 'cancelled' : t.status
       map.set(t.id, { ...t, status })
     }
-    return map
+    return retainTaskHistory(map)
   } catch {
     return new Map()
   }
@@ -149,7 +174,7 @@ export const useTaskStore = create<TasksStore>()((set, get) => ({
     set((state) => {
       const next = new Map(state.tasks)
       next.set(id, entry)
-      return { tasks: next }
+      return { tasks: retainTaskHistory(next) }
     })
     return id
   },
@@ -160,7 +185,7 @@ export const useTaskStore = create<TasksStore>()((set, get) => ({
       const existing = next.get(id)
       if (!existing) return state
       next.set(id, { ...existing, ...updates, updatedAt: Date.now() })
-      return { tasks: next }
+      return { tasks: retainTaskHistory(next) }
     })
   },
 
@@ -184,7 +209,7 @@ export const useTaskStore = create<TasksStore>()((set, get) => ({
         finishedAt: Date.now(),
         updatedAt: Date.now()
       })
-      return { tasks: next }
+      return { tasks: retainTaskHistory(next) }
     })
     persistTasks(get().tasks)
   },
@@ -201,7 +226,7 @@ export const useTaskStore = create<TasksStore>()((set, get) => ({
         finishedAt: Date.now(),
         updatedAt: Date.now()
       })
-      return { tasks: next }
+      return { tasks: retainTaskHistory(next) }
     })
     persistTasks(get().tasks)
   },
@@ -219,7 +244,7 @@ export const useTaskStore = create<TasksStore>()((set, get) => ({
         finishedAt: Date.now(),
         updatedAt: Date.now()
       })
-      return { tasks: next }
+      return { tasks: retainTaskHistory(next) }
     })
     persistTasks(get().tasks)
   },

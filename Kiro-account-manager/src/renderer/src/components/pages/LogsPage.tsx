@@ -3,14 +3,8 @@ import { Trash2, Download, RefreshCw, Search, Filter, ArrowDown, ChevronsDown, A
 import { Button, Badge, Input } from '../ui'
 import { useTranslation } from '../../hooks/useTranslation'
 import { useVirtualizer } from '@tanstack/react-virtual'
-
-interface LogEntry {
-  timestamp: string
-  level: 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
-  category: string
-  message: string
-  data?: unknown
-}
+import type { LogEntry } from '../../../../shared/logHistory'
+import { useProxyLogs } from '../../hooks/useProxyLogs'
 
 type LogLevel = 'ALL' | 'DEBUG' | 'INFO' | 'WARN' | 'ERROR'
 
@@ -46,8 +40,6 @@ const LEVEL_BTN_ACTIVE: Record<string, string> = {
 export function LogsPage() {
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
-  const [logs, setLogs] = useState<LogEntry[]>([])
-  const [totalCount, setTotalCount] = useState(0)
   const [filter, setFilter] = useState('')
   const [levelFilter, setLevelFilter] = useState<LogLevel>('ALL')
   const [categoryFilter, setCategoryFilter] = useState('all')
@@ -57,41 +49,17 @@ export function LogsPage() {
     return localStorage.getItem('systemLogs_displayLimit') || '5000'
   })
   const [isAtBottom, setIsAtBottom] = useState(true)
-  const [isLoading, setIsLoading] = useState(false)
   const [expandedIdx, setExpandedIdx] = useState<number | null>(null)
   const [newLogCount, setNewLogCount] = useState(0)
   const containerRef = useRef<HTMLDivElement>(null)
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const prevLogCount = useRef(0)
-
-  const fetchLogs = useCallback(async () => {
-    try {
-      const fetchCount = displayLimit === 'all' ? undefined : parseInt(displayLimit) || undefined
-      const [allLogs, count] = await Promise.all([
-        window.api.proxyGetLogs(fetchCount),
-        window.api.proxyGetLogsCount()
-      ])
-      const newLogs = allLogs as LogEntry[]
-      setLogs(newLogs)
-      setTotalCount(count)
-      // 如果用户不在底部，累计新日志数
-      if (!isAtBottom && newLogs.length > prevLogCount.current) {
-        setNewLogCount(prev => prev + (newLogs.length - prevLogCount.current))
-      }
-      prevLogCount.current = newLogs.length
-    } catch {
-      // ignore
-    }
-  }, [isAtBottom, displayLimit])
+  const { logs, total: totalCount, loading: isLoading, error: logError, received, refresh: fetchLogs, clear } = useProxyLogs(true, displayLimit)
+  const prevReceived = useRef(0)
 
   useEffect(() => {
-    setIsLoading(true)
-    fetchLogs().finally(() => setIsLoading(false))
-    pollRef.current = setInterval(fetchLogs, 1500)
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current)
-    }
-  }, [fetchLogs])
+    if (!isAtBottom && received > prevReceived.current) setNewLogCount(prev => prev + received - prevReceived.current)
+    if (received < prevReceived.current) setNewLogCount(0)
+    prevReceived.current = received
+  }, [received, isAtBottom])
 
   // 持久化 displayLimit
   useEffect(() => {
@@ -123,10 +91,9 @@ export function LogsPage() {
   }
 
   const handleClear = async () => {
-    await window.api.proxyClearLogs()
-    setLogs([])
-    setTotalCount(0)
+    await clear()
     setNewLogCount(0)
+    setExpandedIdx(null)
   }
 
   const handleExport = () => {
@@ -186,6 +153,7 @@ export function LogsPage() {
 
   return (
     <div className="h-full flex flex-col p-4 gap-2">
+      {logError && <p role="status" className="text-xs text-muted-foreground">{isEn ? 'Log updates are delayed. Existing logs remain available; retry after the current request finishes.' : '日志更新延迟，已有日志仍可查看；当前请求结束后可重试。'}</p>}
       {/* 工具栏 */}
       <div className="flex items-center gap-2 flex-shrink-0">
         <div className="flex items-center gap-2 flex-1">

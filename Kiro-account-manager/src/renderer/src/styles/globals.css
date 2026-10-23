@@ -928,6 +928,13 @@ body {
   opacity: 0.22;
   filter: blur(100px);
 }
+/* Native hide/minimize is separate from document.hidden when background
+   business timers remain enabled. Release decoration layers while in the tray. */
+html[data-window-active='false'] .ambient-bg::before,
+html[data-window-active='false'] .ambient-bg::after {
+  content: none;
+  animation: none;
+}
 /* 主壳内容需要 z-index 浮在 ambient 上 */
 .ambient-bg > * {
   position: relative;

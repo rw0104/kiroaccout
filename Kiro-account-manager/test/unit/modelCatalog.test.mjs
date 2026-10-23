@@ -106,14 +106,15 @@ test('only explicitly unavailable, retired, or wrong-origin records are filtered
 function serverHarness(fetcher) {
   const tree = sourceTree('main/proxy/proxyServer.ts')
   const declaration = tree.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === 'ProxyServer')
-  const names = ['clearModelCache', 'modelCacheKey', 'loadModelCatalog', 'getThinkingConfig', 'getAvailableModels', 'handleModels', 'handleApiError']
+  const names = ['clearModelCache', 'cleanupModelCache', 'modelCacheKey', 'loadModelCatalog', 'getThinkingConfig', 'getAvailableModels', 'handleModels', 'handleApiError']
   const members = declaration.members.filter(node => names.includes(node.name?.getText(tree))).map(node => node.getText(tree)).join('\n')
   const functions = tree.statements.filter(node => ts.isFunctionDeclaration(node)).map(node => node.getText(tree)).join('\n')
-  const context = vm.createContext({ crypto, extractThinkingSchema, filterAvailableModels, modelUnavailableReason, toAccountModel, ModelRequestError,
+  const context = vm.createContext({ crypto, Buffer, extractThinkingSchema, filterAvailableModels, modelUnavailableReason, toAccountModel, ModelRequestError,
     mapModelId: id => id, fetchKiroModels: fetcher, setModelContextWindow() {}, classifyError: () => 'other', console, Map, Set, Error })
   execute(`${functions}\nclass Subject { ${members} }; globalThis.Subject=Subject`, context)
   const server = new context.Subject()
   server.modelCache = new Map(); server.MODEL_CACHE_TTL = 300000
+  server.modelCacheBytes = 0; server.modelCacheGeneration = 0; server.MODEL_CACHE_MAX = 100; server.MODEL_CACHE_BYTE_LIMIT = 16 * 1024 * 1024
   server.throwIfAborted = () => {}; server.throwIfResponseClosed = () => {}; server.isAbortError = () => false
   server.isResponseClosed = () => false; server.isAnthropicPath = () => false
   server.recordRequestFailed = () => {}; server.recordRequest = () => {}; server.events = {}

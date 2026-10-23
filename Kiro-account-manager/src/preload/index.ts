@@ -1,4 +1,6 @@
 import type { AccountModelInfo } from '../shared/modelCatalog'
+import type { LogPage } from '../shared/logHistory'
+import type { WindowVisibilityState } from '../shared/windowVisibility'
 import type { AppUpdateState, UpdateActionResult } from '../main/appUpdater'
 import type { LoginResult, SocialLoginCallback } from '../main/loginSessions'
 import { KIRO_INSTANCE_CHANNELS, type KiroInstancesApi } from '../shared/kiroInstances'
@@ -7,6 +9,12 @@ import { electronAPI } from '@electron-toolkit/preload'
 
 // Custom APIs for renderer
 const api = {
+  getWindowVisibility: (): Promise<WindowVisibilityState> => ipcRenderer.invoke('window-get-visibility'),
+  onWindowVisibilityChanged: (callback: (state: WindowVisibilityState) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, state: WindowVisibilityState): void => callback(state)
+    ipcRenderer.on('window-visibility-changed', handler)
+    return () => { ipcRenderer.removeListener('window-visibility-changed', handler) }
+  },
   // 打开外部链接
   openExternal: (url: string, usePrivateMode?: boolean): void => {
     ipcRenderer.send('open-external', url, usePrivateMode)
@@ -524,6 +532,7 @@ const api = {
   },
 
   // 获取反代详细日志
+  proxyGetLogPage: (cursor?: string, limit?: number): Promise<LogPage> => ipcRenderer.invoke('proxy-get-log-page', cursor, limit),
   proxyGetLogs: (count?: number): Promise<Array<{ timestamp: string; level: string; category: string; message: string; data?: unknown }>> => {
     return ipcRenderer.invoke('proxy-get-logs', count)
   },

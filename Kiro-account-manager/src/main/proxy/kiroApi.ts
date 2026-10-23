@@ -1,5 +1,6 @@
 // Kiro API 调用核心模块
 import { v4 as uuidv4 } from 'uuid'
+import { createHash } from 'crypto'
 import { fetch as undiciFetch, type RequestInit as UndiciRequestInit, type Dispatcher } from 'undici'
 import type {
   KiroPayload,
@@ -1004,28 +1005,44 @@ const conversationCache = new Map<string, { id: string; timestamp: number }>()
 const CONVERSATION_CACHE_TTL = 2 * 60 * 60 * 1000 // 2 小时
 const CONVERSATION_CACHE_MAX = 1000
 
+export function cleanupConversationCache(now: number = Date.now()): number {
+  let removed = 0
+  for (const [key, entry] of conversationCache) {
+    if (now - entry.timestamp >= CONVERSATION_CACHE_TTL) {
+      conversationCache.delete(key)
+      removed++
+    }
+  }
+  while (conversationCache.size > CONVERSATION_CACHE_MAX) {
+    conversationCache.delete(conversationCache.keys().next().value!)
+    removed++
+  }
+  return removed
+}
+
 function resolveConversationId(history: KiroHistoryMessage[], sessionHint?: string): string {
   // sessionHint 已包含 API Key hash 前缀（由 proxyServer 注入），天然隔离不同用户
-  const key = sessionHint || fingerprintFromHistory(history)
-  if (!key) return uuidv4()
+  const hint = typeof sessionHint === 'string' && sessionHint.length > 0 ? sessionHint : undefined
+  const source = hint || fingerprintFromHistory(history)
+  if (!source) return uuidv4()
+  // Hash the entire identity, including its namespace, instead of retaining an
+  // arbitrarily large body field or truncating distinct sessions to one prefix.
+  const key = createHash('sha256').update(hint ? 'hint:' : 'history:').update(source).digest('hex')
 
   const now = Date.now()
+  cleanupConversationCache(now)
   const cached = conversationCache.get(key)
   if (cached) {
     cached.timestamp = now
+    conversationCache.delete(key)
+    conversationCache.set(key, cached)
     return cached.id
-  }
-
-  // 清理过期缓存
-  if (conversationCache.size > CONVERSATION_CACHE_MAX) {
-    const cutoff = now - CONVERSATION_CACHE_TTL
-    for (const [k, v] of conversationCache) {
-      if (v.timestamp < cutoff) conversationCache.delete(k)
-    }
   }
 
   const id = uuidv4()
   conversationCache.set(key, { id, timestamp: now })
+  // Map insertion order is the access order: hits move to the end above.
+  while (conversationCache.size > CONVERSATION_CACHE_MAX) conversationCache.delete(conversationCache.keys().next().value!)
   return id
 }
 

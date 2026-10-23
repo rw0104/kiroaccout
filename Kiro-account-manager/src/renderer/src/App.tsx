@@ -8,6 +8,7 @@ import { UpdateDialog } from './components/UpdateDialog'
 import { KiroInstancesPanel } from './components/kiro/KiroInstancesPanel'
 import { CloseConfirmDialog } from './components/CloseConfirmDialog'
 import { useAccountsStore, isBannedAccountError } from './store/accounts'
+import { useWindowVisibility } from './hooks/useWindowVisibility'
 
 // 托盘信息防抖延迟：后台刷新风暴时合并多次跨进程 IPC 为单次
 const TRAY_UPDATE_DEBOUNCE_MS = 400
@@ -15,6 +16,11 @@ const TRAY_UPDATE_DEBOUNCE_MS = 400
 const BACKGROUND_RESULT_FLUSH_MS = 120
 
 function App(): React.JSX.Element {
+  const isWindowVisible = useWindowVisibility()
+  useEffect(() => {
+    document.documentElement.dataset.windowActive = String(isWindowVisible)
+    return () => { delete document.documentElement.dataset.windowActive }
+  }, [isWindowVisible])
   const [currentPage, setCurrentPage] = useState<PageType>('home')
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true)
 
