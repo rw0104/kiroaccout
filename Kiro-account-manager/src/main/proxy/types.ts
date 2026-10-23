@@ -15,6 +15,7 @@ export interface OpenAIChatRequest {
   metadata?: Record<string, unknown>
   kiro_context?: KiroRequestContext
   reasoning_effort?: 'low' | 'medium' | 'high' | 'max' | string
+  reasoning?: { effort?: string }
   thinking?: { type: 'enabled'; budget_tokens?: number } | { type: 'adaptive' } | { type: 'disabled' }
 }
 

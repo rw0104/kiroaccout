@@ -18,7 +18,7 @@ import type {
   TokenRefreshCallback
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
-import { callKiroApiStream, callKiroApi, fetchKiroModels, setModelContextWindow, type KiroModel } from './kiroApi'
+import { callKiroApiStream, callKiroApi, fetchKiroModels, mapModelId, setModelContextWindow, type KiroModel } from './kiroApi'
 import { proxyLogger } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
 import {
@@ -32,6 +32,7 @@ import {
   responsesToOpenAIChat,
   openAIChatToResponsesResponse
 } from './translator'
+import { extractThinkingSchema, filterAvailableModels, modelUnavailableReason, toAccountModel, ModelRequestError } from '../../shared/modelCatalog'
 import { ToolNameRegistry } from './toolNameRegistry'
 import { promptCacheTracker } from './promptCacheTracker'
 import { loadSteeringDocuments, formatSteeringForPrompt, type SteeringDocument } from './steeringLoader'
@@ -94,7 +95,12 @@ type ClientModel = {
   thinkingEfforts?: string[]
   thinkingSchemaPath?: 'output_config' | 'reasoning'
   supportsPromptCaching?: boolean
-  modelProvider?: string
+  modelProvider?: string | null
+  promptCaching?: KiroModel['promptCaching']
+  additionalModelRequestFieldsSchema?: KiroModel['additionalModelRequestFieldsSchema']
+  status?: string | null
+  availableOrigins?: string[] | null
+  defaultThinkingEffort?: string
   permission: unknown[]
   root: string
   parent: null
@@ -151,29 +157,6 @@ function modelCapabilityMap(modalities: ModelModality[]): Record<ModelModality, 
   }
 }
 
-function extractThinkingSchema(schema?: Record<string, unknown> | null): { efforts?: string[]; schemaPath?: 'output_config' | 'reasoning' } | undefined {
-  if (!schema) return undefined
-  const props = schema.properties as Record<string, unknown> | undefined
-  if (!props) return undefined
-  // output_config 路径（Claude 4.6+ 新模型）
-  if (props.output_config) {
-    const effortField = (props.output_config as Record<string, unknown>)?.properties as Record<string, unknown> | undefined
-    const effortEnum = (effortField?.effort as Record<string, unknown> | undefined)?.enum as string[] | undefined
-    if (effortEnum && effortEnum.length > 0) {
-      return { efforts: effortEnum, schemaPath: 'output_config' }
-    }
-  }
-  // reasoning 路径（备用）
-  if (props.reasoning) {
-    const reasoningProps = (props.reasoning as Record<string, unknown>)?.properties as Record<string, unknown> | undefined
-    const effortEnum = (reasoningProps?.effort as Record<string, unknown> | undefined)?.enum as string[] | undefined
-    if (effortEnum && effortEnum.length > 0) {
-      return { efforts: effortEnum, schemaPath: 'reasoning' }
-    }
-  }
-  return undefined
-}
-
 function buildClientModel(input: {
   id: string
   created: number
@@ -188,13 +171,16 @@ function buildClientModel(input: {
   promptCaching?: { supportsPromptCaching: boolean; maximumCacheCheckpointsPerRequest?: number | null; minimumTokensPerCacheCheckpoint?: number | null } | null
   additionalModelRequestFieldsSchema?: Record<string, unknown> | null
   modelProvider?: string | null
+  status?: string | null
+  availableOrigins?: string[] | null
 }): ClientModel {
   const name = modelDisplayName(input.id, input.modelName)
   const inputModalities = modelInputModalities(input.supportedInputTypes)
   const outputModalities: ModelModality[] = ['text']
   const output = modelOutputLimit(input.id, input.maxOutputTokens)
   const context = typeof input.maxInputTokens === 'number' && input.maxInputTokens > 0 ? input.maxInputTokens : 200000
-  const hasThinking = !!(input.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.thinking || !!(input.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.output_config
+  const thinking = extractThinkingSchema(input.additionalModelRequestFieldsSchema)
+  const hasThinking = !!thinking
   const reasoning = hasThinking
   const interleaved = hasThinking ? { field: 'reasoning_content' as const } : false
 
@@ -236,11 +222,16 @@ function buildClientModel(input: {
     inputTypes: input.supportedInputTypes,
     rateMultiplier: input.rateMultiplier,
     rateUnit: input.rateUnit,
-    supportsThinking: !!(input.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.thinking || !!(input.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.output_config,
-    thinkingEfforts: extractThinkingSchema(input.additionalModelRequestFieldsSchema)?.efforts,
-    thinkingSchemaPath: extractThinkingSchema(input.additionalModelRequestFieldsSchema)?.schemaPath,
+    supportsThinking: hasThinking,
+    thinkingEfforts: thinking?.efforts,
+    thinkingSchemaPath: thinking?.schemaPath,
+    defaultThinkingEffort: thinking?.defaultEffort,
     supportsPromptCaching: input.promptCaching?.supportsPromptCaching || false,
-    modelProvider: input.modelProvider || undefined,
+    modelProvider: input.modelProvider,
+    promptCaching: input.promptCaching,
+    additionalModelRequestFieldsSchema: input.additionalModelRequestFieldsSchema,
+    status: input.status,
+    availableOrigins: input.availableOrigins,
     permission: [],
     root: input.id,
     parent: null
@@ -1033,89 +1024,55 @@ export class ProxyServer {
     ])
   }
 
-  // 清除模型缓存，强制下次请求重新获取
+  // Catalogs are isolated by account, credential generation, profile and Region.
   clearModelCache(): void {
-    this.modelCache = null
-    console.log('[ProxyServer] Model cache cleared')
+    this.modelCache.clear()
   }
 
-  // 从模型缓存查找指定模型的 thinking 配置
-  private getThinkingConfig(modelId: string): ThinkingConfig | undefined {
-    if (!this.modelCache) return undefined
-    const lower = modelId.toLowerCase()
-    const model = this.modelCache.models.find(m => m.modelId.toLowerCase() === lower)
-    if (!model) return undefined
-    const schema = extractThinkingSchema(model.additionalModelRequestFieldsSchema)
-    if (!schema?.schemaPath || !schema.efforts?.length) return undefined
-    return { schemaPath: schema.schemaPath, efforts: schema.efforts }
+  private modelCacheKey(account: ProxyAccount): string {
+    return crypto.createHash('sha256').update(JSON.stringify([
+      account.id, account.accessToken, account.profileArn, account.region, account.provider, account.authMethod
+    ])).digest('hex')
   }
 
-  // 获取可用模型列表
-  private static mapKiroModelToApi(m: KiroModel) {
-    return {
-      id: m.modelId,
-      name: m.modelName,
-      description: m.description,
-      inputTypes: m.supportedInputTypes,
-      maxInputTokens: m.tokenLimits?.maxInputTokens,
-      maxOutputTokens: m.tokenLimits?.maxOutputTokens,
-      rateMultiplier: m.rateMultiplier,
-      rateUnit: m.rateUnit,
-      supportsThinking: !!(m.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.thinking || !!(m.additionalModelRequestFieldsSchema?.properties as Record<string, unknown> | undefined)?.output_config,
-      thinkingEfforts: extractThinkingSchema(m.additionalModelRequestFieldsSchema)?.efforts,
-      thinkingSchemaPath: extractThinkingSchema(m.additionalModelRequestFieldsSchema)?.schemaPath,
-      supportsPromptCaching: m.promptCaching?.supportsPromptCaching || false,
-      modelProvider: m.modelProvider || undefined
-    }
-  }
-
-  async getAvailableModels(signal?: AbortSignal): Promise<{ models: ReturnType<typeof ProxyServer.mapKiroModelToApi>[]; fromCache: boolean }> {
+  private async loadModelCatalog(account: ProxyAccount, signal?: AbortSignal): Promise<{ models: KiroModel[]; fromCache: boolean }> {
+    this.throwIfAborted(signal)
+    const key = this.modelCacheKey(account)
+    const cached = this.modelCache.get(key)
     const now = Date.now()
-    
-    let kiroModels: KiroModel[]
-    let fromCache = false
-
-    if (this.modelCache && (now - this.modelCache.timestamp) < this.MODEL_CACHE_TTL) {
-      kiroModels = this.modelCache.models
-      fromCache = true
-    } else {
-      this.throwIfAborted(signal)
-      const account = await this.getAvailableAccount(signal)
-      this.throwIfAborted(signal)
-      if (!account) {
-        return { models: [], fromCache: false }
-      }
-
-      try {
-        kiroModels = await fetchKiroModels(account, signal)
-        if (kiroModels.length > 0) {
-          this.modelCache = { models: kiroModels, timestamp: now }
-          // 同步到 kiroApi 的 ctx cache, 供 token 裁剪逻辑使用
-          for (const m of kiroModels) {
-            if (m.tokenLimits?.maxInputTokens) {
-              setModelContextWindow(m.modelId, m.tokenLimits.maxInputTokens)
-            }
-          }
-        }
-      } catch (error) {
-        if (this.isAbortError(error, signal)) throw error
-        console.error('[ProxyServer] Failed to fetch models:', error)
-        return { models: [], fromCache: false }
-      }
+    if (cached && now - cached.timestamp < this.MODEL_CACHE_TTL) return { models: cached.models, fromCache: true }
+    const models = await fetchKiroModels(account, signal)
+    this.throwIfAborted(signal)
+    // Cache a successful empty response too; errors never produce a catalog.
+    for (const [oldKey, entry] of this.modelCache) {
+      if (now - entry.timestamp >= this.MODEL_CACHE_TTL) this.modelCache.delete(oldKey)
     }
+    if (this.modelCache.size >= 100) this.modelCache.delete(this.modelCache.keys().next().value!)
+    this.modelCache.set(key, { models, timestamp: now })
+    for (const model of filterAvailableModels(models)) {
+      if (model.tokenLimits?.maxInputTokens) setModelContextWindow(model.modelId, model.tokenLimits.maxInputTokens)
+    }
+    return { models, fromCache: false }
+  }
 
-    // 合并隐藏模型（与 /v1/models 端点一致）
-    const modelIds = new Set(kiroModels.map(m => m.modelId))
-    const hiddenModels: KiroModel[] = [
-      { modelId: 'claude-3.7-sonnet', modelName: 'Claude 3.7 Sonnet', description: 'Claude 3.7 Sonnet (hidden)', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel,
-      { modelId: 'simple-task', modelName: 'Simple Task', description: 'Kiro fast model (routes to Haiku)', supportedInputTypes: ['TEXT'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 4096 } } as KiroModel,
-      { modelId: 'CLAUDE_SONNET_4_20250514_V1_0', modelName: 'Claude Sonnet 4 (CW)', description: 'CodeWhisperer internal ID', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel,
-      { modelId: 'CLAUDE_HAIKU_4_5_20251001_V1_0', modelName: 'Claude Haiku 4.5 (CW)', description: 'CodeWhisperer internal ID', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel,
-      { modelId: 'CLAUDE_3_7_SONNET_20250219_V1_0', modelName: 'Claude 3.7 Sonnet (CW)', description: 'CodeWhisperer internal ID', supportedInputTypes: ['TEXT', 'IMAGE'], tokenLimits: { maxInputTokens: 200000, maxOutputTokens: 64000 } } as KiroModel
-    ]
-    const merged = [...kiroModels, ...hiddenModels.filter(m => !modelIds.has(m.modelId))]
+  private async getThinkingConfig(modelId: string, account: ProxyAccount, signal?: AbortSignal): Promise<ThinkingConfig | undefined> {
+    const normalized = mapModelId(modelId)
+    const { models } = await this.loadModelCatalog(account, signal)
+    const model = models.find(item => item.modelId.toLowerCase() === normalized.toLowerCase())
+    // Unknown IDs remain available as explicit compatibility input; no invented
+    // permissions or reasoning fields are attached to them.
+    if (!model) return undefined
+    const unavailable = modelUnavailableReason(model)
+    if (unavailable) throw new ModelRequestError(`Requested model is ${unavailable}. Choose a model available to this account.`)
+    return extractThinkingSchema(model.additionalModelRequestFieldsSchema)
+  }
 
-    return { models: merged.map(ProxyServer.mapKiroModelToApi), fromCache }
+  async getAvailableModels(signal?: AbortSignal): Promise<{ models: ReturnType<typeof toAccountModel>[]; fromCache: boolean; accountId: string }> {
+    this.throwIfAborted(signal)
+    const account = await this.getAvailableAccount(signal)
+    if (!account) throw new Error('No available account for the Kiro model catalog')
+    const result = await this.loadModelCatalog(account, signal)
+    return { models: filterAvailableModels(result.models).map(toAccountModel), fromCache: result.fromCache, accountId: account.id }
   }
 
   // 检查 Token 是否需要刷新
@@ -2248,7 +2205,7 @@ export class ProxyServer {
 
     try {
       const toolNameRegistry = new ToolNameRegistry()
-      const kiroPayload = openaiToKiro(openaiRequest, account.profileArn, toolNameRegistry, this.getThinkingConfig(openaiRequest.model))
+      const kiroPayload = openaiToKiro(openaiRequest, account.profileArn, toolNameRegistry, await this.getThinkingConfig(openaiRequest.model, account, signal))
 
       if (isStream) {
         // SSE 流式
@@ -2320,7 +2277,7 @@ export class ProxyServer {
   }
 
   // 模型列表缓存
-  private modelCache: { models: KiroModel[]; timestamp: number } | null = null
+  private modelCache = new Map<string, { models: KiroModel[]; timestamp: number }>()
   private readonly MODEL_CACHE_TTL = 5 * 60 * 1000 // 5 分钟缓存
 
   // Steering 文件缓存（从 config.workspacePath 加载）
@@ -2373,115 +2330,27 @@ export class ProxyServer {
     return [{ type: 'text', text: this.steeringPrompt } as ClaudeContentBlock, ...system]
   }
 
-  // 模型列表
+  // Only account-authorized server records are advertised. A transport failure
+  // is distinct from a successful, empty catalog.
   private async handleModels(res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
-    const now = Date.now()
-    
-    // Kiro 官方模型（与 UI 保持一致）
-    const kiroOfficialModels = [
-      buildClientModel({ id: 'auto', created: now, ownedBy: 'kiro-api', description: 'Auto select best model' }),
-      buildClientModel({ id: 'claude-sonnet-4.5', created: now, ownedBy: 'kiro-api', description: 'The latest Claude Sonnet model' }),
-      buildClientModel({ id: 'claude-sonnet-4', created: now, ownedBy: 'kiro-api', description: 'Hybrid reasoning and coding' }),
-      buildClientModel({ id: 'claude-haiku-4.5', created: now, ownedBy: 'kiro-api', description: 'The latest Claude Haiku model' }),
-      buildClientModel({ id: 'claude-opus-4.5', created: now, ownedBy: 'kiro-api', description: 'The most powerful model' })
-    ]
-
-    // 隐藏模型（未在官方 ListAvailableModels 中返回，但后端可能支持）
-    const hiddenModels = [
-      buildClientModel({ id: 'claude-3.7-sonnet', created: now, ownedBy: 'kiro-api', description: 'Claude 3.7 Sonnet (hidden)', modelName: 'Claude 3.7 Sonnet', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000 }),
-      buildClientModel({ id: 'simple-task', created: now, ownedBy: 'kiro-api', description: 'Kiro fast model for intent classification and lightweight tasks (routes to Haiku)', modelName: 'Simple Task', supportedInputTypes: ['TEXT'], maxInputTokens: 200000, maxOutputTokens: 4096 }),
-      buildClientModel({ id: 'CLAUDE_SONNET_4_20250514_V1_0', created: now, ownedBy: 'kiro-api', description: 'Claude Sonnet 4 (CodeWhisperer internal ID)', modelName: 'Claude Sonnet 4 (CW)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000 }),
-      buildClientModel({ id: 'CLAUDE_HAIKU_4_5_20251001_V1_0', created: now, ownedBy: 'kiro-api', description: 'Claude Haiku 4.5 (CodeWhisperer internal ID)', modelName: 'Claude Haiku 4.5 (CW)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000 }),
-      buildClientModel({ id: 'CLAUDE_3_7_SONNET_20250219_V1_0', created: now, ownedBy: 'kiro-api', description: 'Claude 3.7 Sonnet (CodeWhisperer internal ID)', modelName: 'Claude 3.7 Sonnet (CW)', supportedInputTypes: ['TEXT', 'IMAGE'], maxInputTokens: 200000, maxOutputTokens: 64000 })
-    ]
-
-    // 预设模型（GPT 兼容别名）
-    const presetModels = [
-      buildClientModel({ id: 'gpt-4o', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro' }),
-      buildClientModel({ id: 'gpt-4', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro' }),
-      buildClientModel({ id: 'gpt-4-turbo', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro' }),
-      buildClientModel({ id: 'gpt-3.5-turbo', created: now, ownedBy: 'kiro-proxy', description: 'GPT-compatible alias for Kiro' })
-    ]
-
-    // 尝试从 Kiro API 获取动态模型
-    let kiroModels: KiroModel[] = []
-    
-    // 检查缓存
-    if (this.modelCache && (now - this.modelCache.timestamp) < this.MODEL_CACHE_TTL) {
-      kiroModels = this.modelCache.models
-    } else {
-      // 获取一个可用账号来请求模型列表
-      const account = this.accountPool.getNextAccount()
-      if (account) {
-        try {
-          kiroModels = await fetchKiroModels(account, signal)
-          if (kiroModels.length > 0) {
-            this.modelCache = { models: kiroModels, timestamp: now }
-            // 同步到 kiroApi 的 ctx cache, 供 token 裁剪逻辑使用
-            for (const m of kiroModels) {
-              if (m.tokenLimits?.maxInputTokens) {
-                setModelContextWindow(m.modelId, m.tokenLimits.maxInputTokens)
-              }
-            }
-            proxyLogger.info('ProxyServer', `Fetched ${kiroModels.length} models from Kiro API`)
-          }
-        } catch (error) {
-          if (this.isAbortError(error, signal)) throw error
-          console.error('[ProxyServer] Failed to fetch Kiro models:', error)
-        }
-      }
+    try {
+      const { models } = await this.getAvailableModels(signal)
+      const now = Date.now()
+      const data = models.map(model => buildClientModel({
+        id: model.id, created: now, ownedBy: 'kiro-api', modelName: model.name,
+        description: model.description, supportedInputTypes: model.inputTypes,
+        maxInputTokens: model.maxInputTokens, maxOutputTokens: model.maxOutputTokens,
+        rateMultiplier: model.rateMultiplier, rateUnit: model.rateUnit,
+        promptCaching: model.promptCaching, additionalModelRequestFieldsSchema: model.additionalModelRequestFieldsSchema,
+        modelProvider: model.modelProvider, status: model.status, availableOrigins: model.availableOrigins
+      }))
+      this.throwIfResponseClosed(res, signal)
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ object: 'list', data }))
+    } catch (error) {
+      if (this.isAbortError(error, signal)) throw error
+      this.sendError(res, 502, error instanceof Error ? error.message : 'Kiro model catalog unavailable')
     }
-
-    // 转换 Kiro 模型为 OpenAI 格式（保持原始 modelId）
-    const dynamicModels = kiroModels.map(m => buildClientModel({
-      id: m.modelId,
-      created: now,
-      ownedBy: 'kiro-api',
-      description: m.description,
-      modelName: m.modelName,
-      supportedInputTypes: m.supportedInputTypes,
-      maxInputTokens: m.tokenLimits?.maxInputTokens,
-      maxOutputTokens: m.tokenLimits?.maxOutputTokens,
-      rateMultiplier: m.rateMultiplier,
-      rateUnit: m.rateUnit,
-      promptCaching: m.promptCaching,
-      additionalModelRequestFieldsSchema: m.additionalModelRequestFieldsSchema,
-      modelProvider: m.modelProvider
-    }))
-
-    // 合并模型列表，去重
-    const modelIds = new Set<string>()
-    const allModels: ClientModel[] = []
-    
-    // 1. 优先添加动态模型（从 API 获取的，包含真实 token limit / input types）
-    for (const m of dynamicModels) {
-      if (!modelIds.has(m.id)) {
-        modelIds.add(m.id)
-        allModels.push(m)
-      }
-    }
-    
-    // 2. 添加隐藏模型（未在官方 ListAvailableModels 中返回，但后端可能支持）
-    for (const m of hiddenModels) {
-      if (!modelIds.has(m.id)) {
-        modelIds.add(m.id)
-        allModels.push(m)
-      }
-    }
-    
-    // 3. 动态模型缺失时才添加静态兜底
-    if (dynamicModels.length === 0) {
-      for (const m of [...kiroOfficialModels, ...presetModels]) {
-        if (!modelIds.has(m.id)) {
-          modelIds.add(m.id)
-          allModels.push(m)
-        }
-      }
-    }
-
-    this.throwIfResponseClosed(res, signal)
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ object: 'list', data: allModels }))
   }
 
   // 处理 OpenAI Chat Completions 请求
@@ -2547,7 +2416,7 @@ export class ProxyServer {
       }
 
       // 转换为 Kiro 格式
-      const thinkingConfig = this.getThinkingConfig(processedRequest.model)
+      const thinkingConfig = await this.getThinkingConfig(processedRequest.model, account, signal)
       const kiroPayload = openaiToKiro(processedRequest, account.profileArn, toolNameRegistry, thinkingConfig)
 
       // 记录请求详情到日志
@@ -2577,7 +2446,7 @@ export class ProxyServer {
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
-            const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, thinkingConfig)
+            const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, await this.getThinkingConfig(processedRequest.model, acc, signal))
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/chat/completions',
@@ -2660,6 +2529,8 @@ export class ProxyServer {
 
     try {
       const toolNameRegistry = new ToolNameRegistry()
+      const responseThinking = await this.getThinkingConfig(processedRequest.model, account, signal)
+      const initialPayload = openaiToKiro(processedRequest, account.profileArn, toolNameRegistry, responseThinking)
       if (processedRequest.stream) {
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
@@ -2671,7 +2542,7 @@ export class ProxyServer {
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
-            const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(processedRequest.model))
+            const retryPayload = acc === account ? initialPayload : openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, await this.getThinkingConfig(processedRequest.model, acc, signal))
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/responses',
@@ -2723,7 +2594,7 @@ export class ProxyServer {
       const { result, account: usedAccount } = await this.callWithRetry(
         account,
         async (acc) => {
-          const retryPayload = openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, this.getThinkingConfig(processedRequest.model))
+          const retryPayload = acc === account ? initialPayload : openaiToKiro(processedRequest, acc.profileArn, toolNameRegistry, await this.getThinkingConfig(processedRequest.model, acc, signal))
           return callKiroApi(acc, retryPayload, signal)
         },
         '/v1/responses',
@@ -2970,7 +2841,7 @@ export class ProxyServer {
         processedRequest.system = this.injectSteeringClaude(processedRequest.system) as string | undefined
       }
 
-      const claudeThinkingConfig = this.getThinkingConfig(processedRequest.model)
+      const claudeThinkingConfig = await this.getThinkingConfig(processedRequest.model, account, signal)
       const kiroPayload = claudeToKiro(processedRequest, account.profileArn, toolNameRegistry, claudeThinkingConfig)
 
       // 构建 prompt cache profile（用于模拟缓存 usage）
@@ -3016,7 +2887,7 @@ export class ProxyServer {
         const { result, account: usedAccount } = await this.callWithRetry(
           account,
           async (acc) => {
-            const retryPayload = claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry, claudeThinkingConfig)
+            const retryPayload = claudeToKiro(processedRequest, acc.profileArn, toolNameRegistry, await this.getThinkingConfig(processedRequest.model, acc, signal))
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/messages',
@@ -3337,11 +3208,11 @@ export class ProxyServer {
     this.recordRequestFailed()
     const upstreamStatus = (error as { upstreamStatus?: number }).upstreamStatus
     const errCode = error.message.match(/(\d{3})/)?.[1]
-    const parsedCode = upstreamStatus && upstreamStatus >= 400 && upstreamStatus < 600 ? upstreamStatus : errCode ? parseInt(errCode) : 500
+    const parsedCode = error instanceof ModelRequestError ? 400 : upstreamStatus && upstreamStatus >= 400 && upstreamStatus < 600 ? upstreamStatus : errCode ? parseInt(errCode) : 500
     const errorType = classifyError(parsedCode)
     const isAuthError = (error as { retryable?: boolean }).retryable !== false && (error.message.includes('401') || error.message.includes('403') || error.message.includes('Auth'))
 
-    this.accountPool.recordError(account.id, errorType, parsedCode)
+    if (!(error instanceof ModelRequestError)) this.accountPool.recordError(account.id, errorType, parsedCode)
 
     let statusCode = parsedCode
     if (isAuthError) statusCode = 401

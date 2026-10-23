@@ -12,6 +12,7 @@
 
 import { emptyOutcome, findExistingDuplicate, normalizeCredentialRecord } from './accountImport'
 import type { BackupPayload, ExistingAccountLike, ImportOutcome } from './accountImport'
+import { normalizeAccountSubscription } from './accountSubscription'
 
 export interface GroupLike {
   id: string
@@ -262,9 +263,7 @@ export function planBackupRestore(backup: BackupPayload, ctx: RestoreContext): B
       : []
 
     const region = credential.region
-    const subscription = isPlainObject(src.subscription) && typeof src.subscription.type === 'string' && ['Free', 'Pro', 'Pro_Plus', 'Enterprise', 'Teams'].includes(src.subscription.type)
-      ? src.subscription
-      : { type: 'Free' }
+    const subscription = normalizeAccountSubscription(isPlainObject(src.subscription) ? src.subscription : {})
     const usageSrc = isPlainObject(src.usage) ? src.usage : {}
     const usage = {
       ...usageSrc,

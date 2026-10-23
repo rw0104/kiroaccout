@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
+import { mergeAccountSubscription, normalizeAccountSubscription, normalizeSubscriptionType } from '../../src/shared/accountSubscription.ts'
 
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
@@ -38,6 +39,7 @@ function fixture(api = {}) {
   const get = () => ({ ...state, ...actions, saveToStorage() { saves++; return actions.saveToStorage() } })
   const set = value => Object.assign(state, typeof value === 'function' ? value(state) : value)
   const context = vm.createContext({ get, set, window: { api: { saveAccounts: async data => { writes.push(JSON.parse(JSON.stringify(data))) }, ...api } }, console: { log() {}, warn() {}, error() {} }, Date,
+    mergeAccountSubscription, normalizeAccountSubscription, normalizeSubscriptionType,
     setTimeout: callback => { const id = ++timerId; timers.set(id, callback); return id }, clearTimeout: id => timers.delete(id),
     triggerWebhook: (...args) => hooks.push(args), isBannedAccountError: () => false })
   vm.runInContext(factory, context)

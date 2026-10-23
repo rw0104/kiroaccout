@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactElement } from 'react'
 import { createPortal } from 'react-dom'
 import { Button, Badge } from '../ui'
 import {
@@ -28,7 +28,12 @@ interface ExportDialogProps {
   selectedCount: number
 }
 
-export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportDialogProps) {
+export function ExportDialog({
+  open,
+  onClose,
+  accounts,
+  selectedCount
+}: ExportDialogProps): ReactElement | null {
   const [selectedFormat, setSelectedFormat] = useState<AccountExportFormat>('json')
   const [scope, setScope] = useState<AccountExportScope>('all')
   const [includeCredentials, setIncludeCredentials] = useState(false)
@@ -127,15 +132,7 @@ export function ExportDialog({ open, onClose, accounts, selectedCount }: ExportD
         setCopiedCount(result.count)
         setCopied(true)
       } else {
-        const kind =
-          selectedFormat === 'json'
-            ? 'backup'
-            : selectedFormat === 'oidc'
-              ? 'credentials'
-              : selectedFormat
-        const mode = result.containsCredentials ? 'with-credentials' : 'no-credentials'
-        const filename = `kiro-accounts-${kind}-${mode}-${new Date().toISOString().slice(0, 10)}.${result.extension}`
-        const success = await window.api.exportToFile(result.content, filename)
+        const success = await window.api.exportToFile(result.content, result.filename)
         if (success) {
           alert(isEn ? `Exported ${result.count} accounts` : `已导出 ${result.count} 个账户`)
           onClose()

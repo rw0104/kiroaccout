@@ -6,24 +6,13 @@ import kiroLogo from '@/assets/kiro-high-resolution-logo-transparent.png'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account, AccountFilter } from '@/types/account'
+import { getSubscriptionColor } from '../accounts/_helpers'
+import { AddOnCredits } from '../accounts/AddOnCredits'
 
 // 额度告急阈值（usage.percentUsed 为 0-1 小数）
 const QUOTA_WARN_RATIO = 0.9
 // 即将到期阈值（天）
 const EXPIRE_WARN_DAYS = 7
-
-// 订阅类型颜色映射
-const getSubscriptionColor = (type: string, title?: string): string => {
-  const text = (title || type).toUpperCase()
-  // KIRO PRO+ / PRO_PLUS - 紫色
-  if (text.includes('PRO+') || text.includes('PRO_PLUS') || text.includes('PROPLUS')) return 'bg-purple-500'
-  // KIRO POWER - 金色
-  if (text.includes('POWER')) return 'bg-amber-500'
-  // KIRO PRO - 蓝色
-  if (text.includes('PRO')) return 'bg-blue-500'
-  // KIRO FREE - 灰色
-  return 'bg-gray-500'
-}
 
 export function HomePage() {
   const { accounts, activeAccountId, getStats, darkMode, usagePrecision, setFilter, setActiveGroupTab } = useAccountsStore()
@@ -393,7 +382,8 @@ export function HomePage() {
                   'inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium text-white',
                   getSubscriptionColor(
                     activeAccount.subscription?.type || 'Free',
-                    activeAccount.subscription?.title
+                    activeAccount.subscription?.title,
+                    activeAccount.subscription?.rawType
                   )
                 )}>
                   {activeAccount.subscription?.title || activeAccount.subscription?.type || 'Free'}
@@ -496,9 +486,10 @@ export function HomePage() {
             </div>
 
             {/* 额度明细 */}
-            {(activeAccount.usage?.baseLimit || activeAccount.usage?.freeTrialLimit || activeAccount.usage?.bonuses?.length) && (
+            {(activeAccount.usage?.baseLimit || activeAccount.usage?.freeTrialLimit || activeAccount.usage?.bonuses?.length || activeAccount.usage?.addOnCredits?.length) && (
               <div className="pt-3 border-t space-y-2">
                 <p className="text-xs font-medium text-muted-foreground">{isEn ? 'Quota Details' : '额度明细'}</p>
+                <AddOnCredits credits={activeAccount.usage?.addOnCredits} isEn={isEn} precision={usagePrecision} />
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
                   {/* 基础额度 */}
                   {activeAccount.usage?.baseLimit !== undefined && activeAccount.usage.baseLimit > 0 && (

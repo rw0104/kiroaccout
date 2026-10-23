@@ -27,6 +27,9 @@ import {
   RotateCcw
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { AddOnCredits } from './AddOnCredits'
+import { getSubscriptionColor } from './_helpers'
+import { normalizeSubscriptionType } from '../../../../shared/accountSubscription'
 
 // 解析 ARGB 颜色转换为 CSS rgba
 function toRgba(argbColor: string): string {
@@ -78,18 +81,6 @@ interface AccountCardProps {
   onSelect: () => void
   onEdit: () => void
   onShowDetail: () => void
-}
-
-const getSubscriptionColor = (type: string, title?: string): string => {
-  const text = (title || type).toUpperCase()
-  // KIRO PRO+ / PRO_PLUS - 紫色
-  if (text.includes('PRO+') || text.includes('PRO_PLUS') || text.includes('PROPLUS')) return 'bg-purple-500'
-  // KIRO POWER - 金色
-  if (text.includes('POWER')) return 'bg-amber-500'
-  // KIRO PRO - 蓝色
-  if (text.includes('PRO')) return 'bg-blue-500'
-  // KIRO FREE - 灰色
-  return 'bg-gray-500'
 }
 
 const StatusLabelsZh: Record<string, string> = {
@@ -212,82 +203,8 @@ export const AccountCard = memo(function AccountCard({
   }
 
   const handleSwitch = async (): Promise<void> => {
-    const { credentials } = account
-    const { switchTarget } = useAccountsStore.getState()
-    
-    // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret
-    if (!credentials.refreshToken) {
-      alert(isEn ? 'Incomplete credentials, cannot switch' : '账号凭证不完整，无法切换')
-      return
-    }
-    if (credentials.authMethod !== 'social' && (!credentials.clientId || !credentials.clientSecret)) {
-      alert(isEn ? 'Incomplete credentials, cannot switch' : '账号凭证不完整，无法切换')
-      return
-    }
-
-    const cliPayload = {
-      accessToken: credentials.accessToken,
-      refreshToken: credentials.refreshToken,
-      clientId: credentials.clientId,
-      clientSecret: credentials.clientSecret,
-      region: credentials.region || 'us-east-1',
-      profileArn: account.profileArn,
-      provider: credentials.provider
-    }
-    const idePayload = {
-      accessToken: credentials.accessToken,
-      refreshToken: credentials.refreshToken,
-      clientId: credentials.clientId || '',
-      clientSecret: credentials.clientSecret || '',
-      region: credentials.region || 'us-east-1',
-      startUrl: credentials.startUrl,
-      authMethod: credentials.authMethod,
-      provider: credentials.provider,
-      profileArn: account.profileArn,
-      accountId: account.id
-    }
-
-    let success = true
-    let errorMsg = ''
-
-    // 根据 switchTarget 设置决定切换目标
-    if (switchTarget === 'ide' || switchTarget === 'both') {
-      const result = await window.api.switchAccount(idePayload)
-      if (!result.success) {
-        success = false
-        errorMsg = result.error || ''
-      } else if (result.refreshedCredentials) {
-        // 同步 main 进程 refresh 后的最新 credentials 到 store，避免反代 store 留下已作废的 refreshToken
-        const rc = result.refreshedCredentials
-        useAccountsStore.setState((state) => {
-          const accounts = new Map(state.accounts)
-          const acc = accounts.get(account.id)
-          if (acc) {
-            accounts.set(account.id, {
-              ...acc,
-              credentials: {
-                ...acc.credentials,
-                accessToken: rc.accessToken,
-                refreshToken: rc.refreshToken,
-                expiresAt: Date.now() + rc.expiresIn * 1000
-              }
-            })
-          }
-          return { accounts }
-        })
-        useAccountsStore.getState().saveToStorage()
-      }
-    }
-    if (switchTarget === 'cli' || switchTarget === 'both') {
-      const result = await window.api.switchAccountCli(cliPayload)
-      if (!result.success && switchTarget === 'cli') { success = false; errorMsg = result.error || '' }
-    }
-
-    if (success) {
-      setActiveAccount(account.id)
-    } else {
-      alert(isEn ? `Switch failed: ${errorMsg}` : `切换失败: ${errorMsg}`)
-    }
+    const result = await useAccountsStore.getState().switchAccountToTarget(account.id)
+    if (!result.success) alert(isEn ? `Switch failed: ${result.error || ''}` : `切换失败：${result.error || ''}`)
   }
 
   const handleRefresh = async (): Promise<void> => {
@@ -409,8 +326,7 @@ export const AccountCard = memo(function AccountCard({
       if (result.success && result.plans.length > 0) {
         setSubscriptionPlans(result.plans)
         // 检查是否是首次用户（当前订阅类型为 FREE 或无订阅）
-        const currentType = account.subscription.type?.toUpperCase() || ''
-        const isFirstTime = currentType === '' || currentType.includes('FREE')
+        const isFirstTime = normalizeSubscriptionType(account.subscription) === 'Free'
         setIsFirstTimeUser(isFirstTime)
         setShowSubscriptionDialog(true)
       } else {
@@ -619,7 +535,7 @@ export const AccountCard = memo(function AccountCard({
             <Badge 
               className={cn(
                 'text-white text-[10px] h-5 px-2 border-0 cursor-pointer transition-all hover:opacity-80 hover:scale-105',
-                getSubscriptionColor(account.subscription.type, account.subscription.title),
+                getSubscriptionColor(account.subscription.type, account.subscription.title, account.subscription.rawType),
                 subscriptionLoading && 'opacity-60 cursor-wait'
               )}
               onClick={handleSubscriptionClick}
@@ -735,6 +651,7 @@ export const AccountCard = memo(function AccountCard({
 
         {/* Detailed Quotas - Compact list */}
         <div className="space-y-1.5 min-h-0 overflow-y-auto pr-1 text-[10px] max-h-24">
+           <AddOnCredits credits={account.usage.addOnCredits} isEn={isEn} precision={usagePrecision} />
            {/* 基础额度 */}
            {account.usage.baseLimit !== undefined && account.usage.baseLimit > 0 && (
              <div className="flex items-center gap-2">

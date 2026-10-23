@@ -1,6 +1,6 @@
 import { createPortal } from 'react-dom'
 import { useState, useEffect } from 'react'
-import { X, RefreshCw, User, CreditCard, Key, Cpu, Loader2, FileText, Image, Hash, Zap } from 'lucide-react'
+import { X, RefreshCw, User, CreditCard, Key, Cpu, Loader2, FileText, Image, Hash, Zap, Brain, Database } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
@@ -8,17 +8,10 @@ import type { Account } from '@/types/account'
 import { cn } from '@/lib/utils'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
+import { getSubscriptionColor } from './_helpers'
+import { AddOnCredits } from './AddOnCredits'
 
-interface ModelInfo {
-  id: string
-  name: string
-  description: string
-  inputTypes?: string[]
-  maxInputTokens?: number | null
-  maxOutputTokens?: number | null
-  rateMultiplier?: number
-  rateUnit?: string
-}
+import type { AccountModelInfo } from '../../../../shared/modelCatalog'
 
 interface AccountDetailDialogProps {
   open: boolean
@@ -34,19 +27,6 @@ function getDisplayName(account: Account): string {
   if (account.email) return account.email
   if (account.userId) return account.userId
   return 'Unknown'
-}
-
-// 订阅类型对应颜色
-const getSubscriptionColor = (type: string, title?: string): string => {
-  const text = (title || type).toUpperCase()
-  // KIRO PRO+ / PRO_PLUS - 紫色
-  if (text.includes('PRO+') || text.includes('PRO_PLUS') || text.includes('PROPLUS')) return 'bg-purple-500'
-  // KIRO POWER - 金色
-  if (text.includes('POWER')) return 'bg-amber-500'
-  // KIRO PRO - 蓝色
-  if (text.includes('PRO')) return 'bg-blue-500'
-  // KIRO FREE - 灰色
-  return 'bg-gray-500'
 }
 
 // 格式化日期
@@ -82,7 +62,7 @@ export function AccountDetailDialog({
   onRefresh,
   isRefreshing
 }: AccountDetailDialogProps) {
-  const [models, setModels] = useState<ModelInfo[]>([])
+  const [models, setModels] = useState<AccountModelInfo[]>([])
   const [modelsLoading, setModelsLoading] = useState(false)
   const [modelsError, setModelsError] = useState<string | null>(null)
   const { maskEmail, maskNickname, privacyMode, usagePrecision } = useAccountsStore()
@@ -91,6 +71,8 @@ export function AccountDetailDialog({
 
   // 获取账户可用模型
   useEffect(() => {
+    let cancelled = false
+    setModels([])
     if (open && account?.credentials?.accessToken) {
       setModelsLoading(true)
       setModelsError(null)
@@ -104,17 +86,19 @@ export function AccountDetailDialog({
         account.id
       )
         .then(result => {
+          if (cancelled) return
           if (result.success) {
             setModels(result.models)
           } else {
             setModelsError(result.error || 'Failed to fetch models')
           }
         })
-        .catch(err => setModelsError(err.message))
-        .finally(() => setModelsLoading(false))
+        .catch(err => { if (!cancelled) setModelsError(err.message) })
+        .finally(() => { if (!cancelled) setModelsLoading(false) })
     } else {
-      setModels([])
+      setModelsLoading(false)
     }
+    return () => { cancelled = true }
   }, [open, account?.credentials?.accessToken, account?.credentials?.region, account?.profileArn, account?.machineId, account?.credentials?.provider, account?.idp, account?.credentials?.authMethod, account?.id])
 
   if (!open || !account) return null
@@ -150,7 +134,7 @@ export function AccountDetailDialog({
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2 mb-1.5">
                 <span className="font-bold text-lg text-foreground truncate" title={account.email || getDisplayName(account)}>{account.email ? maskEmail(account.email) : getDisplayName(account)}</span>
-                <Badge className={cn(getSubscriptionColor(subscription.type, subscription.title), "hover:opacity-90 text-white shadow-md flex-shrink-0 px-2.5")}>
+                <Badge className={cn(getSubscriptionColor(subscription.type, subscription.title, subscription.rawType), "hover:opacity-90 text-white shadow-md flex-shrink-0 px-2.5")}>
                   {subscription.title || subscription.type}
                 </Badge>
               </div>
@@ -254,6 +238,8 @@ export function AccountDetailDialog({
                </div>
             </div>
           </section>
+
+          <AddOnCredits credits={usage.addOnCredits} isEn={isEn} precision={usagePrecision} detailed />
 
           {/* 奖励详情 */}
           {usage.bonuses && usage.bonuses.length > 0 && (
@@ -409,6 +395,12 @@ export function AccountDetailDialog({
                           {model.name && model.name !== model.id && (
                             <p className="text-[11px] text-primary/80 font-medium mb-1 truncate">{model.name}</p>
                           )}
+                          <div className="flex flex-wrap gap-1 mb-1">
+                            {model.modelProvider && <Badge variant="secondary" className="text-[10px]">{model.modelProvider}</Badge>}
+                            {model.status && <Badge variant="secondary" className="text-[10px]">{model.status}</Badge>}
+                            {model.supportsThinking && <Badge variant="secondary" title={model.thinkingEfforts?.join(', ')} className="text-[10px]"><Brain className="h-3 w-3" /></Badge>}
+                            {model.supportsPromptCaching && <Badge variant="secondary" className="text-[10px]"><Database className="h-3 w-3" /></Badge>}
+                          </div>
                           <p className="text-[11px] text-muted-foreground line-clamp-2 leading-relaxed">
                             {model.description || (isEn ? 'No description' : '无描述')}
                           </p>

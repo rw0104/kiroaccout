@@ -8,6 +8,7 @@ import { parseAccountImportText } from '../../../../shared/accountImport'
 import type { ImportOutcome } from '../../../../shared/accountImport'
 import { startSerialLoginPolling } from '@/lib/loginPolling'
 import type { LoginResult } from '../../../../main/loginSessions'
+import type { AccountAddOnCredit } from '../../../../shared/accountUsage'
 
 interface AddAccountDialogProps {
   isOpen: boolean
@@ -28,6 +29,7 @@ interface VerifiedData {
   accessToken: string
   refreshToken: string
   expiresIn?: number
+  clientSecretExpiresAt?: number
   subscriptionType: string
   subscriptionTitle: string
   subscription?: {
@@ -44,6 +46,9 @@ interface VerifiedData {
     freeTrialCurrent?: number
     freeTrialExpiry?: string
     bonuses?: BonusData[]
+    addOnCredits?: AccountAddOnCredit[]
+    addOnCurrent?: number
+    addOnLimit?: number
     nextResetDate?: string
     resourceDetail?: {
       displayName?: string
@@ -104,6 +109,12 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   const [region, setRegion] = useState('us-east-1')
   const [authMethod, setAuthMethod] = useState<'IdC' | 'social'>('IdC')
   const [provider, setProvider] = useState('BuilderId')  // 'BuilderId', 'Enterprise', 'Github', 'Google'
+  const importedRegistrationRef = useRef<{
+    clientId: string
+    clientSecret: string
+    region: string
+    clientSecretExpiresAt?: number
+  } | null>(null)
 
   // SSO Token 导入
   const [ssoToken, setSsoToken] = useState('')
@@ -251,6 +262,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         refreshToken: tokenData.refreshToken,
         clientId: tokenData.clientId || '',
         clientSecret: tokenData.clientSecret || '',
+        clientSecretExpiresAt: tokenData.clientSecretExpiresAt,
         region: tokenData.region || 'us-east-1',
         authMethod: tokenData.authMethod,
         provider: tokenData.provider,
@@ -314,6 +326,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             freeTrialCurrent: result.data.usage.freeTrialCurrent,
             freeTrialExpiry: result.data.usage.freeTrialExpiry,
             bonuses: result.data.usage.bonuses,
+            addOnCredits: result.data.usage.addOnCredits,
+            addOnCurrent: result.data.usage.addOnCurrent,
+            addOnLimit: result.data.usage.addOnLimit,
             nextResetDate: result.data.usage.nextResetDate,
             resourceDetail: result.data.usage.resourceDetail
           },
@@ -515,6 +530,12 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         setClientId(result.data.clientId)
         setClientSecret(result.data.clientSecret)
         setRegion(result.data.region)
+        importedRegistrationRef.current = {
+          clientId: result.data.clientId,
+          clientSecret: result.data.clientSecret,
+          region: result.data.region,
+          clientSecretExpiresAt: result.data.clientSecretExpiresAt
+        }
         setAuthMethod(result.data.authMethod as 'IdC' | 'social' || 'IdC')
         setProvider(result.data.provider || 'BuilderId')
         setError(null)
@@ -578,6 +599,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               refreshToken: result.data.refreshToken,
               clientId: result.data.clientId,
               clientSecret: result.data.clientSecret,
+              clientSecretExpiresAt: result.data.clientSecretExpiresAt,
               region: result.data.region,
               expiresAt: result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000
             },
@@ -602,6 +624,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
               freeTrialCurrent: result.data.usage?.freeTrialCurrent,
               freeTrialExpiry: result.data.usage?.freeTrialExpiry,
               bonuses: result.data.usage?.bonuses,
+              addOnCredits: result.data.usage?.addOnCredits,
+              addOnCurrent: result.data.usage?.addOnCurrent,
+              addOnLimit: result.data.usage?.addOnLimit,
               nextResetDate: result.data.usage?.nextResetDate,
               resourceDetail: result.data.usage?.resourceDetail
             },
@@ -708,10 +733,18 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     setError(null)
 
     try {
+      const importedRegistration = importedRegistrationRef.current
+      const clientSecretExpiresAt =
+        importedRegistration?.clientId === clientId &&
+        importedRegistration.clientSecret === clientSecret &&
+        importedRegistration.region === region
+          ? importedRegistration.clientSecretExpiresAt
+          : undefined
       const result = await window.api.verifyAccountCredentials({
         refreshToken,
         clientId,
         clientSecret,
+        clientSecretExpiresAt,
         region,
         authMethod,
         provider
@@ -741,6 +774,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             refreshToken: result.data.refreshToken,
             clientId,
             clientSecret,
+            clientSecretExpiresAt: result.data.clientSecretExpiresAt ?? clientSecretExpiresAt,
             region,
             expiresAt: result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000,
             authMethod,
@@ -768,6 +802,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             freeTrialCurrent: result.data.usage.freeTrialCurrent,
             freeTrialExpiry: result.data.usage.freeTrialExpiry,
             bonuses: result.data.usage.bonuses,
+            addOnCredits: result.data.usage.addOnCredits,
+            addOnCurrent: result.data.usage.addOnCurrent,
+            addOnLimit: result.data.usage.addOnLimit,
             nextResetDate: result.data.usage.nextResetDate,
             resourceDetail: result.data.usage.resourceDetail
           },
@@ -789,6 +826,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
   }
 
   const resetForm = () => {
+    importedRegistrationRef.current = null
     setImportMode('login')
     setRefreshToken('')
     setClientId('')

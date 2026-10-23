@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
+import { isRetiredModelId, ModelRequestError } from '../../src/shared/modelCatalog.ts'
 import { executeRuntimeRequest } from '../../src/main/proxy/kiroRuntime.ts'
 
 const require = createRequire(import.meta.url)
@@ -10,6 +11,7 @@ const ts = require('typescript')
 const source = readFileSync(new URL('../../src/main/proxy/kiroApi.ts', import.meta.url), 'utf8')
 const tree = ts.createSourceFile('kiroApi.ts', source, ts.ScriptTarget.Latest, true)
 const functions = ['callKiroApiStream', 'callKiroApi', 'isCodeWhispererModelId', 'normalizeClaudeVersion', 'mapModelId']
+const modelMap = tree.statements.find(node => ts.isVariableStatement(node) && node.declarationList.declarations.some(item => item.name.getText(tree) === 'MODEL_ID_MAP')).getText(tree)
 const declarations = tree.statements.filter(node => ts.isFunctionDeclaration(node) && functions.includes(node.name?.text)).map(node => node.getText(tree).replace(/^export /, '')).join('\n')
 
 function crc32(bytes) {
@@ -38,8 +40,8 @@ const account = { id: 'synthetic', accessToken: 'SYNTHETIC_ACCESS', provider: 'E
 const payload = { conversationState: { conversationId: 'synthetic-session', chatTriggerType: 'MANUAL', currentMessage: { userInputMessage: { content: 'Synthetic input', modelId: 'synthetic-model', origin: 'AI_EDITOR' } } } }
 function harness(fetcher) {
   const context = vm.createContext({ executeRuntimeRequest, fetchWithProxy: fetcher, configuredAgentMode: 'spec', logStreamEvents: false,
-    countTokens: () => 1, MODEL_ID_MAP: { default: 'default-model' }, console })
-  vm.runInContext(ts.transpileModule(declarations, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context)
+    countTokens: () => 1, isRetiredModelId, ModelRequestError, console })
+  vm.runInContext(ts.transpileModule(modelMap + '\n' + declarations, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context)
   return context
 }
 
@@ -103,6 +105,9 @@ test('new model identifiers never silently fall back to an unrelated Claude mode
   const api = harness(async () => { throw new Error('Not called') })
   assert.equal(api.mapModelId('kimi-k3'), 'kimi-k3')
   assert.equal(api.mapModelId('future.synthetic-model-v2'), 'future.synthetic-model-v2')
-  assert.equal(api.mapModelId(''), 'default-model')
+  assert.equal(api.mapModelId(''), 'auto')
+  assert.equal(api.mapModelId('gpt-4o'), 'gpt-4o')
+  assert.equal(api.mapModelId('claude-3-sonnet'), 'claude-3-sonnet')
+  for (const retired of ['claude-sonnet-4', 'claude-sonnet-4-0', 'claude-sonnet-4.0', 'claude-sonnet-4-20250514', 'CLAUDE_SONNET_4_20250514_V1_0']) assert.throws(() => api.mapModelId(retired), /retired/)
   assert.throws(() => api.mapModelId('invalid\nmodel'), /Invalid model identifier/)
 })

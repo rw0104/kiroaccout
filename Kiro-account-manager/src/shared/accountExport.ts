@@ -46,6 +46,7 @@ export type AccountExportResult =
       content: string
       count: number
       extension: 'json' | 'txt' | 'csv'
+      filename: string
       containsCredentials: boolean
     }
   | { ok: false; code: string; message: string; count: number }
@@ -90,6 +91,35 @@ function fail(code: string, message: string, count = 0): AccountExportResult {
 function cloneJson<T>(value: T): T {
   // Callers get an independent snapshot; stripping private fields must never mutate the store.
   return JSON.parse(JSON.stringify(value)) as T
+}
+
+function emailFilename(email: string | undefined, extension: string): string | undefined {
+  if (!email?.trim()) return undefined
+  let name = email
+    .trim()
+    .replace(/[<>:"/\\|?*\p{Cc}]/gu, '_')
+    .replace(/[. ]+$/g, '')
+  if (!name) return undefined
+  // Windows device names are reserved even when followed by an extension.
+  if (
+    /^(con|prn|aux|nul|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])(?:\.|$)/i.test(name)
+  ) {
+    name = `_${name}`
+  }
+  // Keep the complete component within 255 bytes, including its extension. Iterating
+  // code points also avoids splitting an emoji/surrogate pair when shortening a name.
+  const maxBytes = 255 - extension.length - 1
+  const encoder = new TextEncoder()
+  let shortened = ''
+  let bytes = 0
+  for (const character of name) {
+    const size = encoder.encode(character).length
+    if (bytes + size > maxBytes) break
+    shortened += character
+    bytes += size
+  }
+  shortened = shortened.replace(/[. ]+$/g, '')
+  return shortened ? `${shortened}.${extension}` : undefined
 }
 
 function minimalCredential(
@@ -137,6 +167,7 @@ export function createAccountExport(input: AccountExportInput): AccountExportRes
 
   try {
     const accounts = cloneJson(ids.map((id) => source.get(id)!))
+    const exportedAt = input.now ?? Date.now()
     const normalized: NormalizedCredential[] = []
     for (let index = 0; index < accounts.length; index++) {
       const account = accounts[index]
@@ -209,7 +240,7 @@ export function createAccountExport(input: AccountExportInput): AccountExportRes
           format: 'kiro-account-backup',
           schemaVersion: 1,
           version: input.appVersion,
-          exportedAt: input.now ?? Date.now(),
+          exportedAt,
           credentialsIncluded: includeCredentials,
           accounts: backupAccounts,
           groups: cloneJson(groups),
@@ -304,11 +335,20 @@ export function createAccountExport(input: AccountExportInput): AccountExportRes
       default:
         return fail('unsupported_format', '不支持的导出格式，未导出任何内容', accounts.length)
     }
+    const kind =
+      input.format === 'json' ? 'backup' : input.format === 'oidc' ? 'credentials' : input.format
+    const mode = includeCredentials ? 'with-credentials' : 'no-credentials'
+    const fallbackFilename = `kiro-accounts-${kind}-${mode}-${new Date(exportedAt).toISOString().slice(0, 10)}.${extension}`
     return {
       ok: true,
       content,
       count: accounts.length,
       extension,
+      // Derive the name from the same validated selection as the content, never a
+      // caller's candidate list or an unrelated account in the complete collection.
+      filename:
+        (accounts.length === 1 && emailFilename(normalized[0].email, extension)) ||
+        fallbackFilename,
       containsCredentials: includeCredentials
     }
   } catch {

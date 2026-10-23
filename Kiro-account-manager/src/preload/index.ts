@@ -1,3 +1,4 @@
+import type { AccountModelInfo } from '../shared/modelCatalog'
 import type { AppUpdateState, UpdateActionResult } from '../main/appUpdater'
 import type { LoginResult, SocialLoginCallback } from '../main/loginSessions'
 import { KIRO_INSTANCE_CHANNELS, type KiroInstancesApi } from '../shared/kiroInstances'
@@ -135,16 +136,19 @@ const api = {
     refreshToken: string
     clientId: string
     clientSecret: string
+    clientSecretExpiresAt?: number
     region?: string
     startUrl?: string
     authMethod?: 'IdC' | 'social'
-    provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise'
+    provider?: 'BuilderId' | 'Github' | 'Google' | 'Enterprise' | 'IAM_SSO'
     profileArn?: string
     accountId?: string
   }): Promise<{
     success: boolean
     error?: string
     refreshedCredentials?: { accessToken: string; refreshToken: string; expiresIn: number }
+    handoffProof?: string
+    preparedExpiresAt?: number
   }> => {
     return ipcRenderer.invoke('switch-account', credentials)
   },
@@ -174,11 +178,17 @@ const api = {
     refreshToken: string
     clientId?: string
     clientSecret?: string
+    clientSecretExpiresAt?: number
+    authMethod?: string
+    accountId?: string
+    expiresAt?: number
+    reusePreparedCredentials?: boolean
+    handoffProof?: string
     region?: string
     profileArn?: string
     provider?: string
     scopes?: string[]
-  }): Promise<{ success: boolean; error?: string; dbPath?: string }> => {
+  }): Promise<{ success: boolean; error?: string; dbPath?: string; refreshedCredentials?: { accessToken: string; refreshToken: string; expiresIn: number }; preparedExpiresAt?: number }> => {
     return ipcRenderer.invoke('switch-account-cli', credentials)
   },
 
@@ -205,6 +215,7 @@ const api = {
     refreshToken: string
     clientId: string
     clientSecret: string
+    clientSecretExpiresAt?: number
     region?: string
     authMethod?: string  // 'IdC' 或 'social'
     provider?: string    // 'BuilderId', 'Github', 'Google'
@@ -216,6 +227,7 @@ const api = {
       accessToken: string
       refreshToken: string
       expiresIn?: number
+      clientSecretExpiresAt?: number
       subscriptionType: string
       subscriptionTitle: string
       usage: { current: number; limit: number }
@@ -249,6 +261,7 @@ const api = {
       refreshToken: string
       clientId: string
       clientSecret: string
+      clientSecretExpiresAt?: number
       region: string
       authMethod: string  // 'IdC' 或 'social'
       provider: string    // 'BuilderId', 'Github', 'Google'
@@ -266,6 +279,7 @@ const api = {
       refreshToken: string
       clientId: string
       clientSecret: string
+      clientSecretExpiresAt?: number
       region: string
       expiresIn?: number
       email?: string
@@ -601,7 +615,7 @@ const api = {
   },
 
   // 获取可用模型列表
-  proxyGetModels: (): Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }>; fromCache?: boolean }> => {
+  proxyGetModels: (): Promise<{ success: boolean; error?: string; models: AccountModelInfo[]; fromCache?: boolean; accountId?: string }> => {
     return ipcRenderer.invoke('proxy-get-models')
   },
 
@@ -610,7 +624,7 @@ const api = {
   },
 
   // 获取账户可用模型列表
-  accountGetModels: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string): Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }> }> => {
+  accountGetModels: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string): Promise<{ success: boolean; error?: string; models: AccountModelInfo[] }> => {
     return ipcRenderer.invoke('account-get-models', accessToken, region, profileArn, machineId, provider, authMethod, accountId)
   },
 

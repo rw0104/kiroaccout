@@ -12,7 +12,7 @@ import type {
   AccountImportItem,
   BatchOperationResult,
   AccountSubscription,
-  SubscriptionType
+  AccountUsage
 } from '../types/account'
 import type {
   ProxyEntry,
@@ -25,6 +25,8 @@ import { useWebhookStore, type WebhookEvent, type WebhookMessage } from './webho
 import { emptyOutcome, findExistingDuplicate, normalizeCredentialRecord, planFromJsonValue, type ImportPlan, type ImportOutcome } from '../../../shared/accountImport'
 import { planBackupRestore } from '../../../shared/backupRestore'
 import { executeCredentialImport } from '../utils/accountImport'
+import { compareSubscriptionTypes, emptySubscriptionCounts, mergeAccountSubscription, normalizeAccountSubscription, normalizeSubscriptionType } from '../../../shared/accountSubscription'
+import { switchAccountToClients, type AccountSwitchResult, type AccountSwitchTarget } from '../../../shared/switchAccount'
 
 // ============================================
 // 账号管理 Store
@@ -60,6 +62,7 @@ let lastSaveError: Error | null = null
 // Every snapshot writer shares this queue. Build snapshots inside the queue so a
 // delayed autosave cannot restore an account after a confirmed deletion.
 let accountPersistenceQueue: Promise<void> = Promise.resolve()
+let accountSwitchTask: { id: string; target: AccountSwitchTarget; task: Promise<AccountSwitchResult> } | undefined
 function enqueueAccountPersistence<T>(work: () => Promise<T>): Promise<T> {
   const result = accountPersistenceQueue.then(work, work)
   accountPersistenceQueue = result.then(() => undefined, () => undefined)
@@ -244,6 +247,7 @@ async function syncLocalSsoAccountAsync(
       refreshToken: importResult.data.refreshToken,
       clientId: importResult.data.clientId || '',
       clientSecret: importResult.data.clientSecret || '',
+      clientSecretExpiresAt: importResult.data.clientSecretExpiresAt,
       region: importResult.data.region,
       authMethod: importResult.data.authMethod,
       provider: importResult.data.provider
@@ -264,13 +268,14 @@ async function syncLocalSsoAccountAsync(
         refreshToken: verifyResult.data.refreshToken,
         clientId: importResult.data.clientId || '',
         clientSecret: importResult.data.clientSecret || '',
+        clientSecretExpiresAt: importResult.data.clientSecretExpiresAt,
         region: importResult.data.region || 'us-east-1',
         expiresAt: verifyResult.data.expiresIn ? now + verifyResult.data.expiresIn * 1000 : now + 3600 * 1000,
         authMethod: importResult.data.authMethod as 'IdC' | 'social',
         provider: (importResult.data.provider || 'BuilderId') as 'BuilderId' | 'Github' | 'Google'
       },
-      subscription: {
-        type: verifyResult.data.subscriptionType as SubscriptionType,
+      subscription: normalizeAccountSubscription({
+        type: verifyResult.data.subscriptionType,
         title: verifyResult.data.subscriptionTitle,
         rawType: verifyResult.data.subscription?.rawType,
         daysRemaining: verifyResult.data.daysRemaining,
@@ -278,7 +283,7 @@ async function syncLocalSsoAccountAsync(
         managementTarget: verifyResult.data.subscription?.managementTarget,
         upgradeCapability: verifyResult.data.subscription?.upgradeCapability,
         overageCapability: verifyResult.data.subscription?.overageCapability
-      },
+      }),
       usage: {
         current: verifyResult.data.usage.current,
         limit: verifyResult.data.usage.limit,
@@ -292,6 +297,9 @@ async function syncLocalSsoAccountAsync(
         freeTrialCurrent: verifyResult.data.usage.freeTrialCurrent,
         freeTrialExpiry: verifyResult.data.usage.freeTrialExpiry,
         bonuses: verifyResult.data.usage.bonuses,
+        addOnCredits: verifyResult.data.usage.addOnCredits,
+        addOnCurrent: verifyResult.data.usage.addOnCurrent,
+        addOnLimit: verifyResult.data.usage.addOnLimit,
         nextResetDate: verifyResult.data.usage.nextResetDate,
         resourceDetail: verifyResult.data.usage.resourceDetail
       },
@@ -461,6 +469,7 @@ interface AccountsActions {
 
   // 激活账号
   setActiveAccount: (id: string | null) => void
+  switchAccountToTarget: (id: string, target?: AccountSwitchTarget) => Promise<AccountSwitchResult>
   getActiveAccount: () => Account | null
 
   // 分组操作
@@ -722,6 +731,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     const account: Account = {
       ...accountData,
+      subscription: normalizeAccountSubscription(accountData.subscription ?? {}),
       id,
       machineId,
       createdAt: now,
@@ -745,7 +755,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const accounts = new Map(state.accounts)
       const account = accounts.get(id)
       if (account) {
-        accounts.set(id, { ...account, ...updates })
+        accounts.set(id, { ...account, ...updates, subscription: mergeAccountSubscription(account.subscription, updates.subscription) })
       }
       return { accounts }
     })
@@ -783,6 +793,51 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   }),
 
   // ==================== 激活账号 ====================
+
+  switchAccountToTarget: (id, target = get().switchTarget) => {
+    if (accountSwitchTask) {
+      if (accountSwitchTask.id === id && accountSwitchTask.target === target) return accountSwitchTask.task
+      return Promise.resolve({ success: false, error: '另一个账号正在切换，请等待完成后重试', completedTargets: [] })
+    }
+    set(state => ({ accountOperationCounts: accountOperationCountsAfter(state, id, 1) }))
+    const task = switchAccountToClients(id, target, {
+      getAccount: accountId => get().accounts.get(accountId),
+      switchIde: payload => window.api.switchAccount(payload),
+      switchCli: payload => window.api.switchAccountCli(payload),
+      applyCredentials: (accountId, expected, next) => {
+        let accepted = false
+        set(state => {
+          const account = state.accounts.get(accountId)
+          if (!account) return {}
+          if (account.credentials.accessToken === next.accessToken && account.credentials.refreshToken === next.refreshToken) {
+            accepted = true
+            if (account.credentials.expiresAt === next.expiresAt) return {}
+            // The earlier refresh event can arrive before the IDE write supplies
+            // its exact prepared expiry. Keep the same generation, align its proof.
+            const accounts = new Map(state.accounts)
+            accounts.set(accountId, { ...account, credentials: { ...account.credentials, expiresAt: next.expiresAt } })
+            return { accounts }
+          }
+          if (account.credentials.accessToken !== expected.accessToken || account.credentials.refreshToken !== expected.refreshToken) return {}
+          accepted = true
+          const accounts = new Map(state.accounts)
+          accounts.set(accountId, { ...account, credentials: { ...account.credentials, ...next } })
+          return { accounts }
+        })
+        return accepted
+      },
+      persist: () => get().saveAccountChanges(),
+      activate: async accountId => {
+        await get().setActiveAccount(accountId)
+        await get().saveAccountChanges()
+      }
+    }).finally(() => {
+      if (accountSwitchTask?.task === task) accountSwitchTask = undefined
+      set(state => ({ accountOperationCounts: accountOperationCountsAfter(state, id, -1) }))
+    })
+    accountSwitchTask = { id, target, task }
+    return task
+  },
 
   setActiveAccount: async (id) => {
     const state = get()
@@ -1067,7 +1122,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     }
 
     if (filter.subscriptionTypes?.length) {
-      result = result.filter((a) => filter.subscriptionTypes!.includes(a.subscription.type))
+      result = result.filter((a) => filter.subscriptionTypes!.includes(normalizeSubscriptionType(a.subscription)))
     }
 
     if (filter.statuses?.length) {
@@ -1134,7 +1189,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           cmp = (a.nickname ?? '').localeCompare(b.nickname ?? '')
           break
         case 'subscription':
-          cmp = a.subscription.type.localeCompare(b.subscription.type)
+          cmp = compareSubscriptionTypes(a.subscription, b.subscription)
           break
         case 'usage':
           cmp = a.usage.percentUsed - b.usage.percentUsed
@@ -1252,7 +1307,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         email: item.email.trim(), password: credential.password, nickname: credential.nickname,
         userId: credential.userId, idp: credential.provider, groupId: item.groupId,
         credentials: { ...credential, accessToken: credential.accessToken || '', csrfToken: '', expiresAt: credential.expiresAt || now },
-        subscription: { type: 'Free' },
+        subscription: { type: 'Unknown' },
         usage: { current: 0, limit: 0, percentUsed: 0, lastUpdated: now },
         tags: item.tags || [], status: 'unknown', lastUsedAt: now
       })
@@ -1543,16 +1598,16 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
               freeTrialCurrent: apiUsage.freeTrialCurrent,
               freeTrialExpiry: apiUsage.freeTrialExpiry,
               bonuses: apiUsage.bonuses,
+              addOnCredits: apiUsage.addOnCredits,
+              addOnCurrent: apiUsage.addOnCurrent,
+              addOnLimit: apiUsage.addOnLimit,
               nextResetDate: apiUsage.nextResetDate,
               resourceDetail: apiUsage.resourceDetail
             } : acc.usage
 
             // 合并订阅信息
             const apiSub = result.data!.subscription
-            const mergedSubscription = apiSub ? {
-              ...acc.subscription,
-              ...apiSub
-            } : acc.subscription
+            const mergedSubscription = mergeAccountSubscription(acc.subscription, apiSub)
 
             // 转换 IDP 类型（保持原值优先，只有明确匹配时才更新）
             const apiIdp = result.data!.idp
@@ -1682,13 +1737,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         refreshing: 0,
         unknown: 0
       },
-      bySubscription: {
-        Free: 0,
-        Pro: 0,
-        Pro_Plus: 0,
-        Enterprise: 0,
-        Teams: 0
-      },
+      bySubscription: emptySubscriptionCounts(),
       byIdp: {
         Google: 0,
         Github: 0,
@@ -1705,7 +1754,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     for (const account of accountList) {
       stats.byStatus[account.status]++
-      stats.bySubscription[account.subscription.type]++
+      stats.bySubscription[normalizeSubscriptionType(account.subscription)]++
       stats.byIdp[account.idp]++
 
       if (account.isActive) stats.activeCount++
@@ -1742,6 +1791,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         // 为没有 machineId 的现有账户生成一个
         let needsSave = false
         for (const [id, account] of accounts) {
+          const subscription = normalizeAccountSubscription(account.subscription ?? {})
+          if (subscription.type !== account.subscription?.type) {
+            account.subscription = subscription
+            needsSave = true
+          }
           if (!account.machineId) {
             account.machineId = generateRandomMachineId()
             accounts.set(id, account)
@@ -1810,9 +1864,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         // 启动定时自动保存（防止数据丢失）
         get().startAutoSave()
 
-        // 如果生成了新的 machineId，保存到存储
+        // 保存本地类型迁移和新生成的 machineId
         if (needsSave) {
-          console.log('[Store] Saving accounts with newly generated machineIds')
+          console.log('[Store] Saving normalized account metadata')
           get().saveToStorage()
         }
 
@@ -2131,7 +2185,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   },
 
   checkAndAutoSwitch: async () => {
-    const { accounts, autoSwitchThreshold, checkAccountStatus, setActiveAccount } = get()
+    const { autoSwitchThreshold, checkAccountStatus } = get()
     const activeAccount = get().getActiveAccount()
     
     if (!activeAccount) {
@@ -2156,7 +2210,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       console.log(`[AutoSwitch] Account ${updatedAccount.email} reached threshold, switching...`)
       
       // 查找可用的账号
-      const availableAccount = Array.from(accounts.values()).find(acc => {
+      const availableAccount = Array.from(get().accounts.values()).find(acc => {
         // 排除当前账号
         if (acc.id === activeAccount.id) return false
         // 排除被封禁的账号
@@ -2169,57 +2223,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
       if (availableAccount) {
         console.log(`[AutoSwitch] Switching to: ${availableAccount.email}`)
-        setActiveAccount(availableAccount.id)
-        // 根据 switchTarget 设置决定切换目标
-        const { switchTarget: target } = get()
-        const creds = availableAccount.credentials
-        if (target === 'ide' || target === 'both') {
-          const switchResult = await window.api.switchAccount({
-            accessToken: creds.accessToken || '',
-            refreshToken: creds.refreshToken || '',
-            clientId: creds.clientId || '',
-            clientSecret: creds.clientSecret || '',
-            region: creds.region || 'us-east-1',
-            startUrl: creds.startUrl,
-            authMethod: creds.authMethod,
-            provider: creds.provider,
-            profileArn: (availableAccount as { profileArn?: string }).profileArn,
-            accountId: availableAccount.id
-          })
-          // 把 main 进程 refresh 后的最新 credentials 同步回 store，
-          // 否则 store 里的 refreshToken 仍是 v1（已被服务端 rotate 作废），下次任何 refresh 都会失败
-          if (switchResult?.success && switchResult.refreshedCredentials) {
-            const rc = switchResult.refreshedCredentials
-            set((state) => {
-              const accounts = new Map(state.accounts)
-              const acc = accounts.get(availableAccount.id)
-              if (acc) {
-                accounts.set(availableAccount.id, {
-                  ...acc,
-                  credentials: {
-                    ...acc.credentials,
-                    accessToken: rc.accessToken,
-                    refreshToken: rc.refreshToken,
-                    expiresAt: Date.now() + rc.expiresIn * 1000
-                  }
-                })
-              }
-              return { accounts }
-            })
-            get().saveToStorage()
-          }
-        }
-        if (target === 'cli' || target === 'both') {
-          window.api.switchAccountCli?.({
-            accessToken: creds.accessToken || '',
-            refreshToken: creds.refreshToken || '',
-            clientId: creds.clientId,
-            clientSecret: creds.clientSecret,
-            region: creds.region || 'us-east-1',
-            profileArn: (availableAccount as { profileArn?: string }).profileArn,
-            provider: creds.provider
-          }).catch(err => console.warn('[AutoSwitch CLI] Failed:', err))
-        }
+        const result = await get().switchAccountToTarget(availableAccount.id)
+        if (!result.success) console.warn('[AutoSwitch] Switch incomplete:', result.error)
+
       } else {
         console.log('[AutoSwitch] No available account to switch to')
       }
@@ -2499,6 +2505,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           freeTrialLimit?: number
           freeTrialExpiry?: string
           bonuses?: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
+          addOnCredits?: AccountUsage['addOnCredits']
+          addOnCurrent?: number
+          addOnLimit?: number
           nextResetDate?: string
           resourceDetail?: {
             displayName?: string
@@ -2511,7 +2520,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             overageEnabled?: boolean
           }
         }
-        subscription?: { type?: string; title?: string; daysRemaining?: number; expiresAt?: number; overageCapability?: string; upgradeCapability?: string; subscriptionManagementTarget?: string }
+        subscription?: { type?: string; title?: string; rawType?: string; daysRemaining?: number; expiresAt?: number; overageCapability?: string; upgradeCapability?: string; subscriptionManagementTarget?: string }
         userInfo?: { email?: string; userId?: string }
         status?: string
         errorMessage?: string
@@ -2547,21 +2556,24 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             freeTrialLimit: refreshData.usage.freeTrialLimit ?? account.usage.freeTrialLimit,
             freeTrialExpiry: refreshData.usage.freeTrialExpiry ?? account.usage.freeTrialExpiry,
             bonuses: refreshData.usage.bonuses ?? account.usage.bonuses,
+            addOnCredits: refreshData.usage.addOnCredits ?? account.usage.addOnCredits,
+            addOnCurrent: refreshData.usage.addOnCurrent ?? account.usage.addOnCurrent,
+            addOnLimit: refreshData.usage.addOnLimit ?? account.usage.addOnLimit,
             nextResetDate: refreshData.usage.nextResetDate ?? account.usage.nextResetDate,
             resourceDetail: refreshData.usage.resourceDetail ?? account.usage.resourceDetail,
             lastUpdated: now
           }
         })() : account.usage,
-        subscription: refreshData?.subscription ? {
-          ...account.subscription,
-          type: (refreshData.subscription.type as SubscriptionType) || account.subscription.type,
-          title: refreshData.subscription.title || account.subscription.title,
+        subscription: refreshData?.subscription ? mergeAccountSubscription(account.subscription, {
+          type: normalizeSubscriptionType(refreshData.subscription),
+          title: refreshData.subscription.title,
+          rawType: refreshData.subscription.rawType,
           daysRemaining: refreshData.subscription.daysRemaining ?? account.subscription.daysRemaining,
           expiresAt: refreshData.subscription.expiresAt ?? account.subscription.expiresAt,
           overageCapability: refreshData.subscription.overageCapability ?? account.subscription.overageCapability,
           upgradeCapability: refreshData.subscription.upgradeCapability ?? account.subscription.upgradeCapability,
           managementTarget: refreshData.subscription.subscriptionManagementTarget ?? account.subscription.managementTarget
-        } : account.subscription,
+        }) : normalizeAccountSubscription(account.subscription),
         email: refreshData?.userInfo?.email || account.email,
         userId: refreshData?.userInfo?.userId || account.userId,
         status: newStatus,
@@ -2612,6 +2624,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           freeTrialLimit?: number
           freeTrialExpiry?: string
           bonuses?: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
+          addOnCredits?: AccountUsage['addOnCredits']
+          addOnCurrent?: number
+          addOnLimit?: number
           nextResetDate?: string
           resourceDetail?: {
             displayName?: string
@@ -2624,7 +2639,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             overageEnabled?: boolean
           }
         }
-        subscription?: { type?: string; title?: string; daysRemaining?: number; expiresAt?: number; overageCapability?: string; upgradeCapability?: string; subscriptionManagementTarget?: string }
+        subscription?: { type?: string; title?: string; rawType?: string; daysRemaining?: number; expiresAt?: number; overageCapability?: string; upgradeCapability?: string; subscriptionManagementTarget?: string }
         userInfo?: { email?: string; userId?: string }
         status?: string
         errorMessage?: string
@@ -2656,21 +2671,24 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             freeTrialLimit: checkData.usage.freeTrialLimit ?? account.usage.freeTrialLimit,
             freeTrialExpiry: checkData.usage.freeTrialExpiry ?? account.usage.freeTrialExpiry,
             bonuses: checkData.usage.bonuses ?? account.usage.bonuses,
+            addOnCredits: checkData.usage.addOnCredits ?? account.usage.addOnCredits,
+            addOnCurrent: checkData.usage.addOnCurrent ?? account.usage.addOnCurrent,
+            addOnLimit: checkData.usage.addOnLimit ?? account.usage.addOnLimit,
             nextResetDate: checkData.usage.nextResetDate ?? account.usage.nextResetDate,
             resourceDetail: checkData.usage.resourceDetail ?? account.usage.resourceDetail,
             lastUpdated: now
           }
         })() : account.usage,
-        subscription: checkData?.subscription ? {
-          ...account.subscription,
-          type: (checkData.subscription.type as 'Free' | 'Pro' | 'Enterprise' | 'Teams') ?? account.subscription.type,
-          title: checkData.subscription.title ?? account.subscription.title,
+        subscription: checkData?.subscription ? mergeAccountSubscription(account.subscription, {
+          type: normalizeSubscriptionType(checkData.subscription),
+          title: checkData.subscription.title,
+          rawType: checkData.subscription.rawType,
           daysRemaining: checkData.subscription.daysRemaining ?? account.subscription.daysRemaining,
           expiresAt: checkData.subscription.expiresAt ?? account.subscription.expiresAt,
           overageCapability: checkData.subscription.overageCapability ?? account.subscription.overageCapability,
           upgradeCapability: checkData.subscription.upgradeCapability ?? account.subscription.upgradeCapability,
           managementTarget: checkData.subscription.subscriptionManagementTarget ?? account.subscription.managementTarget
-        } : account.subscription,
+        }) : normalizeAccountSubscription(account.subscription),
         email: checkData?.userInfo?.email || account.email,
         userId: checkData?.userInfo?.userId || account.userId,
         status: newStatus,

@@ -795,13 +795,13 @@ export function SettingsPage() {
               onChange={(e) => handleUsageApiTypeChange(e.target.value as 'rest' | 'cbor')}
               disabled={usageApiLoading}
             >
-              <option value="rest">REST (GetUsageLimits)</option>
-              <option value="cbor">CBOR (GetUserUsageAndLimits)</option>
+              <option value="rest">{isEn ? 'Kiro client (recommended)' : 'Kiro 客户端（推荐）'}</option>
+              <option value="cbor">{isEn ? 'Web portal (compatibility)' : '网页端（兼容）'}</option>
             </select>
           </div>
           <div className="text-xs text-muted-foreground bg-muted/50 rounded-lg p-3 space-y-1">
-            <p>• <strong>REST</strong>: {isEn ? 'Official Kiro IDE format, recommended' : '官方 Kiro IDE 使用的格式，推荐使用'}</p>
-            <p>• <strong>CBOR</strong>: {isEn ? 'Web portal format, may have different fields' : '网页端格式，字段可能有差异'}</p>
+            <p>• {isEn ? 'Kiro client: current account service, including purchased credits.' : 'Kiro 客户端：使用当前账户服务，包含购买的充值额度。'}</p>
+            <p>• {isEn ? 'Web portal: compatibility option; available fields can differ.' : '网页端：保留兼容选项，可用字段可能不同。'}</p>
           </div>
           <div className="flex items-center justify-between pt-2 border-t">
             <div>

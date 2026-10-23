@@ -4,6 +4,7 @@
  */
 import type { CSSProperties } from 'react'
 import type { Account } from '@/types/account'
+import { normalizeSubscriptionType, type SubscriptionType } from '../../../../shared/accountSubscription'
 
 // ============ 颜色解析 ============
 
@@ -91,12 +92,22 @@ export const unauthorizedRowStyle: CSSProperties = {
 
 // ============ 订阅徽章配色 ============
 
-export function getSubscriptionColor(type: string, title?: string): string {
-  const text = (title || type).toUpperCase()
-  if (text.includes('PRO+') || text.includes('PRO_PLUS') || text.includes('PROPLUS')) return 'bg-purple-500'
-  if (text.includes('POWER')) return 'bg-amber-500'
-  if (text.includes('PRO')) return 'bg-blue-500'
-  return 'bg-gray-500'
+export function getSubscriptionColor(type: string, title?: string, rawType?: string): string {
+  const colors: Record<SubscriptionType, string> = {
+    Free: 'bg-gray-500', Pro: 'bg-blue-500', Pro_Plus: 'bg-purple-500', Pro_Max: 'bg-fuchsia-600',
+    Power: 'bg-amber-500', Enterprise: 'bg-emerald-600', Teams: 'bg-cyan-600', Unknown: 'bg-slate-500'
+  }
+  return colors[normalizeSubscriptionType({ type, title, rawType })]
+}
+
+export function getSubscriptionSoftColor(type: string, title?: string, rawType?: string): string {
+  const colors: Record<SubscriptionType, string> = {
+    Free: 'bg-muted text-muted-foreground', Pro: 'bg-blue-500/15 text-blue-700 dark:text-blue-300',
+    Pro_Plus: 'bg-purple-500/15 text-purple-700 dark:text-purple-300', Pro_Max: 'bg-fuchsia-500/15 text-fuchsia-700 dark:text-fuchsia-300',
+    Power: 'bg-amber-500/15 text-amber-700 dark:text-amber-300', Enterprise: 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300',
+    Teams: 'bg-cyan-500/15 text-cyan-700 dark:text-cyan-300', Unknown: 'bg-muted text-muted-foreground'
+  }
+  return colors[normalizeSubscriptionType({ type, title, rawType })]
 }
 
 // ============ 状态文本 ============

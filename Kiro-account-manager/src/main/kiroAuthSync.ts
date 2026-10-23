@@ -23,21 +23,17 @@ export const KIRO_SSO_CACHE_DIR = path.join(os.homedir(), '.aws', 'sso', 'cache'
 export const KIRO_AUTH_TOKEN_PATH = path.join(KIRO_SSO_CACHE_DIR, 'kiro-auth-token.json')
 
 const KIRO_DEFAULT_START_URL = 'https://view.awsapps.com/start'
-const KIRO_OIDC_SCOPES = [
-  'codewhisperer:completions',
-  'codewhisperer:analysis',
-  'codewhisperer:conversations',
-  'codewhisperer:transformations',
-  'codewhisperer:taskassist'
-]
+const CLIENT_REGISTRATION_EXPIRY_BUFFER_MS = 900_000
 
 // =============== profileArn 决策中心 ===============
 //
 // 占位符 ARN：Kiro IDE 源码 FixedProfileArns 里给 BuilderId 硬编码的值。
 // Kiro IDE 内部逻辑依赖该字段存在，移除会导致 IDE 功能异常。
-export const KIRO_BUILDER_ID_PLACEHOLDER_ARN = 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX'
+export const KIRO_BUILDER_ID_PLACEHOLDER_ARN =
+  'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX'
 // Social 登录（Github/Google）共用的 Kiro 后端固定 profileArn
-export const KIRO_SOCIAL_PROFILE_ARN = 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK'
+export const KIRO_SOCIAL_PROFILE_ARN =
+  'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK'
 
 // Enterprise 备用 profileArn（自动获取失败时使用，区域动态替换）
 const ENTERPRISE_FALLBACK_PROFILE_ID = 'VNECVYCYYAWN'
@@ -105,6 +101,8 @@ export interface WriteKiroAuthTokenInput {
   /** IdC 必填：会一起写客户端注册文件 */
   clientId?: string
   clientSecret?: string
+  /** Actual OIDC registration deadline in Unix seconds; never synthesized. */
+  clientSecretExpiresAt?: number
   profileArn?: string
 }
 
@@ -120,6 +118,45 @@ function computeClientIdHash(startUrl?: string): string {
     .digest('hex')
 }
 
+export interface KiroClientRegistration {
+  clientId: string
+  clientSecret: string
+  expiresAt: string
+}
+
+/** Pure preflight: call before rotating credentials or changing the shared IDE cache. */
+export function validateKiroClientRegistration(
+  input: Pick<
+    WriteKiroAuthTokenInput,
+    'authMethod' | 'clientId' | 'clientSecret' | 'clientSecretExpiresAt'
+  >,
+  now = Date.now()
+): KiroClientRegistration | undefined {
+  if (input.authMethod === 'social') return undefined
+  const rawExpiry = input.clientSecretExpiresAt
+  const milliseconds =
+    typeof rawExpiry === 'number' && Number.isFinite(rawExpiry)
+      ? Math.floor(rawExpiry >= 1e12 ? rawExpiry / 1000 : rawExpiry) * 1000
+      : NaN
+  const expiry = new Date(milliseconds)
+  if (
+    input.authMethod !== 'IdC' ||
+    !input.clientId?.trim() ||
+    !input.clientSecret?.trim() ||
+    !Number.isFinite(expiry.getTime()) ||
+    milliseconds <= now + CLIENT_REGISTRATION_EXPIRY_BUFFER_MS
+  ) {
+    throw new Error(
+      'OIDC 客户端登记缺失、已过期或即将到期，请重新授权后切换；未改写 Kiro 登录缓存。'
+    )
+  }
+  return {
+    clientId: input.clientId,
+    clientSecret: input.clientSecret,
+    expiresAt: expiry.toISOString()
+  }
+}
+
 /**
  * 以与 Kiro IDE 完全兼容的格式写入 ~/.aws/sso/cache/kiro-auth-token.json
  * - mode 0o600：与 IDE 保持一致（writeTokenToDisk 用 0o600 即 384）
@@ -129,8 +166,9 @@ function computeClientIdHash(startUrl?: string): string {
 export async function writeKiroAuthTokenFile(
   input: WriteKiroAuthTokenInput
 ): Promise<WriteKiroAuthTokenResult> {
-  await fs.mkdir(KIRO_SSO_CACHE_DIR, { recursive: true })
-
+  // Validate the complete registration before creating the cache directory or
+  // publishing a token. The official IDE rejects registration inside 15 minutes.
+  const registration = validateKiroClientRegistration(input)
   const clientIdHash = computeClientIdHash(input.startUrl)
 
   const tokenData: Record<string, unknown> =
@@ -154,6 +192,18 @@ export async function writeKiroAuthTokenFile(
           profileArn: input.profileArn
         }
 
+  await fs.mkdir(KIRO_SSO_CACHE_DIR, { recursive: true })
+  let clientRegPath: string | undefined
+  // Registration must be available before the IDE can observe the new token.
+  if (registration) {
+    clientRegPath = path.join(KIRO_SSO_CACHE_DIR, `${clientIdHash}.json`)
+    await fs.writeFile(clientRegPath, JSON.stringify(registration, null, 2), { mode: 0o600 })
+    try {
+      await fs.chmod(clientRegPath, 0o600)
+    } catch {
+      /* ignore */
+    }
+  }
   await fs.writeFile(KIRO_AUTH_TOKEN_PATH, JSON.stringify(tokenData, null, 2), {
     mode: 0o600
   })
@@ -162,25 +212,6 @@ export async function writeKiroAuthTokenFile(
     await fs.chmod(KIRO_AUTH_TOKEN_PATH, 0o600)
   } catch {
     /* ignore */
-  }
-
-  let clientRegPath: string | undefined
-  if (input.authMethod !== 'social' && input.clientId && input.clientSecret) {
-    clientRegPath = path.join(KIRO_SSO_CACHE_DIR, `${clientIdHash}.json`)
-    // IDE 客户端注册有效期 90 天（Kiro IDE 原版做法），格式为去掉 Z 的 ISO 字符串
-    const clientExpiresAt = new Date(Date.now() + 90 * 24 * 3600 * 1000).toISOString().replace('Z', '')
-    const clientData = {
-      clientId: input.clientId,
-      clientSecret: input.clientSecret,
-      expiresAt: clientExpiresAt,
-      scopes: KIRO_OIDC_SCOPES
-    }
-    await fs.writeFile(clientRegPath, JSON.stringify(clientData, null, 2), { mode: 0o600 })
-    try {
-      await fs.chmod(clientRegPath, 0o600)
-    } catch {
-      /* ignore */
-    }
   }
 
   return { tokenPath: KIRO_AUTH_TOKEN_PATH, clientRegPath }
@@ -219,7 +250,12 @@ export function parseAccessTokenClaims(accessToken: string): AccessTokenClaims |
     const json = Buffer.from(b64, 'base64').toString('utf-8')
     const claims = JSON.parse(json) as Record<string, unknown>
     const audRaw = claims.aud
-    const aud = typeof audRaw === 'string' ? audRaw : Array.isArray(audRaw) && typeof audRaw[0] === 'string' ? (audRaw[0] as string) : undefined
+    const aud =
+      typeof audRaw === 'string'
+        ? audRaw
+        : Array.isArray(audRaw) && typeof audRaw[0] === 'string'
+          ? (audRaw[0] as string)
+          : undefined
     return {
       sub: typeof claims.sub === 'string' ? (claims.sub as string) : undefined,
       email: typeof claims.email === 'string' ? (claims.email as string) : undefined,

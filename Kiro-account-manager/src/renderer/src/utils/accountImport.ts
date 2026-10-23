@@ -7,7 +7,8 @@ import {
   type ImportPlan,
   type NormalizedCredential
 } from '../../../shared/accountImport'
-import type { Account, SubscriptionType } from '../types/account'
+import type { Account } from '../types/account'
+import { normalizeSubscriptionType } from '../../../shared/accountSubscription'
 
 type Verification = Awaited<ReturnType<Window['api']['verifyAccountCredentials']>>
 type AccountInput = Omit<Account, 'id' | 'createdAt' | 'isActive'>
@@ -47,7 +48,6 @@ export function verifiedAccount(
   const userId = data.userId?.trim() || credential.userId
   if (!email && !userId) throw new Error('Missing verified identity')
   const seconds = Number.isFinite(data.expiresIn) && data.expiresIn! > 0 ? data.expiresIn! : 0
-  const subscriptions: SubscriptionType[] = ['Free', 'Pro', 'Pro_Plus', 'Enterprise', 'Teams']
   return {
     email,
     userId,
@@ -71,7 +71,7 @@ export function verifiedAccount(
     },
     profileArn: data.profileArn || credential.profileArn,
     subscription: {
-      type: subscriptions.includes(data.subscriptionType as SubscriptionType) ? data.subscriptionType as SubscriptionType : 'Free',
+      type: normalizeSubscriptionType({ type: data.subscriptionType, title: data.subscriptionTitle, rawType: data.subscription?.rawType }),
       title: data.subscriptionTitle,
       rawType: data.subscription?.rawType,
       daysRemaining: data.daysRemaining,

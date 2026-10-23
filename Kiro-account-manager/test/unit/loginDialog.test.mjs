@@ -96,6 +96,18 @@ test('Google and Github shortcuts start provider-bound portal polling without le
   assert.equal(generic.portalStarts[0].expectedProvider, undefined)
 })
 
+test('verified login preserves purchased credit details when inserting the account', async () => {
+  const usage = { current: 110, limit: 600, addOnCurrent: 10, addOnLimit: 500,
+    addOnCredits: [{ id: 'synthetic-pack', current: 10, limit: 500, remaining: 490, status: 'active', expiresAt: '2027-03-01T00:00:00.000Z' }] }
+  const harness = dialogHarness({ verify: async () => verified({ usage }) })
+  await harness.dialog.handleStartSocialLogin('Google')
+  await harness.complete()
+  assert.deepEqual(harness.addedAccount.usage.addOnCredits, usage.addOnCredits)
+  assert.equal(harness.addedAccount.usage.addOnCurrent, 10)
+  assert.equal(harness.addedAccount.usage.addOnLimit, 500)
+  assert.equal(harness.addedAccount.usage.limit, 600)
+})
+
 test('closing during portal verification rejects late account insertion and stops only that poll', async () => {
   const verify = deferred()
   const harness = dialogHarness({ verify: () => verify.promise })

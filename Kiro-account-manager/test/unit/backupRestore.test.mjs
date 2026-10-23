@@ -243,7 +243,7 @@ test('unknown subscriptions and transient state are normalized for restored acco
   const b = backupOf([acct('a', 'a@example.invalid', { status: 'refreshing', subscription: { type: 'Unknown' }, usage: { current: '1' } })])
   const plan = planBackupRestore(b, ctx())
   assert.equal(plan.accounts[0].status, 'unknown')
-  assert.equal(plan.accounts[0].subscription.type, 'Free')
+  assert.equal(plan.accounts[0].subscription.type, 'Unknown')
   assert.equal(plan.accounts[0].usage.current, 0)
   assert.equal(plan.accounts[0].isActive, false)
 })

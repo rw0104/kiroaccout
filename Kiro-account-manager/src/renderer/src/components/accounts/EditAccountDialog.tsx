@@ -1,9 +1,10 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { X, Loader2, RefreshCw, Download, CheckCircle, Copy, Check } from 'lucide-react'
 import { Button, Card, CardContent, CardHeader, CardTitle } from '../ui'
 import { useAccountsStore } from '@/store'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account, SubscriptionType } from '@/types/account'
+import type { AccountAddOnCredit } from '../../../../shared/accountUsage'
 
 interface EditAccountDialogProps {
   open: boolean
@@ -25,6 +26,22 @@ export function EditAccountDialog({
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
   const [region, setRegion] = useState('us-east-1')
+  const registrationRef = useRef<{
+    accountId: string
+    clientId: string
+    clientSecret: string
+    region: string
+    clientSecretExpiresAt?: number
+  } | null>(null)
+  const matchingRegistrationExpiry = (): number | undefined => {
+    const registration = registrationRef.current
+    return registration?.accountId === account?.id &&
+      registration?.clientId === clientId &&
+      registration?.clientSecret === clientSecret &&
+      registration?.region === region
+      ? registration?.clientSecretExpiresAt
+      : undefined
+  }
 
   // 可编辑字段
   const [nickname, setNickname] = useState('')
@@ -45,6 +62,9 @@ export function EditAccountDialog({
       freeTrialCurrent?: number
       freeTrialExpiry?: string
       bonuses?: { code: string; name: string; current: number; limit: number; expiresAt?: string }[]
+      addOnCredits?: AccountAddOnCredit[]
+      addOnCurrent?: number
+      addOnLimit?: number
       nextResetDate?: string
     }
     daysRemaining?: number
@@ -71,6 +91,13 @@ export function EditAccountDialog({
       setClientId(account.credentials.clientId || '')
       setClientSecret(account.credentials.clientSecret || '')
       setRegion(account.credentials.region || 'us-east-1')
+      registrationRef.current = {
+        accountId: account.id,
+        clientId: account.credentials.clientId || '',
+        clientSecret: account.credentials.clientSecret || '',
+        region: account.credentials.region || 'us-east-1',
+        clientSecretExpiresAt: account.credentials.clientSecretExpiresAt
+      }
       setNickname(account.nickname || '')
       
       // 设置当前账号信息
@@ -81,6 +108,7 @@ export function EditAccountDialog({
         subscriptionType: account.subscription.type,
         subscriptionTitle: account.subscription.title || account.subscription.type,
         usage: {
+          ...account.usage,
           current: account.usage?.current || 0,
           limit: account.usage?.limit || 0
         },
@@ -100,6 +128,13 @@ export function EditAccountDialog({
         setClientId(result.data.clientId)
         setClientSecret(result.data.clientSecret)
         setRegion(result.data.region)
+        if (account) registrationRef.current = {
+          accountId: account.id,
+          clientId: result.data.clientId,
+          clientSecret: result.data.clientSecret,
+          region: result.data.region,
+          clientSecretExpiresAt: result.data.clientSecretExpiresAt
+        }
         setError(null)
       } else {
         setError(result.error || '导入失败')
@@ -125,16 +160,25 @@ export function EditAccountDialog({
     setError(null)
 
     try {
+      const clientSecretExpiresAt = matchingRegistrationExpiry()
       const result = await window.api.verifyAccountCredentials({
         refreshToken,
         clientId,
         clientSecret,
+        clientSecretExpiresAt,
         region,
         authMethod: account?.credentials.authMethod,
         provider: account?.credentials.provider || account?.idp
       })
 
       if (result.success && result.data) {
+        if (account) registrationRef.current = {
+          accountId: account.id,
+          clientId,
+          clientSecret,
+          region,
+          clientSecretExpiresAt: result.data.clientSecretExpiresAt ?? clientSecretExpiresAt
+        }
         setAccountInfo({
           email: result.data.email,
           userId: result.data.userId,
@@ -176,6 +220,7 @@ export function EditAccountDialog({
         refreshToken,
         clientId,
         clientSecret,
+        clientSecretExpiresAt: matchingRegistrationExpiry(),
         region,
         expiresAt: now + 3600 * 1000
       },
@@ -198,6 +243,9 @@ export function EditAccountDialog({
         freeTrialCurrent: accountInfo.usage.freeTrialCurrent,
         freeTrialExpiry: accountInfo.usage.freeTrialExpiry,
         bonuses: accountInfo.usage.bonuses,
+        addOnCredits: accountInfo.usage.addOnCredits,
+        addOnCurrent: accountInfo.usage.addOnCurrent,
+        addOnLimit: accountInfo.usage.addOnLimit,
         nextResetDate: accountInfo.usage.nextResetDate
       },
       status: 'active'

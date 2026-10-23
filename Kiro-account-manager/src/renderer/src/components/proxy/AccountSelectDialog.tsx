@@ -2,6 +2,7 @@ import { useState, useMemo } from 'react'
 import { X, Search, Check, User, CreditCard, Zap, Mail, AlertCircle, Ban } from 'lucide-react'
 import { Button, Card, CardContent, CardHeader, CardTitle, Input, Badge } from '../ui'
 import type { Account } from '../../types/account'
+import { getSubscriptionColor } from '../accounts/_helpers'
 
 interface AccountSelectDialogProps {
   open: boolean
@@ -55,19 +56,6 @@ export function AccountSelectDialog({
     const usage = acc.usage
     if (!usage) return '-'
     return `${usage.current.toFixed(1)} / ${usage.limit}`
-  }
-
-  const getSubscriptionColor = (title?: string): string => {
-    if (!title) return 'bg-gray-500 text-white'
-    const t = title.toUpperCase()
-    // KIRO PRO+ / PRO_PLUS - 紫色
-    if (t.includes('PRO+') || t.includes('PRO_PLUS') || t.includes('PROPLUS')) return 'bg-purple-500 text-white'
-    // KIRO POWER - 金色
-    if (t.includes('POWER')) return 'bg-amber-500 text-white'
-    // KIRO PRO - 蓝色
-    if (t.includes('PRO')) return 'bg-blue-500 text-white'
-    // KIRO FREE - 灰色
-    return 'bg-gray-500 text-white'
   }
 
   // 检测是否为封禁账号（通过 lastError 判断）
@@ -240,7 +228,7 @@ export function AccountSelectDialog({
                         
                         {/* 订阅类型和使用量 */}
                         <div className="flex items-center gap-3 mt-2">
-                          <Badge className={`text-xs ${getSubscriptionColor(acc.subscription?.title)}`}>
+                          <Badge className={`text-xs text-white ${getSubscriptionColor(acc.subscription?.type || 'Unknown', acc.subscription?.title, acc.subscription?.rawType)}`}>
                             <CreditCard className="h-3 w-3 mr-1" />
                             {acc.subscription?.title || 'Unknown'}
                           </Badge>

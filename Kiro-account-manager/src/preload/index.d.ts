@@ -1,6 +1,8 @@
+import type { AccountModelInfo } from '../shared/modelCatalog'
 import type { AppUpdateState, UpdateActionResult } from '../main/appUpdater'
 import type { LoginResult, SocialLoginCallback } from '../main/loginSessions'
 import type { KiroInstancesApi } from '../shared/kiroInstances'
+import type { AccountAddOnCredit } from '../shared/accountUsage'
 import { ElectronAPI } from '@electron-toolkit/preload'
 
 interface AccountData {
@@ -119,6 +121,9 @@ interface StatusResult {
       freeTrialCurrent?: number
       freeTrialExpiry?: string
       bonuses?: BonusData[]
+      addOnCredits?: AccountAddOnCredit[]
+      addOnCurrent?: number
+      addOnLimit?: number
       nextResetDate?: string
       resourceDetail?: ResourceDetail
     }
@@ -197,6 +202,7 @@ interface KiroApi {
     refreshToken: string
     clientId: string
     clientSecret: string
+    clientSecretExpiresAt?: number
     region?: string
     startUrl?: string
     authMethod?: 'IdC' | 'social'
@@ -213,6 +219,8 @@ interface KiroApi {
       refreshToken: string
       expiresIn: number
     }
+    handoffProof?: string
+    preparedExpiresAt?: number
   }>
 
   /**
@@ -247,11 +255,17 @@ interface KiroApi {
     refreshToken: string
     clientId?: string
     clientSecret?: string
+    clientSecretExpiresAt?: number
+    authMethod?: string
+    accountId?: string
+    expiresAt?: number
+    reusePreparedCredentials?: boolean
+    handoffProof?: string
     region?: string
     profileArn?: string
     provider?: string
     scopes?: string[]
-  }) => Promise<{ success: boolean; error?: string; dbPath?: string }>
+  }) => Promise<{ success: boolean; error?: string; dbPath?: string; refreshedCredentials?: { accessToken: string; refreshToken: string; expiresIn: number }; preparedExpiresAt?: number }>
 
   // 退出登录 - 清除本地 SSO 缓存
   logoutAccount: () => Promise<{ success: boolean; deletedCount?: number; error?: string }>
@@ -268,6 +282,7 @@ interface KiroApi {
     refreshToken: string
     clientId: string
     clientSecret: string
+    clientSecretExpiresAt?: number
     region?: string
     authMethod?: string  // 'IdC' 或 'social'
     provider?: string    // 'BuilderId', 'Github', 'Google'
@@ -279,6 +294,7 @@ interface KiroApi {
       accessToken: string
       refreshToken: string
       expiresIn?: number
+      clientSecretExpiresAt?: number
       subscriptionType: string
       subscriptionTitle: string
       subscription?: {
@@ -296,6 +312,9 @@ interface KiroApi {
         freeTrialCurrent?: number
         freeTrialExpiry?: string
         bonuses?: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
+        addOnCredits?: AccountAddOnCredit[]
+        addOnCurrent?: number
+        addOnLimit?: number
         nextResetDate?: string
         resourceDetail?: {
           displayName?: string
@@ -335,6 +354,7 @@ interface KiroApi {
       refreshToken: string
       clientId: string
       clientSecret: string
+      clientSecretExpiresAt?: number
       region: string
       authMethod: string  // 'IdC' 或 'social'
       provider: string    // 'BuilderId', 'Github', 'Google'
@@ -350,6 +370,7 @@ interface KiroApi {
       refreshToken: string
       clientId: string
       clientSecret: string
+      clientSecretExpiresAt?: number
       region: string
       expiresIn?: number
       email?: string
@@ -372,6 +393,9 @@ interface KiroApi {
         freeTrialCurrent?: number
         freeTrialExpiry?: string
         bonuses?: Array<{ code: string; name: string; current: number; limit: number; expiresAt?: string }>
+        addOnCredits?: AccountAddOnCredit[]
+        addOnCurrent?: number
+        addOnLimit?: number
         nextResetDate?: string
         resourceDetail?: {
           displayName?: string
@@ -576,12 +600,12 @@ interface KiroApi {
   proxyRefreshModels: () => Promise<{ success: boolean; error?: string }>
 
   // 获取可用模型列表
-  proxyGetModels: () => Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }>; fromCache?: boolean }>
+  proxyGetModels: () => Promise<{ success: boolean; error?: string; models: AccountModelInfo[]; fromCache?: boolean; accountId?: string }>
 
   proxyConfigureClients: (input: { clients: Array<'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'>; modelId: string; modelName?: string; models?: Array<{ id: string; name?: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null }> }) => Promise<{ success: boolean; error?: string; proxyOrigin: string; openaiBaseUrl: string; results: Array<{ client: 'claudeCode' | 'opencode' | 'codex' | 'gemini' | 'hermes' | 'openclaw'; success: boolean; paths: string[]; backupPaths: string[]; error?: string }> }>
 
   // 获取账户可用模型列表
-  accountGetModels: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => Promise<{ success: boolean; error?: string; models: Array<{ id: string; name: string; description: string; inputTypes?: string[]; maxInputTokens?: number | null; maxOutputTokens?: number | null; rateMultiplier?: number; rateUnit?: string }> }>
+  accountGetModels: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => Promise<{ success: boolean; error?: string; models: AccountModelInfo[] }>
 
   // 获取可用订阅列表
   accountGetSubscriptions: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => Promise<{ success: boolean; error?: string; plans: Array<{ name: string; qSubscriptionType: string; description: { title: string; billingInterval: string; featureHeader: string; features: string[] }; pricing: { amount: number; currency: string } }>; disclaimer?: string[] }>

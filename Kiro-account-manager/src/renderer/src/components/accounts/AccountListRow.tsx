@@ -21,6 +21,7 @@ import {
   Copy
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { AddOnCredits } from './AddOnCredits'
 import {
   toRgba,
   generateRowGlowStyle,
@@ -138,81 +139,9 @@ function AccountListRowComponent({
   // === Handlers ===
   const handleSwitch = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation()
-    const { credentials } = account
-    const { switchTarget } = useAccountsStore.getState()
-
-    if (!credentials.refreshToken) {
-      alert(isEn ? 'Incomplete credentials, cannot switch' : '账号凭证不完整，无法切换')
-      return
-    }
-    if (credentials.authMethod !== 'social' && (!credentials.clientId || !credentials.clientSecret)) {
-      alert(isEn ? 'Incomplete credentials, cannot switch' : '账号凭证不完整，无法切换')
-      return
-    }
-
-    const cliPayload = {
-      accessToken: credentials.accessToken,
-      refreshToken: credentials.refreshToken,
-      clientId: credentials.clientId,
-      clientSecret: credentials.clientSecret,
-      region: credentials.region || 'us-east-1',
-      profileArn: account.profileArn,
-      provider: credentials.provider
-    }
-    const idePayload = {
-      accessToken: credentials.accessToken,
-      refreshToken: credentials.refreshToken,
-      clientId: credentials.clientId || '',
-      clientSecret: credentials.clientSecret || '',
-      region: credentials.region || 'us-east-1',
-      startUrl: credentials.startUrl,
-      authMethod: credentials.authMethod,
-      provider: credentials.provider,
-      profileArn: account.profileArn,
-      accountId: account.id
-    }
-
-    let success = true
-    let errorMsg = ''
-    const target = switchTarget || 'ide'
-    if (target === 'ide' || target === 'both') {
-      const result = await window.api.switchAccount(idePayload)
-      if (!result.success) {
-        success = false
-        errorMsg = result.error || ''
-      } else if (result.refreshedCredentials) {
-        // 同步 main 进程 refresh 后的最新 credentials 到 store，避免反代 store 留下已作废的 refreshToken
-        const rc = result.refreshedCredentials
-        useAccountsStore.setState((state) => {
-          const accounts = new Map(state.accounts)
-          const acc = accounts.get(account.id)
-          if (acc) {
-            accounts.set(account.id, {
-              ...acc,
-              credentials: {
-                ...acc.credentials,
-                accessToken: rc.accessToken,
-                refreshToken: rc.refreshToken,
-                expiresAt: Date.now() + rc.expiresIn * 1000
-              }
-            })
-          }
-          return { accounts }
-        })
-        useAccountsStore.getState().saveToStorage()
-      }
-    }
-    if (target === 'cli' || target === 'both') {
-      const result = await window.api.switchAccountCli(cliPayload)
-      if (!result.success && target === 'cli') { success = false; errorMsg = result.error || '' }
-    }
-
-    if (success) {
-      setActiveAccount(account.id)
-    } else {
-      alert(isEn ? `Switch failed: ${errorMsg}` : `切换失败：${errorMsg}`)
-    }
-  }, [account, isEn, setActiveAccount])
+    const result = await useAccountsStore.getState().switchAccountToTarget(account.id)
+    if (!result.success) alert(isEn ? `Switch failed: ${result.error || ''}` : `切换失败：${result.error || ''}`)
+  }, [account.id, isEn])
 
   const handleRefresh = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation()
@@ -401,7 +330,7 @@ function AccountListRowComponent({
         <Badge
           className={cn(
             'text-white text-[10px] h-5 px-2 border-0 min-w-[90px] flex items-center justify-center',
-            getSubscriptionColor(account.subscription.type, account.subscription.title)
+            getSubscriptionColor(account.subscription.type, account.subscription.title, account.subscription.rawType)
           )}
         >
           {account.subscription.title || account.subscription.type}
@@ -500,6 +429,7 @@ function AccountListRowComponent({
           </span>
           <span>/ {formatUsage(account.usage.limit)}</span>
         </div>
+        <AddOnCredits credits={account.usage.addOnCredits} isEn={isEn} precision={usagePrecision} inline />
       </div>
 
       {/* === 时间信息区 === */}

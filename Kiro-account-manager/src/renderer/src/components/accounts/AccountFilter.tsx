@@ -9,7 +9,11 @@ const SubscriptionOptions: { value: SubscriptionType; label: string; color: stri
   { value: 'Free', label: 'KIRO FREE', color: 'text-gray-500 border-gray-300', activeColor: 'bg-gray-500 text-white border-gray-500' },
   { value: 'Pro', label: 'KIRO PRO', color: 'text-blue-500 border-blue-300', activeColor: 'bg-blue-500 text-white border-blue-500' },
   { value: 'Pro_Plus', label: 'KIRO PRO+', color: 'text-purple-500 border-purple-300', activeColor: 'bg-purple-500 text-white border-purple-500' },
-  { value: 'Enterprise', label: 'KIRO POWER', color: 'text-amber-500 border-amber-300', activeColor: 'bg-amber-500 text-white border-amber-500' }
+  { value: 'Pro_Max', label: 'KIRO PRO MAX', color: 'text-fuchsia-600 border-fuchsia-300', activeColor: 'bg-fuchsia-600 text-white border-fuchsia-600' },
+  { value: 'Power', label: 'KIRO POWER', color: 'text-amber-500 border-amber-300', activeColor: 'bg-amber-500 text-white border-amber-500' },
+  { value: 'Enterprise', label: 'ENTERPRISE', color: 'text-emerald-600 border-emerald-300', activeColor: 'bg-emerald-600 text-white border-emerald-600' },
+  { value: 'Teams', label: 'TEAMS', color: 'text-cyan-600 border-cyan-300', activeColor: 'bg-cyan-600 text-white border-cyan-600' },
+  { value: 'Unknown', label: 'Unknown', color: 'text-slate-500 border-slate-300', activeColor: 'bg-slate-500 text-white border-slate-500' }
 ]
 
 const StatusOptionsZh: { value: AccountStatus; label: string }[] = [
@@ -161,7 +165,7 @@ export function AccountFilterPanel(): React.ReactNode {
                       )}
                       onClick={() => toggleArrayFilter('subscriptionTypes', option.value)}
                     >
-                      {option.label}({count})
+                      {option.value === 'Unknown' && !isEn ? '未知' : option.label}({count})
                     </button>
                   )
                 })}

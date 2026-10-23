@@ -26,6 +26,8 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useTranslation } from '@/hooks/useTranslation'
+import { isPaidSubscription, normalizeSubscriptionType } from '../../../../shared/accountSubscription'
+import { getSubscriptionSoftColor } from '../accounts/_helpers'
 
 /**
  * 订阅升级前预检：从一个账号视角判断它是否可参与批量升级
@@ -35,11 +37,8 @@ type EligibilityReason = 'ok' | 'no-token' | 'already-pro' | 'banned' | 'cant-up
 function checkUpgradeEligibility(account: ReturnType<typeof useAccountsStore.getState>['accounts'] extends Map<string, infer T> ? T : never): { eligible: boolean; reason: EligibilityReason; detail?: string } {
   if (!account.credentials?.accessToken) return { eligible: false, reason: 'no-token' }
 
-  const type = (account.subscription?.type || '').toUpperCase()
-  const title = (account.subscription?.title || '').toUpperCase()
-  const isFreeTier = type.includes('FREE') || title.includes('FREE') || (!type && !title)
-  const isAlreadyPaid = type.includes('PRO') || type.includes('ENTERPRISE') || type.includes('TEAMS')
-    || title.includes('PRO') || title.includes('ENTERPRISE') || title.includes('TEAMS')
+  const isFreeTier = normalizeSubscriptionType(account.subscription) === 'Free'
+  const isAlreadyPaid = isPaidSubscription(account.subscription)
 
   if (isAlreadyPaid) {
     return { eligible: false, reason: 'already-pro', detail: account.subscription?.title || account.subscription?.type }
@@ -212,9 +211,7 @@ export function SubscriptionPage() {
     
     return source.filter(acc => {
       if (!acc) return false
-      const type = (acc.subscription?.type || '').toUpperCase()
-      const title = (acc.subscription?.title || '').toUpperCase()
-      const isFreeTier = type.includes('FREE') || title.includes('FREE') || (!type && !title)
+      const isFreeTier = normalizeSubscriptionType(acc.subscription) === 'Free'
       const hasToken = !!acc.credentials?.accessToken
       return isFreeTier && hasToken
     })
@@ -642,9 +639,7 @@ export function SubscriptionPage() {
     return source.filter(acc => {
       if (!acc) return false
       const hasToken = !!acc.credentials?.accessToken
-      const type = (acc.subscription?.type || '').toUpperCase()
-      const title = (acc.subscription?.title || '').toUpperCase()
-      const isSubscribed = type.includes('PRO') || type.includes('ENTERPRISE') || type.includes('TEAMS') || title.includes('PRO') || title.includes('ENTERPRISE') || title.includes('TEAMS')
+      const isSubscribed = isPaidSubscription(acc.subscription)
       return hasToken && isSubscribed
     })
   }, [accounts, selectedIds])
@@ -1093,13 +1088,7 @@ export function SubscriptionPage() {
                           <span className="w-32 text-center">
                             <span className={cn(
                               'inline-block px-2 py-0.5 rounded text-[10px] font-medium',
-                              planName.toUpperCase().includes('PRO+') || planName.toUpperCase().includes('PRO_PLUS')
-                                ? 'bg-purple-500/15 text-purple-700 dark:text-purple-300'
-                                : planName.toUpperCase().includes('POWER')
-                                  ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
-                                  : planName.toUpperCase().includes('PRO')
-                                    ? 'bg-blue-500/15 text-blue-700 dark:text-blue-300'
-                                    : 'bg-muted text-muted-foreground'
+                              getSubscriptionSoftColor(acc.subscription?.type || 'Unknown', acc.subscription?.title, acc.subscription?.rawType)
                             )}>
                               {planName}
                             </span>
@@ -2092,13 +2081,7 @@ function ManageSubscriptionsTab({ getAllSubscribed, updateAccount, concurrency, 
                   <span className="w-28 text-center">
                     <span className={cn(
                       'inline-block px-2 py-0.5 rounded text-[10px] font-medium',
-                      planName.toUpperCase().includes('PRO+') || planName.toUpperCase().includes('PRO_PLUS')
-                        ? 'bg-purple-500/15 text-purple-700 dark:text-purple-300'
-                        : planName.toUpperCase().includes('POWER')
-                          ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
-                          : planName.toUpperCase().includes('PRO')
-                            ? 'bg-blue-500/15 text-blue-700 dark:text-blue-300'
-                            : 'bg-muted text-muted-foreground'
+                      getSubscriptionSoftColor(acc.subscription?.type || 'Unknown', acc.subscription?.title, acc.subscription?.rawType)
                     )}>
                       {planName}
                     </span>
@@ -2261,13 +2244,7 @@ function SubscribedRow({ acc, idx, selected, onToggleSelect, isEn }: {
       <span className="w-28 text-center">
         <span className={cn(
           'inline-block px-2 py-0.5 rounded text-[10px] font-medium',
-          planName.toUpperCase().includes('PRO+') || planName.toUpperCase().includes('PRO_PLUS')
-            ? 'bg-purple-500/15 text-purple-700 dark:text-purple-300'
-            : planName.toUpperCase().includes('POWER')
-              ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300'
-              : planName.toUpperCase().includes('PRO')
-                ? 'bg-blue-500/15 text-blue-700 dark:text-blue-300'
-                : 'bg-muted text-muted-foreground'
+          getSubscriptionSoftColor(acc.subscription?.type || 'Unknown', acc.subscription?.title, acc.subscription?.rawType)
         )}>{planName}</span>
       </span>
       <span className="w-20 text-center text-muted-foreground">

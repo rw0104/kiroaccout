@@ -3,20 +3,7 @@ import { X, RefreshCw, Loader2, Cpu, FileText, Image, Hash, Sparkles, Zap, Shuff
 import { Button, Card, CardContent, CardHeader, CardTitle, Badge } from '../ui'
 import { cn } from '@/lib/utils'
 
-interface ModelInfo {
-  id: string
-  name: string
-  description: string
-  inputTypes?: string[]
-  maxInputTokens?: number | null
-  maxOutputTokens?: number | null
-  rateMultiplier?: number
-  rateUnit?: string
-  supportsThinking?: boolean
-  thinkingEfforts?: string[]
-  supportsPromptCaching?: boolean
-  modelProvider?: string
-}
+import type { AccountModelInfo } from '../../../../shared/modelCatalog'
 
 interface ModelsDialogProps {
   open: boolean
@@ -33,7 +20,7 @@ export function ModelsDialog({
   onOpenModelMapping,
   mappingCount = 0
 }: ModelsDialogProps) {
-  const [models, setModels] = useState<ModelInfo[]>([])
+  const [models, setModels] = useState<AccountModelInfo[]>([])
   const [loading, setLoading] = useState(false)
   const [fromCache, setFromCache] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -47,18 +34,23 @@ export function ModelsDialog({
     setShowIpTip(false)
   }
 
-  const fetchModels = async () => {
+  const fetchModels = async (refresh = false): Promise<void> => {
     setLoading(true)
     setError(null)
     try {
+      if (refresh) await window.api.proxyRefreshModels()
       const result = await window.api.proxyGetModels()
       if (result.success) {
         setModels(result.models)
         setFromCache(result.fromCache || false)
       } else {
+        setModels([])
+        setFromCache(false)
         setError(result.error || 'Failed to fetch models')
       }
     } catch (err) {
+      setModels([])
+      setFromCache(false)
       setError(err instanceof Error ? err.message : 'Unknown error')
     } finally {
       setLoading(false)
@@ -125,7 +117,7 @@ export function ModelsDialog({
               <Button 
                 variant="outline" 
                 size="sm" 
-                onClick={fetchModels}
+                onClick={() => fetchModels(true)}
                 disabled={loading}
                 className="rounded-lg"
               >
@@ -143,7 +135,7 @@ export function ModelsDialog({
           </div>
         </CardHeader>
         <CardContent className="p-4">
-          {/* IP 限制提示横幅 (Pro+ 订阅但缺失高级模型) */}
+          {/* 账户模型目录说明 */}
           {showIpTip && (
             <div className="mb-3 rounded-xl border border-warning/30 bg-gradient-to-r from-warning/10 to-warning/5 p-3.5 relative">
               <div className="flex items-start gap-3">
@@ -154,18 +146,18 @@ export function ModelsDialog({
                   <p className="text-sm font-semibold text-warning mb-1.5 flex items-center gap-1.5">
                     <Globe className="h-3.5 w-3.5" />
                     {isEn
-                      ? 'Pro/Pro Max subscription but missing advanced models?'
-                      : '订阅 Pro/Pro Max 但看不到高级模型？'}
+                      ? 'Models available to the current account'
+                      : '当前账号的可用模型'}
                   </p>
                   <p className="text-xs text-warning/90 leading-relaxed mb-1">
                     {isEn
-                      ? 'This is likely caused by regional restrictions on China-mainland IPs. Try the following:'
-                      : '这通常是国内 IP 被限制导致的。请尝试以下方案：'}
+                      ? 'Availability depends on the account plan, profile Region, administrator rules, and model lifecycle.'
+                      : '模型可用性取决于账号套餐、配置区域、管理员规则和模型生命周期。'}
                   </p>
                   <ul className="text-xs text-warning/90 space-y-0.5 list-disc list-inside">
-                    <li>{isEn ? 'Enable VPN/proxy (system-level or app-level)' : '开启 VPN / 代理（系统级或应用级均可）'}</li>
-                    <li>{isEn ? 'Switch to high-quality outbound IP (US/EU residential preferred)' : '切换到优质外网 IP（推荐美国 / 欧洲住宅 IP）'}</li>
-                    <li>{isEn ? 'Click Refresh after IP change to reload models' : 'IP 切换后点击右上角「刷新」重新加载模型'}</li>
+                    <li>{isEn ? 'Experimental or preview models may require explicit access.' : '实验或预览模型可能需要单独开通权限。'}</li>
+                    <li>{isEn ? 'Only models returned for this account and editor origin are shown.' : '仅展示服务端为当前账号及编辑器入口返回的模型。'}</li>
+                    <li>{isEn ? 'Refresh after a plan, profile, or administrator change.' : '套餐、配置或管理员规则变更后请刷新。'}</li>
                   </ul>
                 </div>
                 <Button
@@ -223,6 +215,10 @@ export function ModelsDialog({
                         {model.name && model.name !== model.id && (
                           <p className="text-[11px] text-primary/70 font-medium truncate">{model.name}</p>
                         )}
+                        <div className="flex flex-wrap gap-1 mt-1">
+                          {model.modelProvider && <Badge variant="secondary" className="text-[10px]">{model.modelProvider}</Badge>}
+                          {model.status && <Badge variant="secondary" className="text-[10px]">{model.status}</Badge>}
+                        </div>
                       </div>
                     </div>
                     <p className="text-[11px] text-muted-foreground line-clamp-2 mb-2 pl-4">

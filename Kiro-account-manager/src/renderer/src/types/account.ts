@@ -1,10 +1,12 @@
 // ============================================
 // 多账号管理器类型定义
 // ============================================
+import type { AccountAddOnCredit } from '../../../shared/accountUsage'
 
 export type IdpType = 'Google' | 'Github' | 'BuilderId' | 'Enterprise' | 'AWSIdC' | 'Internal' | 'IAM_SSO'
 
-export type SubscriptionType = 'Free' | 'Pro' | 'Pro_Plus' | 'Enterprise' | 'Teams'
+import type { SubscriptionType } from '../../../shared/accountSubscription'
+export type { SubscriptionType } from '../../../shared/accountSubscription'
 
 export type AccountStatus = 'active' | 'expired' | 'error' | 'refreshing' | 'unknown'
 
@@ -53,6 +55,9 @@ export interface AccountUsage {
   freeTrialCurrent?: number
   freeTrialExpiry?: string
   bonuses?: BonusUsage[]  // 奖励额度列表
+  addOnCredits?: AccountAddOnCredit[] // 充值额度包，含过期/耗尽明细
+  addOnCurrent?: number // 未过期充值包已用
+  addOnLimit?: number // 未过期充值包额度
   nextResetDate?: string  // 重置日期
   resourceDetail?: ResourceDetail // 资源详情
 }

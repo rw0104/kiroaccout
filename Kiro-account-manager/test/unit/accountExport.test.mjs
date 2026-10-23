@@ -215,6 +215,73 @@ test('selected scope writes exactly that selection and its relationships; all sc
   assert.equal(JSON.parse(all.content).tags.length, 2)
 })
 
+test('single-account filenames use the exported email for every file format and credential mode', () => {
+  for (const format of ['json', 'oidc', 'txt', 'csv', 'kami']) {
+    for (const includeCredentials of [false, true]) {
+      if (format === 'kami' && !includeCredentials) continue
+      const extension = ['json', 'oidc'].includes(format) ? 'json' : format === 'csv' ? 'csv' : 'txt'
+      for (const scope of ['all', 'selected']) {
+        const result = createAccountExport(input({
+          accounts: scope === 'all' ? [account('github', 'Github')] : three(),
+          selectedIds: ['github', 'github'], scope, format, includeCredentials
+        }))
+        assert.equal(result.ok, true)
+        assert.equal(result.count, 1)
+        assert.equal(result.filename, `github@example.invalid.${extension}`)
+      }
+    }
+  }
+})
+
+test('multiple-account filenames retain the existing format, credential mode and date', () => {
+  for (const format of ['json', 'oidc', 'txt', 'csv', 'kami']) {
+    const result = createAccountExport(input({ format, includeCredentials: true }))
+    assert.equal(result.ok, true)
+    const kind = format === 'json' ? 'backup' : format === 'oidc' ? 'credentials' : format
+    assert.equal(result.filename, `kiro-accounts-${kind}-with-credentials-1970-01-01.${result.extension}`)
+  }
+  const metadata = createAccountExport(input())
+  assert.equal(metadata.filename, 'kiro-accounts-backup-no-credentials-1970-01-01.json')
+})
+
+test('missing single-account email falls back safely without using an unselected account email', () => {
+  const blank = account('blank', 'Google')
+  blank.email = '   '
+  for (const includeCredentials of [false, true]) {
+    const result = createAccountExport(input({
+      accounts: [account('unselected', 'Google'), blank],
+      scope: 'selected', selectedIds: ['blank'], includeCredentials
+    }))
+    assert.equal(result.ok, true)
+    assert.equal(result.count, 1)
+    assert.equal(result.filename, `kiro-accounts-backup-${includeCredentials ? 'with' : 'no'}-credentials-1970-01-01.json`)
+    assert.doesNotMatch(result.filename, /unselected/)
+  }
+})
+
+test('email filenames are safe file components on Windows and preserve normal addresses', () => {
+  for (const email of [
+    '  synthetic+tag@example.invalid  ',
+    '../synthetic:name\\with?"<>|*\u0000@example.invalid. ',
+    'CON', 'NUL.json', 'COM\u00b9',
+    `${'合成😀'.repeat(80)}@example.invalid`,
+    '...'
+  ]) {
+    const row = account('safe', 'Google')
+    row.email = email
+    const result = createAccountExport(input({ accounts: [row] }))
+    assert.equal(result.ok, true)
+    assert.ok(Buffer.byteLength(result.filename, 'utf8') <= 255)
+    assert.doesNotMatch(result.filename, /[<>:"/\\|?*\u0000-\u001f\u007f]/)
+    assert.doesNotMatch(result.filename, /^(con|prn|aux|nul|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])(?:\.|$)/i)
+    assert.match(result.filename, /[^. ]\.json$/)
+    if (email.trim() === 'synthetic+tag@example.invalid') {
+      assert.equal(result.filename, 'synthetic+tag@example.invalid.json')
+    }
+    if (email === '...') assert.match(result.filename, /^kiro-accounts-backup-/)
+  }
+})
+
 test('empty or stale selection never falls back to exporting every account', () => {
   const empty = createAccountExport(input({ scope: 'selected', selectedIds: [] }))
   assert.equal(empty.ok, false)
@@ -226,6 +293,7 @@ test('empty or stale selection never falls back to exporting every account', () 
   assert.equal(stale.ok, false)
   assert.equal(stale.code, 'stale_selection')
   assert.equal('content' in stale, false)
+  assert.equal('filename' in stale, false)
 })
 
 test('invalid authentication, duplicate IDs and missing relationships block the whole export with redacted errors', () => {

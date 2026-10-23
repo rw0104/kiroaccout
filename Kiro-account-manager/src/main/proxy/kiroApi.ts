@@ -17,6 +17,9 @@ import type {
 } from './types'
 import { proxyLogger } from './logger'
 import { executeRuntimeRequest } from './kiroRuntime'
+import { requestControlPlane } from '../kiroControlPlane'
+import { isRetiredModelId, ModelRequestError, type KiroModel } from '../../shared/modelCatalog'
+export type { KiroModel } from '../../shared/modelCatalog'
 import { getKProxyService } from '../kproxy'
 import { getSystemProxy, safeCreateProxyAgent } from './systemProxy'
 import {
@@ -250,20 +253,9 @@ const MODEL_ID_MAP: Record<string, string> = {
   'claude-haiku-4.5': 'claude-haiku-4.5',
   'claude-opus-4-5': 'claude-opus-4.5',
   'claude-opus-4.5': 'claude-opus-4.5',
-  // Claude 4 系列
-  'claude-sonnet-4': 'claude-sonnet-4',
-  'claude-sonnet-4-20250514': 'claude-sonnet-4',
-  // Claude 3.5 系列 (映射到 Sonnet 4.5)
-  'claude-3-5-sonnet': 'claude-sonnet-4.5',
-  'claude-3-opus': 'claude-sonnet-4.5',
-  'claude-3-sonnet': 'claude-sonnet-4',
-  'claude-3-haiku': 'claude-haiku-4.5',
-  // GPT 兼容映射 (映射到 Sonnet 4.5)
-  'gpt-4': 'claude-sonnet-4.5',
-  'gpt-4o': 'claude-sonnet-4.5',
-  'gpt-4-turbo': 'claude-sonnet-4.5',
-  'gpt-3.5-turbo': 'claude-sonnet-4.5',
-  'default': 'claude-sonnet-4.5'
+  // An omitted model asks Kiro to route it. Cross-provider aliases belong to
+  // explicit user mappings, never an implicit substitute for the requested ID.
+  'default': 'auto'
 }
 
 /**
@@ -289,11 +281,14 @@ function isCodeWhispererModelId(modelId: string): boolean {
 }
 
 export function mapModelId(model: string): string {
+  if (typeof model !== 'string') throw new ModelRequestError('Model must be a string. Choose a model available to this account.')
   let modelId = model.trim()
   if (!modelId) return MODEL_ID_MAP.default
+  if (isRetiredModelId(modelId)) throw new ModelRequestError('Model is retired: Sonnet 4.0 reached end of life on 2026-10-14. Choose a currently available model.')
   if (isCodeWhispererModelId(modelId)) return modelId
   // 0) 归一化版本号短横 → 点号（claude-opus-4-6 → claude-opus-4.6），兼容不支持 "." 的客户端
   modelId = normalizeClaudeVersion(modelId)
+  if (isRetiredModelId(modelId)) throw new ModelRequestError('Model is retired: Sonnet 4.0 reached end of life on 2026-10-14. Choose a currently available model.')
   const lower = modelId.toLowerCase()
   // 1) 显式 alias 映射优先
   if (MODEL_ID_MAP[lower]) return MODEL_ID_MAP[lower]
@@ -303,7 +298,7 @@ export function mapModelId(model: string): string {
   // Current Runtime model IDs evolve independently from this client's alias table.
   // Let the service reject an unknown model instead of silently billing a different one.
   if (/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(modelId)) return modelId
-  throw new Error('Invalid model identifier')
+  throw new ModelRequestError('Invalid model identifier')
 }
 
 // 检测是否为 Agentic 模式请求
@@ -1160,29 +1155,6 @@ export async function callKiroApi(
   })
 }
 
-// Kiro 官方模型信息
-export interface KiroModel {
-  modelId: string
-  modelName: string
-  description: string
-  modelProvider?: string | null
-  rateMultiplier?: number
-  rateUnit?: string
-  status?: string | null
-  supportedInputTypes?: string[]
-  tokenLimits?: {
-    maxInputTokens?: number | null
-    maxOutputTokens?: number | null
-  }
-  promptCaching?: {
-    supportsPromptCaching: boolean
-    maximumCacheCheckpointsPerRequest?: number | null
-    minimumTokensPerCacheCheckpoint?: number | null
-  } | null
-  additionalModelRequestFieldsSchema?: Record<string, unknown> | null
-  availableOrigins?: string[] | null
-}
-
 // 根据账号区域获取 Q Service 端点（官方插件使用 q.{region}.amazonaws.com）
 function getQServiceEndpoint(region?: string): string {
   if (region?.startsWith('eu-')) return 'https://q.eu-central-1.amazonaws.com'
@@ -1244,7 +1216,8 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
 
     const arn = profiles[0].arn
     if (arn) {
-      console.log(`[KiroAPI] Enterprise profileArn resolved: ${arn}`)
+      console.log('[KiroAPI] Enterprise profile resolved')
+      if (account.id) profileArnPersistCallback?.(account.id, arn)
     }
     return arn || undefined
   } catch (error) {
@@ -1255,64 +1228,34 @@ export async function fetchEnterpriseProfileArn(account: ProxyAccount): Promise<
 
 // 获取 Kiro 官方模型列表（支持分页，与官方插件一致传递 profileArn）
 export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSignal): Promise<KiroModel[]> {
-  const baseUrl = getQServiceEndpoint(account.region)
-  const machineId = getAccountMachineId(account.id, account.machineId)
-  
-  const headers: Record<string, string> = {
-    'Authorization': `Bearer ${account.accessToken}`,
-    'Content-Type': 'application/json',
-    'Accept': 'application/json',
-    'User-Agent': getKiroUserAgent(machineId),
-    'x-amz-user-agent': getKiroAmzUserAgent(machineId),
-    'x-amzn-codewhisperer-optout': 'true'
-  }
-
   const allModels: KiroModel[] = []
+  const seenTokens = new Set<string>()
   let nextToken: string | undefined
-
-  // Enterprise 缺 profileArn 时调 API 获取；BuilderId/Social 不需要（resolveProfileArn 会兜底）
-  const isEnterprise = account.provider === 'Enterprise' || account.authMethod === 'external_idp'
-  if (!account.profileArn && isEnterprise) {
-    const fetchedArn = await fetchEnterpriseProfileArn(account)
-    if (fetchedArn) {
-      account.profileArn = fetchedArn
-      if (account.id) profileArnPersistCallback?.(account.id, fetchedArn)
+  const enterprise = account.provider === 'Enterprise' || account.provider === 'ExternalIdp' || account.authMethod === 'external_idp'
+  // Control-plane identity differs from Runtime defaults: absence of a profile
+  // must not manufacture a US profile and override the account's Region.
+  const profileArn = account.profileArn && !isPlaceholderProfileArn(account.profileArn) && !/^arn:aws:codewhisperer:[a-z0-9-]+:610548660232:profile\/VNECVYCYYAWN$/.test(account.profileArn) ? account.profileArn : undefined
+  if (enterprise && !profileArn) throw new ModelRequestError('An authenticated organization profile is required to load models. Sign in again and select a profile.')
+  const identity = { ...account, profileArn }
+  // IDE 1.4.13 uses AWS JSON 1.0 POST /, despite the SDK's retained REST
+  // trait. A failed later page must not become an apparently complete catalog.
+  for (let page = 0; page < 10; page++) {
+    throwIfAborted(signal)
+    const data = await requestControlPlane<{ models?: KiroModel[]; nextToken?: string }>(identity, 'ListAvailableModels', { nextToken }, {
+      signal,
+      fetch: ((url, init) => fetchWithProxy(String(url), init, account)) as typeof fetch
+    })
+    throwIfAborted(signal)
+    if (!Array.isArray(data.models) || data.models.some(model => !model || typeof model !== 'object' || typeof model.modelId !== 'string' || !model.modelId.trim())) {
+      throw new Error('Kiro model catalog returned an invalid model list')
     }
+    allModels.push(...data.models)
+    if (data.nextToken === undefined || data.nextToken === null || data.nextToken === '') return allModels
+    if (typeof data.nextToken !== 'string' || seenTokens.has(data.nextToken)) throw new Error('Kiro model catalog returned invalid pagination')
+    seenTokens.add(data.nextToken)
+    nextToken = data.nextToken
   }
-
-  try {
-    do {
-      const params = new URLSearchParams({ origin: 'AI_EDITOR', maxResults: '50' })
-      const arnForModels = resolveProfileArn(account)
-      // profileArn 决策由 resolveProfileArn 统一处理：
-      //   - BuilderId → 占位符 ARN（ListAvailableModels 需要，有效）
-      //   - Github/Google → social ARN（有效）
-      //   - Enterprise → 真实 ARN（上方已自愈获取）
-      if (arnForModels) params.set('profileArn', arnForModels)
-      if (nextToken) params.set('nextToken', nextToken)
-
-      const url = `${baseUrl}/ListAvailableModels?${params.toString()}`
-      throwIfAborted(signal)
-      const response = await fetchWithProxy(url, { method: 'GET', headers, signal }, account)
-      throwIfAborted(signal)
-      
-      if (!response.ok) {
-        const errBody = await response.text().catch(() => '')
-        console.error(`[KiroAPI] ListAvailableModels failed: ${response.status}`, errBody.slice(0, 300))
-        break
-      }
-
-      const data = await response.json()
-      allModels.push(...(data.models || []))
-      nextToken = data.nextToken
-    } while (nextToken)
-
-    return allModels
-  } catch (error) {
-    if (signal?.aborted) throw getAbortError(signal)
-    console.error('[KiroAPI] ListAvailableModels error:', error)
-    return allModels.length > 0 ? allModels : []
-  }
+  throw new Error('Kiro model catalog exceeded the pagination limit')
 }
 
 // 订阅计划信息

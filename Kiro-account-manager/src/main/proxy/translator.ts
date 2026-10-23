@@ -28,79 +28,49 @@ import type {
   KiroUsage
 } from './types'
 import { buildKiroPayload, mapModelId } from './kiroApi'
+import { ModelRequestError, type ThinkingConfig } from '../../shared/modelCatalog'
+export type { ThinkingConfig } from '../../shared/modelCatalog'
 import { ToolNameRegistry } from './toolNameRegistry'
 
 const KIRO_CACHE_POINT: KiroCachePoint = { type: 'default' }
 
-/** 模型 thinking 能力元数据（由 proxyServer 从模型缓存中查询后传入） */
-export interface ThinkingConfig {
-  schemaPath: 'output_config' | 'reasoning'
-  efforts: string[]
-  defaultEffort?: string
-}
-
-/**
- * 将客户端 effort / thinking 参数 + 模型 schema path 映射为 Kiro additionalModelRequestFields。
- * 官方 Kiro IDE 的 kr() 函数逻辑：
- *   output_config → { thinking: { type: 'adaptive', display: 'summarized' }, output_config: { effort } }
- *   reasoning     → { reasoning: { effort } }
- */
-function buildThinkingFields(
-  thinkingConfig: ThinkingConfig | undefined,
+/** Send only fields described by this account's model schema. */
+export function buildThinkingFields(
+  config: ThinkingConfig | undefined,
   clientThinking?: { type: string; budget_tokens?: number; display?: string },
   clientReasoningEffort?: string
 ): Record<string, unknown> | undefined {
-  // 客户端明确关闭 thinking
-  if (clientThinking?.type === 'disabled') return undefined
-
-  // 没有模型元数据时，回退到旧逻辑：仅传 { thinking: { type: 'adaptive' } }
-  if (!thinkingConfig) {
-    if (clientThinking && clientThinking.type !== 'disabled') {
-      return { thinking: { type: 'adaptive' } }
-    }
-    if (clientReasoningEffort) {
-      return { thinking: { type: 'adaptive' } }
-    }
-    return undefined
+  if (clientReasoningEffort !== undefined && (typeof clientReasoningEffort !== 'string' || !clientReasoningEffort.trim())) throw new ModelRequestError('Reasoning effort must be a non-empty string.')
+  if (clientThinking && (!['enabled', 'adaptive', 'disabled'].includes(clientThinking.type))) throw new ModelRequestError('Unsupported thinking mode.')
+  if (!clientThinking && !clientReasoningEffort) return undefined
+  if (!config) {
+    if (clientThinking?.type === 'disabled' && !clientReasoningEffort) return undefined
+    throw new ModelRequestError('Reasoning capability is unavailable for this model. Refresh its model catalog or remove the reasoning options.')
   }
-
-  // 客户端没请求 thinking 也没请求 reasoning_effort → 不启用
-  const wantsThinking = !!(clientThinking && clientThinking.type !== 'disabled') || !!clientReasoningEffort
-  if (!wantsThinking) return undefined
-
-  // 映射 effort level（直接使用客户端值，不做强制转换）
-  const mapEffort = (input: string): string => input.toLowerCase()
-
-  let effort: string
-  if (clientReasoningEffort) {
-    effort = mapEffort(clientReasoningEffort)
-  } else if (clientThinking?.type === 'enabled' && clientThinking.budget_tokens) {
-    // budget_tokens 粗略映射到 effort level
-    const b = clientThinking.budget_tokens
-    if (b <= 4000) effort = 'low'
-    else if (b <= 16000) effort = 'medium'
-    else if (b <= 64000) effort = 'high'
-    else effort = 'xhigh'
-  } else {
-    effort = thinkingConfig.defaultEffort || 'high'
+  const result: Record<string, unknown> = {}
+  let thinkingType = clientThinking?.type
+  if (thinkingType === 'enabled' && config.thinkingTypes?.includes('adaptive')) thinkingType = 'adaptive'
+  if (thinkingType && config.thinkingTypes?.includes(thinkingType)) {
+    const thinking: Record<string, unknown> = { type: thinkingType }
+    if (clientThinking?.display && config.thinkingDisplayTypes?.includes(clientThinking.display)) thinking.display = clientThinking.display
+    result.thinking = thinking
+  } else if (thinkingType && thinkingType !== 'disabled' && !config.efforts.length) {
+    throw new ModelRequestError('The requested thinking mode is not supported by this model.')
   }
-
-  // 确保 effort 在可用范围内，否则取最接近的
-  if (!thinkingConfig.efforts.includes(effort)) {
-    effort = thinkingConfig.efforts[thinkingConfig.efforts.length - 1] || 'high'
+  let effort = clientReasoningEffort?.toLowerCase()
+  if (effort && (!config.schemaPath || !config.efforts.includes(effort))) {
+    throw new ModelRequestError(`Unsupported reasoning effort. Supported values: ${config.efforts.join(', ') || 'none'}`)
   }
-
-  switch (thinkingConfig.schemaPath) {
-    case 'output_config':
-      return {
-        thinking: { type: 'adaptive', display: 'summarized' },
-        output_config: { effort }
-      }
-    case 'reasoning':
-      return { reasoning: { effort } }
-    default:
-      return { thinking: { type: 'adaptive' } }
+  if (!effort && clientThinking && clientThinking.type !== 'disabled' && config.schemaPath && config.efforts.length) {
+    // Legacy budget input has no exact effort equivalent. Prefer the model's
+    // published default instead of injecting an unsupported effort or budget.
+    effort = config.defaultEffort || (config.efforts.includes('high') ? 'high' : config.efforts[0])
   }
+  if (effort && thinkingType === 'disabled' && ['xhigh', 'max'].includes(effort)) {
+    throw new ModelRequestError('This reasoning effort requires thinking to be enabled.')
+  }
+  if (effort && config.schemaPath) result[config.schemaPath] = { effort }
+  return Object.keys(result).length ? result : undefined
 }
 
 function toKiroCachePoint(cacheControl?: { type: string }): KiroCachePoint | undefined {
@@ -204,6 +174,14 @@ export function responsesToOpenAIChat(request: OpenAIResponsesRequest): OpenAICh
   if (request.previous_response_id !== undefined) chatRequest.conversation_id = request.previous_response_id
   if (request.metadata !== undefined) chatRequest.metadata = request.metadata
   if (request.kiro_context !== undefined) chatRequest.kiro_context = request.kiro_context
+  if (request.reasoning !== undefined) {
+    if (!request.reasoning || typeof request.reasoning !== 'object' || Array.isArray(request.reasoning)) throw new ModelRequestError('reasoning must be an object')
+    const effort = (request.reasoning as { effort?: unknown }).effort
+    if (effort !== undefined) {
+      if (typeof effort !== 'string' || !effort.trim()) throw new ModelRequestError('reasoning.effort must be a non-empty string')
+      chatRequest.reasoning_effort = effort
+    }
+  }
   return chatRequest
 }
 
@@ -520,7 +498,7 @@ export function openaiToKiro(
   const additionalModelRequestFields = buildThinkingFields(
     thinkingConfig,
     request.thinking as { type: string; budget_tokens?: number },
-    request.reasoning_effort
+    request.reasoning_effort ?? request.reasoning?.effort
   )
 
   return buildKiroPayload(
@@ -997,7 +975,7 @@ export function claudeToKiro(
   const additionalModelRequestFields = buildThinkingFields(
     thinkingConfig,
     request.thinking as { type: string; budget_tokens?: number; display?: string },
-    undefined
+    request.output_config?.effort
   )
 
   return buildKiroPayload(
