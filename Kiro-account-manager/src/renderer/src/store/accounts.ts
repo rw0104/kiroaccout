@@ -1567,7 +1567,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     try {
       // 通过主进程调用 Kiro API 获取状态（避免 CORS）
       const result = await window.api.checkAccountStatus(account)
-      if (credentialResultDisposition(get().accounts.get(id), expected, result.success ? result.data?.newCredentials : undefined) !== 'input') return
+      if (credentialResultDisposition(get().accounts.get(id), expected, result.data?.newCredentials) !== 'input') return
       if (isDeferredAccountOperation(result)) return
 
       if (result.success && result.data) {
@@ -1644,6 +1644,27 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           console.log(`[Account] Token refreshed for ${account?.email}`)
         }
       } else {
+        // A token refresh may have succeeded before the follow-up status query
+        // failed. Persist that rotated credential before showing the error.
+        if (result.data?.newCredentials) {
+          set((state) => {
+            const accounts = new Map(state.accounts)
+            const acc = accounts.get(id)
+            if (acc) {
+              accounts.set(id, {
+                ...acc,
+                credentials: {
+                  ...acc.credentials,
+                  accessToken: result.data!.newCredentials!.accessToken,
+                  refreshToken: result.data!.newCredentials!.refreshToken ?? acc.credentials.refreshToken,
+                  expiresAt: result.data!.newCredentials!.expiresAt ?? acc.credentials.expiresAt
+                }
+              })
+            }
+            return { accounts }
+          })
+          get().saveToStorage()
+        }
         // 检查是否是封禁错误
         const isBanned = (result.error as { isBanned?: boolean })?.isBanned
         if (isBanned) {

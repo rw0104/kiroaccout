@@ -80,18 +80,21 @@ test('catalog failures, malformed models and repeated pagination never become pa
   assert.equal(requests, 0)
 })
 
-test('EU Social and Builder identities without a real profile retain their Region and send no synthetic profile', async () => {
+test('personal model catalogs use the official fixed profile when none was selected, while preserving selected profiles elsewhere', async () => {
   const calls = []
   const api = apiHarness(async (url, init) => { calls.push({ url, init }); return Response.json({ models: [] }) })
   for (const identity of [
+    { provider: 'Github', authMethod: 'social', profileArn: undefined },
     { provider: 'Google', authMethod: 'social', profileArn: undefined },
     { provider: 'BuilderId', authMethod: 'IdC', profileArn: undefined },
     { provider: 'BuilderId', authMethod: 'IdC', profileArn: 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX' }
   ]) await api.fetchKiroModels({ ...account, ...identity, region: 'eu-central-1' })
-  assert.equal(calls.length, 3)
-  for (const { url, init } of calls) {
-    assert.equal(url, 'https://management.eu-central-1.kiro.dev/')
-    assert.deepEqual(JSON.parse(init.body), { origin: 'AI_EDITOR' })
+  assert.equal(calls.length, 4)
+  for (const [index, { url, init }] of calls.entries()) {
+    assert.equal(url, 'https://management.us-east-1.kiro.dev/')
+    assert.deepEqual(JSON.parse(init.body), { origin: 'AI_EDITOR', profileArn: index < 2
+      ? 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK'
+      : 'arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX' })
   }
 })
 

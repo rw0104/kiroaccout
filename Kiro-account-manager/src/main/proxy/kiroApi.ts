@@ -1249,12 +1249,13 @@ export async function fetchKiroModels(account: ProxyAccount, signal?: AbortSigna
   const seenTokens = new Set<string>()
   let nextToken: string | undefined
   const enterprise = account.provider === 'Enterprise' || account.provider === 'ExternalIdp' || account.authMethod === 'external_idp'
-  // Control-plane identity differs from Runtime defaults: absence of a profile
-  // must not manufacture a US profile and override the account's Region.
-  const profileArn = account.profileArn && !isPlaceholderProfileArn(account.profileArn) && !/^arn:aws:codewhisperer:[a-z0-9-]+:610548660232:profile\/VNECVYCYYAWN$/.test(account.profileArn) ? account.profileArn : undefined
+  // A selected authenticated profile wins. Personal identities without one use
+  // the official fixed profile in the shared ControlPlane identity resolver.
+  // The old invented enterprise fallback is never an authenticated profile.
+  const profileArn = account.profileArn && !/^arn:aws:codewhisperer:[a-z0-9-]+:610548660232:profile\/VNECVYCYYAWN$/.test(account.profileArn) ? account.profileArn : undefined
   if (enterprise && !profileArn) throw new ModelRequestError('An authenticated organization profile is required to load models. Sign in again and select a profile.')
   const identity = { ...account, profileArn }
-  // IDE 1.4.13 uses AWS JSON 1.0 POST /, despite the SDK's retained REST
+  // IDE 1.4.26 uses AWS JSON 1.0 POST /, despite the SDK's retained REST
   // trait. A failed later page must not become an apparently complete catalog.
   for (let page = 0; page < 10; page++) {
     throwIfAborted(signal)

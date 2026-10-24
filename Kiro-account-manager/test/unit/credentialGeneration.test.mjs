@@ -93,6 +93,20 @@ test('status-check success and failure are tied to their captured credentials', 
   }
 })
 
+test('status-check failure still persists a rotated credential returned with the error', async () => {
+  const ctx = fixture({ checkAccountStatus: async () => ({
+    success: false,
+    data: { status: 'error', newCredentials: { accessToken: 'SYNTHETIC_ACCESS_1', refreshToken: 'SYNTHETIC_REFRESH_1', expiresAt: 67890 } },
+    error: { message: 'Synthetic follow-up query failed' }
+  }) })
+  await ctx.actions.checkAccountStatus('synthetic')
+  assert.equal(ctx.current().credentials.accessToken, 'SYNTHETIC_ACCESS_1')
+  assert.equal(ctx.current().credentials.refreshToken, 'SYNTHETIC_REFRESH_1')
+  assert.equal(ctx.current().credentials.expiresAt, 67890)
+  assert.equal(ctx.current().status, 'error')
+  assert.equal(ctx.current().lastError, 'Synthetic follow-up query failed')
+})
+
 test('background rotation results compare the original input rather than only account id', () => {
   const ctx = fixture()
   ctx.actions.applyBackgroundRefreshResults([{ id: 'synthetic', success: true, ...expected, data: success().data }])

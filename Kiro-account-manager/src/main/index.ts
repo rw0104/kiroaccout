@@ -43,7 +43,7 @@ import { registerKiroInstanceIpc } from './ipc/kiroInstances'
 import { normalizeTimestamp, normalizeCredentialRecord } from '../shared/accountImport'
 import { parseAccountUsage, normalizeUsageDate, type ParsedAccountUsage } from '../shared/accountUsage'
 import { normalizeSubscriptionType } from '../shared/accountSubscription'
-import { requestControlPlane } from './kiroControlPlane'
+import { requestControlPlane, ControlPlaneError } from './kiroControlPlane'
 import { SwitchHandoffStore } from './switchHandoff'
 import { trackWindowVisibility } from './windowVisibility'
 import { filterAvailableModels, toAccountModel } from '../shared/modelCatalog'
@@ -1111,7 +1111,7 @@ async function getUsageLimitsRest(
   return requestControlPlane<UsageLimitsResponse>(
     { accessToken, profileArn, region: ssoRegion, provider },
     'GetUsageLimits',
-    { isEmailRequired: true },
+    {},
     { fetch: async (url, init) => {
       const agent = getKProxyAgent()
       return agent
@@ -3380,21 +3380,22 @@ app.whenReady().then(async () => {
     }
 
     try {
-      const { accessToken, refreshToken, clientId, clientSecret, region, authMethod, provider } = account.credentials || {}
+      const { accessToken, refreshToken, clientId, clientSecret, region, authMethod: rawAuthMethod, provider } = account.credentials || {}
 
       // 查询账号绑定的代理（账号池）
       const boundProxyUrl = proxyServer
         ? proxyServer.getAccountPool().getAccount(account.id || '')?.proxyUrl
         : undefined
 
-      // 确定正确的 idp：优先使用 credentials.provider，否则回退到 account.idp
-      // 社交登录使用实际的 provider (Github/Google)，IdC 使用 BuilderId
-      let idp = 'BuilderId'
-      if (authMethod === 'social') {
-        idp = provider || account.idp || 'BuilderId'
-      } else if (provider) {
-        idp = provider
-      }
+      // Older saved accounts can carry identity only in top-level idp. Resolve
+      // the query header/profile and any one-time refresh route consistently.
+      const identity = resolveIdentity({
+        provider, idp: account.idp, authMethod: rawAuthMethod,
+        hasClientCredentials: !!clientId && !!clientSecret
+      })
+      if (!identity.ok) return { success: false, error: { message: identity.message } }
+      const idp = identity.provider
+      const authMethod = identity.authMethod
 
       if (!accessToken) {
         console.log('[IPC] Missing accessToken')
@@ -3430,10 +3431,15 @@ app.whenReady().then(async () => {
           }
         }
         
-        // 检查是否是 401 错误（token 过期）
+        // The control plane also reports invalid/expired access tokens as typed
+        // HTTP 400 errors. Invalid profiles and generic access denial must not
+        // consume a refresh token or retry the same malformed request.
         // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret
         const canRefresh = refreshToken && (authMethod === 'social' || (clientId && clientSecret))
-        if (errorMsg.includes('401') && canRefresh) {
+        const tokenError = apiError instanceof ControlPlaneError
+          ? apiError.status === 401 || apiError.reason === 'token'
+          : errorMsg.includes('401')
+        if (tokenError && canRefresh) {
           console.log(`[IPC] Token expired, attempting to refresh (authMethod: ${authMethod || 'IdC'})...${boundProxyUrl ? ' [via bound proxy]' : ''}`)
 
           // 尝试刷新 token - 根据 authMethod 选择刷新方式（透传账号代理）
@@ -3449,24 +3455,40 @@ app.whenReady().then(async () => {
           
           if (refreshResult.success && refreshResult.accessToken) {
             console.log('[IPC] Token refreshed, retrying API call...')
-            
-            // 用新 token 并行调用 GetUserInfo 和 getUsageAndLimits
-            const [userInfoResult, usageResult] = await Promise.all([
-              getUserInfo(refreshResult.accessToken, idp, accountMachineId).catch((err: Error) => {
-                if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
-                  throw err
-                }
-                return undefined
-              }),
-              getUsageAndLimits(refreshResult.accessToken, idp, account.profileArn || account.credentials?.profileArn, accountMachineId, region)
-            ])
-            
-            // 返回结果并包含新凭证
-            return parseUsageResponse(usageResult, {
+
+            const rotatedCredentials = {
               accessToken: refreshResult.accessToken,
               refreshToken: refreshResult.refreshToken,
               expiresIn: refreshResult.expiresIn
-            }, userInfoResult)
+            }
+            try {
+              // 用新 token 并行调用 GetUserInfo 和 getUsageAndLimits
+              const [userInfoResult, usageResult] = await Promise.all([
+                getUserInfo(refreshResult.accessToken, idp, accountMachineId).catch((err: Error) => {
+                  if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
+                    throw err
+                  }
+                  return undefined
+                }),
+                getUsageAndLimits(refreshResult.accessToken, idp, account.profileArn || account.credentials?.profileArn, accountMachineId, region)
+              ])
+
+              // 返回结果并包含新凭证
+              return parseUsageResponse(usageResult, rotatedCredentials, userInfoResult)
+            } catch (retryError) {
+              // A successful refresh can rotate the refresh token. Preserve that
+              // rotation even when the follow-up status request fails, so the
+              // renderer can persist it instead of leaving a now-invalid token.
+              return {
+                success: false,
+                data: { status: 'error', newCredentials: {
+                  accessToken: rotatedCredentials.accessToken,
+                  refreshToken: rotatedCredentials.refreshToken,
+                  expiresAt: rotatedCredentials.expiresIn ? Date.now() + rotatedCredentials.expiresIn * 1000 : undefined
+                } },
+                error: { message: retryError instanceof Error ? retryError.message : '刷新后的账户查询失败' }
+              }
+            }
           } else {
             console.error('[IPC] Token refresh failed:', refreshResult.error)
             return {

@@ -4,7 +4,7 @@ Kiro 账户管理桌面应用，用于管理账户、分组和标签，导入、
 
 [正式版下载](https://github.com/rw0104/kiroaccout/releases/latest) · [全部版本](https://github.com/rw0104/kiroaccout/releases) · [源码与问题反馈](https://github.com/rw0104/kiroaccout)
 
-当前源码目标为 **1.8.7 · Windows / macOS / Linux**，发布状态及附件以 Releases 为准。macOS / Linux 请手动下载安装和升级。升级前先备份原有资料。安装到其他目录或使用 ZIP 不会隔离账户管理器自身的数据，不要同时运行新旧管理器。
+当前源码目标为 **1.8.8 · Windows / macOS / Linux**，发布状态及附件以 Releases 为准。macOS / Linux 请手动下载安装和升级。升级前先备份原有资料。安装到其他目录或使用 ZIP 不会隔离账户管理器自身的数据，不要同时运行新旧管理器。
 
 ## 使用
 
@@ -23,7 +23,7 @@ Kiro 账户管理桌面应用，用于管理账户、分组和标签，导入、
 
 若缓存丢失、过期或改登导致无法同步，可在停止实例后选择“恢复解绑”并确认。全部实例文件保留，原账户需重新授权，未核验凭证不会回写。
 
-[1.8.7 发布说明](docs/releases/v1.8.7.md)
+[1.8.8 发布说明](docs/releases/v1.8.8.md)
 
 macOS 提供 Intel / Apple Silicon 的 DMG 与 ZIP，Linux x64 提供 AppImage 与 DEB。macOS 安装包未签名及公证；macOS / Linux 尚未完成真实账户和桌面实机验收，多开仅支持 Windows。macOS / Linux 请手动升级。
 

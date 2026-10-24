@@ -42,13 +42,20 @@ test('profile region takes precedence and Builder IdC uses the official SSO_OIDC
     region: 'us-east-1', profileArn: 'arn:aws:codewhisperer:eu-central-1:123456789012:profile/SYNTHETIC' }, { fetch }), { userId: 'synthetic-idc-user' })
 })
 
-test('an absent optional profile uses the supplied region and never fabricates an organization profile', async () => {
+test('an absent organization profile cannot be replaced by a personal profile during identity verification', async () => {
+  let calls = 0
+  const fetch: typeof globalThis.fetch = async () => { calls++; return json({ userInfo: { userId: 'synthetic-enterprise-user' } }) }
+  assert.equal(await verifyKiroInstanceIdentity({ accessToken: 'SYNTHETIC_ACCESS', provider: 'Enterprise', authMethod: 'IdC', region: 'eu-central-1' }, { fetch }), null)
+  assert.equal(calls, 0)
+})
+
+test('legacy Github identities without a stored profile use the same official default as account and model queries', async () => {
   const fetch: typeof globalThis.fetch = async (url, init) => {
-    assert.equal(url, 'https://management.eu-central-1.kiro.dev/')
-    assert.deepEqual(JSON.parse(String(init?.body)), { origin: 'AI_EDITOR' })
-    return json({ userInfo: { userId: 'synthetic-enterprise-user' } })
+    assert.equal(url, 'https://management.us-east-1.kiro.dev/')
+    assert.deepEqual(JSON.parse(String(init?.body)), { origin: 'AI_EDITOR', profileArn: 'arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK' })
+    return json({ userInfo: { userId: 'synthetic-personal-user' } })
   }
-  assert.deepEqual(await verifyKiroInstanceIdentity({ accessToken: 'SYNTHETIC_ACCESS', provider: 'Enterprise', authMethod: 'IdC', region: 'eu-central-1' }, { fetch }), { userId: 'synthetic-enterprise-user' })
+  assert.deepEqual(await verifyKiroInstanceIdentity({ accessToken: 'SYNTHETIC_ACCESS', provider: 'Github', authMethod: 'social', region: 'eu-central-1' }, { fetch }), { userId: 'synthetic-personal-user' })
 })
 
 test('invalid identity, header or endpoint input is rejected before calling any transport', async () => {
