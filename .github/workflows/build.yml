@@ -104,13 +104,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          remote_refs="$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")"
-          if [[ -n "$remote_refs" ]]; then
+          if ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
             git fetch --depth=1 origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
-            if [[ "$(git rev-parse "$RELEASE_TAG^{commit}")" != "$GITHUB_SHA" ]]; then
-              echo "Existing tag does not match the built commit"
-              exit 1
-            fi
+          fi
+          target_sha="$(git rev-parse "$RELEASE_TAG^{commit}")"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$target_sha" != "$GITHUB_SHA" ]]; then
+            echo "Existing tag does not match the built commit"
+            exit 1
           fi
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             echo "Release already exists: $RELEASE_TAG"
@@ -124,7 +124,7 @@ jobs:
             draft_flags+=(--prerelease)
             platforms="Windows · macOS · Linux Preview"
           fi
-          gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" --draft "${draft_flags[@]}" \
+          gh release create "$RELEASE_TAG" --target "$target_sha" --draft "${draft_flags[@]}" \
             --title "kiroaccout $RELEASE_VERSION · $platforms" \
             --notes-file "docs/releases/$RELEASE_TAG.md" \
             release-assets/*
