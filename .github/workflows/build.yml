@@ -108,7 +108,7 @@ jobs:
             git fetch --depth=1 origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
           fi
           target_sha="$(git rev-parse "$RELEASE_TAG^{commit}")"
-          if [[ "$GITHUB_REF_TYPE" == "tag" && "$target_sha" != "$GITHUB_SHA" ]]; then
+          if [[ "$target_sha" != "$GITHUB_SHA" ]]; then
             echo "Existing tag does not match the built commit"
             exit 1
           fi

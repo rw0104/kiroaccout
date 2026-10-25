@@ -2,7 +2,7 @@
 
 Electron application source. See the [project README](../README.md), [stable download](https://github.com/rw0104/kiroaccout/releases/latest) and [all releases](https://github.com/rw0104/kiroaccout/releases).
 
-This source targets **1.8.10 · Windows x64**. Release availability and assets are listed in Releases. Account binding and rotation protection have synthetic-data regression coverage; login and refresh with two real bound accounts have not been validated. Runtime checks succeeded in one Social session; see the release notes for the scope of validation.
+This source targets **1.8.11 · Windows x64**. Release availability and assets are listed in Releases. Account binding and rotation protection have synthetic-data regression coverage; login and refresh with two real bound accounts have not been validated. Runtime checks succeeded in one Social session; see the release notes for the scope of validation.
 
 Use Add Account → Online Login → Sign in on Kiro website for portal login. For exports, select all or selected accounts, then Backup JSON or Credential JSON. Credentials are excluded by default; that export cannot restore login. Explicitly opt in to include credentials when needed and keep the resulting plain-text file private.
 
@@ -18,4 +18,4 @@ If missing or expired cache data or a changed IDE account prevents synchronizati
 
 The instance page provides observed state, graceful stop and restart. Unsaved changes can prevent closure; no automatic force kill is performed. Removing a configuration preserves profile files. Old RC Windows-user configurations are inactive and must be recreated. Network, proxy, certificates, the Windows identity and DPAPI remain shared; this is not a security sandbox. A separate install directory or ZIP does not isolate the account manager itself.
 
-[1.8.10 notes](../docs/releases/v1.8.10.md) · [AGPL-3.0](../LICENSE) · [Source attribution](../docs/NOTICE.md) · [中文](README_CN.md)
+[1.8.11 notes](../docs/releases/v1.8.11.md) · [AGPL-3.0](../LICENSE) · [Source attribution](../docs/NOTICE.md) · [中文](README_CN.md)

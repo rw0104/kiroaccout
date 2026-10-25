@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { releaseOptions } from './lib/releaseOptions.mjs'
 import { tlsLibrarySpec, verifyBinaryArchitecture } from './lib/platformResources.mjs'
+import { loadLibraryForValidation } from './lib/nativeValidation.mjs'
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const options = releaseOptions(process.argv.slice(2), appRoot)
@@ -42,7 +43,7 @@ assert.equal(sha256, expectedSha256, 'TLS library SHA-256 differs from upstream 
 verifyBinaryArchitecture(bytes, spec.platform, spec.arch)
 writeFileSync(cached, bytes)
 const require = createRequire(import.meta.url)
-const library = require('koffi').load(cached)
+const library = loadLibraryForValidation(require('koffi'), cached)
 for (const [name, result, args] of [
   ['request', 'string', ['string']], ['getCookiesFromSession', 'string', ['string']],
   ['addCookiesToSession', 'string', ['string']], ['freeMemory', 'void', ['string']],
