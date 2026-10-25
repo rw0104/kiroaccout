@@ -24,11 +24,252 @@ function fixture() {
     deps: {
       existing: () => stored,
       verify: async input => { calls.push(input); return response(input) },
-      add: account => { stored.push(account); return 'synthetic-id' },
+      add: account => { stored.push({ id: 'synthetic-id', ...account }); return 'synthetic-id' },
       persist: async () => { saves++ }, now: () => 1000
     }
   }
 }
+
+function enableSourceNameUpdates(ctx) {
+  ctx.deps.updateSourceAccountNames = (id, names) => {
+    const account = ctx.stored.find(row => row.id === id)
+    assert.ok(account)
+    const seen = new Set()
+    account.sourceAccountNames = [...(account.sourceAccountNames || []), ...names]
+      .filter(name => {
+        const key = name.toLowerCase()
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+  }
+}
+
+test('verified email and nickname remain authoritative while the original account is retained for search', async () => {
+  const ctx = fixture()
+  const plan = parseAccountImportText(JSON.stringify(credential({ email: 'synthetic-import-name' })))
+  const outcome = await executeCredentialImport(plan, ctx.deps)
+  assert.equal(outcome.added, 1)
+  assert.equal(ctx.stored[0].email, 'test@example.invalid')
+  assert.equal(ctx.stored[0].nickname, 'test')
+  assert.deepEqual(ctx.stored[0].sourceAccountNames, ['synthetic-import-name'])
+})
+
+test('re-importing the original account supplements a matched account without verification or changing its credentials', async () => {
+  const ctx = fixture()
+  enableSourceNameUpdates(ctx)
+  const existing = { id: 'existing', email: 'verified@example.invalid', nickname: 'custom-name',
+    credentials: { refreshToken: 'SYNTHETIC_REFRESH', provider: 'BuilderId' } }
+  ctx.stored.push(existing)
+  const originalCredentials = existing.credentials
+  const outcome = await executeCredentialImport(parseAccountImportText(JSON.stringify(credential({ email: 'synthetic-source' }))), ctx.deps)
+  assert.equal(outcome.duplicate, 1)
+  assert.equal(outcome.added, 0)
+  assert.equal(ctx.calls.length, 0)
+  assert.equal(ctx.stored.length, 1)
+  assert.equal(existing.email, 'verified@example.invalid')
+  assert.equal(existing.nickname, 'custom-name')
+  assert.equal(existing.credentials, originalCredentials)
+  assert.deepEqual(existing.sourceAccountNames, ['synthetic-source'])
+  assert.equal(ctx.saves, 1)
+})
+
+test('duplicate rows with different original names are retained after the first verification rotates credentials', async () => {
+  const ctx = fixture()
+  enableSourceNameUpdates(ctx)
+  const plan = parseAccountImportText(JSON.stringify([
+    credential({ email: 'synthetic-first-name' }), credential({ email: 'synthetic-second-name' })
+  ]))
+  const outcome = await executeCredentialImport(plan, ctx.deps)
+  assert.equal(outcome.added, 1)
+  assert.equal(outcome.duplicate, 1)
+  assert.equal(ctx.calls.length, 1)
+  assert.deepEqual(ctx.stored[0].sourceAccountNames, ['synthetic-first-name', 'synthetic-second-name'])
+  assert.equal(ctx.saves, 1)
+})
+
+test('each duplicate row keeps its own token identity when the batch shares an original account label', async () => {
+  const ctx = fixture()
+  enableSourceNameUpdates(ctx)
+  const first = { id: 'first', email: 'first@example.invalid', credentials: { refreshToken: 'SYNTHETIC_FIRST', provider: 'BuilderId' } }
+  const second = { id: 'second', email: 'second@example.invalid', credentials: { refreshToken: 'SYNTHETIC_SECOND', provider: 'BuilderId' } }
+  ctx.stored.push(first, second)
+  const originalCredentials = ctx.stored.map(account => account.credentials)
+  const plan = parseAccountImportText(JSON.stringify([
+    credential({ email: 'synthetic-shared-label', refreshToken: 'SYNTHETIC_FIRST', sourceAccountNames: ['first-source'] }),
+    credential({ email: 'synthetic-shared-label', refreshToken: 'SYNTHETIC_SECOND', sourceAccountNames: ['second-source'] })
+  ]))
+  assert.equal(plan.records[1].status, 'duplicate')
+  assert.equal(plan.records[1].duplicateOf, 0)
+  const outcome = await executeCredentialImport(plan, ctx.deps)
+  assert.equal(outcome.duplicate, 2)
+  assert.equal(ctx.calls.length, 0)
+  assert.deepEqual(first.sourceAccountNames, ['first-source', 'synthetic-shared-label'])
+  assert.deepEqual(second.sourceAccountNames, ['second-source', 'synthetic-shared-label'])
+  assert.deepEqual(ctx.stored.map(account => account.email), ['first@example.invalid', 'second@example.invalid'])
+  ctx.stored.forEach((account, index) => assert.equal(account.credentials, originalCredentials[index]))
+  assert.equal(ctx.saves, 1)
+  assert.ok(isOutcomeBalanced(outcome))
+})
+
+test('a direct token match outranks an earlier existing account with the same email', async () => {
+  const ctx = fixture()
+  enableSourceNameUpdates(ctx)
+  ctx.stored.push(
+    { id: 'email-match', email: 'shared@example.invalid', credentials: { refreshToken: 'SYNTHETIC_OTHER', provider: 'BuilderId' } },
+    { id: 'token-match', email: 'verified@example.invalid', credentials: { refreshToken: 'SYNTHETIC_REFRESH', provider: 'BuilderId' } }
+  )
+  const outcome = await executeCredentialImport(parseAccountImportText(JSON.stringify(credential({
+    email: 'shared@example.invalid', sourceAccountNames: ['synthetic-source']
+  }))), ctx.deps)
+  assert.equal(outcome.duplicate, 1)
+  assert.equal(ctx.calls.length, 0)
+  assert.equal(ctx.stored[0].sourceAccountNames, undefined)
+  assert.deepEqual(ctx.stored[1].sourceAccountNames, ['synthetic-source', 'shared@example.invalid'])
+  assert.ok(isOutcomeBalanced(outcome))
+})
+
+for (const identity of ['userId', 'consumed']) {
+  test(`a duplicate row uses its own ${identity} identity before the shared input label`, async () => {
+    const ctx = fixture()
+    enableSourceNameUpdates(ctx)
+    ctx.stored.push(
+      { id: 'first', email: 'first@example.invalid', credentials: { refreshToken: 'SYNTHETIC_FIRST', provider: 'BuilderId' } },
+      { id: 'second', email: 'second@example.invalid', userId: 'second-user', credentials: { refreshToken: 'SYNTHETIC_ROTATED', provider: 'BuilderId' } }
+    )
+    if (identity === 'consumed') ctx.deps.getConsumedAccountId = input => input.refreshToken === 'SYNTHETIC_SECOND' ? 'second' : undefined
+    const plan = parseAccountImportText(JSON.stringify([
+      credential({ email: 'synthetic-shared-label', refreshToken: 'SYNTHETIC_FIRST', sourceAccountNames: ['first-source'] }),
+      credential({ email: 'synthetic-shared-label', refreshToken: 'SYNTHETIC_SECOND', sourceAccountNames: ['second-source'],
+        ...(identity === 'userId' ? { userId: 'second-user' } : {}) })
+    ]))
+    const outcome = await executeCredentialImport(plan, ctx.deps)
+    assert.equal(outcome.duplicate, 2)
+    assert.equal(ctx.calls.length, 0)
+    assert.deepEqual(ctx.stored[0].sourceAccountNames, ['first-source', 'synthetic-shared-label'])
+    assert.deepEqual(ctx.stored[1].sourceAccountNames, ['second-source', 'synthetic-shared-label'])
+    assert.ok(isOutcomeBalanced(outcome))
+  })
+}
+
+test('an input label alone never transfers another row source name to a verified account', async () => {
+  const ctx = fixture()
+  enableSourceNameUpdates(ctx)
+  const plan = parseAccountImportText(JSON.stringify([
+    credential({ email: 'synthetic-shared-label', sourceAccountNames: ['first-source'] }),
+    credential({ email: 'synthetic-shared-label', refreshToken: 'SYNTHETIC_OTHER', sourceAccountNames: ['unresolved-source'] })
+  ]))
+  const outcome = await executeCredentialImport(plan, ctx.deps)
+  assert.equal(outcome.added, 1)
+  assert.equal(outcome.duplicate, 1)
+  assert.equal(ctx.calls.length, 1)
+  assert.deepEqual(ctx.stored[0].sourceAccountNames, ['first-source', 'synthetic-shared-label'])
+  assert.ok(isOutcomeBalanced(outcome))
+})
+
+test('an email-only existing match cannot establish a token binding for other batch source names', async () => {
+  const ctx = fixture()
+  enableSourceNameUpdates(ctx)
+  ctx.stored.push({ id: 'existing', email: 'known@example.invalid', credentials: { refreshToken: 'SYNTHETIC_OTHER', provider: 'BuilderId' } })
+  const plan = parseAccountImportText(JSON.stringify([
+    credential({ email: 'known@example.invalid' }),
+    credential({ email: 'synthetic-unverified-source' })
+  ]))
+  const outcome = await executeCredentialImport(plan, ctx.deps)
+  assert.equal(outcome.duplicate, 2)
+  assert.equal(ctx.calls.length, 0)
+  assert.deepEqual(ctx.stored[0].sourceAccountNames, ['known@example.invalid'])
+  assert.ok(isOutcomeBalanced(outcome))
+})
+
+for (const conflict of ['userId', 'consumed']) {
+  test(`conflicting token and ${conflict} identities do not update either account or refresh again`, async () => {
+    const ctx = fixture()
+    enableSourceNameUpdates(ctx)
+    ctx.stored.push(
+      { id: 'first', email: 'first@example.invalid', userId: 'first-user', credentials: { refreshToken: 'SYNTHETIC_REFRESH', provider: 'BuilderId' } },
+      { id: 'second', email: 'second@example.invalid', userId: 'second-user', credentials: { refreshToken: 'SYNTHETIC_OTHER', provider: 'BuilderId' } }
+    )
+    if (conflict === 'consumed') ctx.deps.getConsumedAccountId = () => 'second'
+    const outcome = await executeCredentialImport(parseAccountImportText(JSON.stringify(credential({
+      email: 'synthetic-source', ...(conflict === 'userId' ? { userId: 'second-user' } : {})
+    }))), ctx.deps)
+    assert.equal(outcome.failed, 1)
+    assert.equal(ctx.calls.length, 0)
+    assert.equal(ctx.saves, 0)
+    assert.ok(ctx.stored.every(account => !account.sourceAccountNames))
+    assert.ok(isOutcomeBalanced(outcome))
+  })
+}
+
+test('a failed save counts both directly matched duplicate rows once and retries without verification', async () => {
+  const ctx = fixture()
+  enableSourceNameUpdates(ctx)
+  ctx.stored.push(
+    { id: 'first', credentials: { refreshToken: 'SYNTHETIC_FIRST', provider: 'BuilderId' } },
+    { id: 'second', credentials: { refreshToken: 'SYNTHETIC_SECOND', provider: 'BuilderId' } }
+  )
+  const plan = parseAccountImportText(JSON.stringify([
+    credential({ email: 'synthetic-shared-label', refreshToken: 'SYNTHETIC_FIRST', sourceAccountNames: ['first-source'] }),
+    credential({ email: 'synthetic-shared-label', refreshToken: 'SYNTHETIC_SECOND', sourceAccountNames: ['second-source'] })
+  ]))
+  let attempts = 0
+  ctx.deps.persist = async () => { if (++attempts === 1) throw new Error('synthetic disk failure') }
+  const first = await executeCredentialImport(plan, ctx.deps)
+  const second = await executeCredentialImport(plan, ctx.deps)
+  assert.equal(first.failed, 2)
+  assert.equal(first.duplicate, 0)
+  assert.equal(first.errors.length, 2)
+  assert.equal(second.duplicate, 2)
+  assert.equal(ctx.calls.length, 0)
+  assert.equal(attempts, 2)
+  assert.deepEqual(ctx.stored[0].sourceAccountNames, ['first-source', 'synthetic-shared-label'])
+  assert.deepEqual(ctx.stored[1].sourceAccountNames, ['second-source', 'synthetic-shared-label'])
+  assert.ok(isOutcomeBalanced(first) && isOutcomeBalanced(second))
+})
+
+test('source names are added to the verified duplicate discovered after awaiting verification', async () => {
+  const ctx = fixture()
+  enableSourceNameUpdates(ctx)
+  ctx.deps.verify = async input => {
+    ctx.stored.push({ id: 'existing', email: 'test@example.invalid', credentials: { provider: 'BuilderId' } })
+    return response(input)
+  }
+  const outcome = await executeCredentialImport(parseAccountImportText(JSON.stringify(credential({ email: 'synthetic-source' }))), ctx.deps)
+  assert.equal(outcome.duplicate, 1)
+  assert.equal(ctx.stored.length, 1)
+  assert.deepEqual(ctx.stored[0].sourceAccountNames, ['synthetic-source'])
+  assert.equal(ctx.saves, 1)
+})
+
+test('source-name persistence failure is visible and a duplicate retry saves again without verification', async () => {
+  const ctx = fixture()
+  enableSourceNameUpdates(ctx)
+  ctx.stored.push({ id: 'existing', email: 'verified@example.invalid', credentials: { refreshToken: 'SYNTHETIC_REFRESH', provider: 'BuilderId' } })
+  let attempts = 0
+  ctx.deps.persist = async () => { if (++attempts === 1) throw new Error('synthetic disk failure') }
+  const plan = parseAccountImportText(JSON.stringify(credential({ email: 'synthetic-source' })))
+  const first = await executeCredentialImport(plan, ctx.deps)
+  const second = await executeCredentialImport(plan, ctx.deps)
+  assert.equal(first.failed, 1)
+  assert.equal(first.duplicate, 0)
+  assert.equal(second.duplicate, 1)
+  assert.equal(ctx.calls.length, 0)
+  assert.equal(attempts, 2)
+  assert.ok(isOutcomeBalanced(first) && isOutcomeBalanced(second))
+})
+
+test('consumed old credentials can add a new source name without another verification', async () => {
+  const ctx = fixture()
+  enableSourceNameUpdates(ctx)
+  ctx.stored.push({ id: 'existing', email: 'verified@example.invalid', credentials: { refreshToken: 'SYNTHETIC_ROTATED', provider: 'BuilderId' } })
+  ctx.deps.getConsumedAccountId = () => 'existing'
+  const outcome = await executeCredentialImport(parseAccountImportText(JSON.stringify(credential({ email: 'synthetic-source' }))), ctx.deps)
+  assert.equal(outcome.duplicate, 1)
+  assert.equal(ctx.calls.length, 0)
+  assert.deepEqual(ctx.stored[0].sourceAccountNames, ['synthetic-source'])
+  assert.equal(ctx.saves, 1)
+})
 
 test('actual execution uses normalized route, preserves metadata, and accounts for invalid/duplicate rows', async () => {
   const ctx = fixture()

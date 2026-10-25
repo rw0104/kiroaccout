@@ -360,8 +360,8 @@ export function ProxySecurityPanel({ config, setConfig, isRunning, isEn }: Proxy
             </div>
             <p className="text-xs text-muted-foreground mb-2">
               {isEn
-                ? 'When TLS is enabled but no cert/key configured, the proxy auto-generates a 2-year self-signed cert (in userData/proxy-tls/). Install on clients or set NODE_TLS_REJECT_UNAUTHORIZED=0.'
-                : '启用 TLS 但未配置证书时，反代自动生成 2 年有效期的自签证书（位于 userData/proxy-tls/）。客户端需要安装该证书或设置 NODE_TLS_REJECT_UNAUTHORIZED=0。'}
+                ? 'Without a configured certificate, the proxy generates a 2-year self-signed certificate. Trust this certificate in the client, or configure its CA file while keeping certificate validation enabled.'
+                : '未配置证书时，反代会生成有效期为 2 年的自签证书。请在客户端信任该证书或配置对应 CA 文件，并保持证书校验开启。'}
             </p>
             {showCert && certInfo && (
               <div className="space-y-2 mt-3">

@@ -9,6 +9,10 @@ interface SelectOption {
 }
 
 interface SelectProps {
+  id?: string
+  'aria-label'?: string
+  'aria-describedby'?: string
+  disabled?: boolean
   value: string
   options: SelectOption[]
   onChange: (value: string) => void
@@ -16,7 +20,7 @@ interface SelectProps {
   className?: string
 }
 
-export function Select({ value, options, onChange, placeholder = '请选择', className }: SelectProps) {
+export function Select({ value, options, onChange, placeholder = '请选择', className, id, disabled = false, 'aria-label': ariaLabel, 'aria-describedby': ariaDescribedBy }: SelectProps) {
   const [isOpen, setIsOpen] = useState(false)
   const [activeIndex, setActiveIndex] = useState(0)
   const ref = useRef<HTMLDivElement>(null)
@@ -39,6 +43,7 @@ export function Select({ value, options, onChange, placeholder = '请选择', cl
   }, [options, value])
 
   const choose = (index: number) => {
+    if (disabled) return
     const option = options[index]
     if (!option) return
     onChange(option.value)
@@ -46,6 +51,7 @@ export function Select({ value, options, onChange, placeholder = '请选择', cl
   }
 
   const handleKeyDown = (event: KeyboardEvent<HTMLButtonElement>) => {
+    if (disabled) return
     if (event.key === 'Escape') { setIsOpen(false); return }
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault()
@@ -62,16 +68,21 @@ export function Select({ value, options, onChange, placeholder = '请选择', cl
     <div ref={ref} className={cn('relative', className)}>
       {/* Trigger */}
       <button
+        id={id}
         type="button"
+        disabled={disabled}
+        aria-label={ariaLabel}
+        aria-describedby={ariaDescribedBy}
         aria-haspopup="listbox"
         aria-expanded={isOpen}
         onKeyDown={handleKeyDown}
-        onClick={() => setIsOpen(open => !open)}
+        onClick={() => { if (!disabled) setIsOpen(open => !open) }}
         className={cn(
           'flex items-center justify-between gap-2 px-3 py-2 w-full min-h-10 rounded-xl border bg-[var(--glass-bg)] backdrop-blur-md text-sm transition-[border-color,box-shadow,background-color,transform] duration-200 shadow-sm',
           'hover:border-primary/50 hover:bg-[var(--glass-bg-strong)] active:scale-[0.995]',
           isOpen && 'border-primary/50 ring-2 ring-primary/20 bg-[var(--glass-bg-strong)]',
-          !isOpen && 'border-foreground/15'
+          !isOpen && 'border-foreground/15',
+          disabled && 'opacity-50 cursor-not-allowed'
         )}
       >
         <span className={cn(!selectedOption && 'text-muted-foreground')}>
@@ -84,7 +95,7 @@ export function Select({ value, options, onChange, placeholder = '请选择', cl
       </button>
 
       {/* Dropdown */}
-      {isOpen && (
+      {isOpen && !disabled && (
         <div role="listbox" aria-label={placeholder} className="absolute top-full left-0 right-0 mt-2 max-h-72 overflow-auto py-1.5 rounded-2xl glass-card-strong z-50 shadow-xl animate-in fade-in-0 zoom-in-95 duration-150 origin-top">
           {options.map((option) => (
             <button

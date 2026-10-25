@@ -557,10 +557,10 @@ export interface ProxyConfig {
   /**
    * P2-21 API Key 与账号的精细绑定：apiKey id → 允许使用的账号 ID 数组（白名单）
    * 未配置或空数组 = 该 API Key 可使用所有账号；
-   * 兼容旧名 apiKeyGroupBindings（按 group 绑定，需配合 group 同步）
+   * 与 apiKeyGroupBindings 及所选账号分组取交集；无可用账号时不会回退到范围外账号。
    */
   apiKeyAccountBindings?: Record<string, string[]>
-  /** @deprecated 改用 apiKeyAccountBindings；保留以兼容老配置 */
+  /** @deprecated 按 group ID 绑定；未设或空数组不限制，非空时与账号白名单取交集。新配置推荐 apiKeyAccountBindings。 */
   apiKeyGroupBindings?: Record<string, string[]>
   /** HTTP + HTTPS 双端口：启用 TLS 时，仍同时监听 HTTP 端口在 fallbackPort */
   fallbackPort?: number

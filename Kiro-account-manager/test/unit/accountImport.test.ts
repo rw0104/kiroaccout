@@ -12,6 +12,26 @@ const bid = { refreshToken: 'FAKE_RT_A', clientId: 'FAKE_C', clientSecret: 'FAKE
 const bid2 = { ...bid, refreshToken: 'FAKE_RT_B' }
 const social = { refreshToken: 'FAKE_RT_SOCIAL', provider: 'Github' }
 
+test('shared parsing keeps normalized source account names as metadata', () => {
+  const plan = parseAccountImportText(JSON.stringify({
+    ...social,
+    email: 'synthetic-login-42',
+    sourceAccountNames: ['  older-login ', 'OLDER-LOGIN', null, 123]
+  }))
+  assert.equal(plan.counts.valid, 1)
+  assert.deepEqual(plan.records[0].credential?.sourceAccountNames, ['older-login'])
+  assert.equal(plan.records[0].credential?.email, 'synthetic-login-42')
+})
+
+test('source account names do not establish account identity or cause duplicate imports', () => {
+  const plan = parseAccountImportText(JSON.stringify([
+    { ...social, sourceAccountNames: ['shared-source-label'] },
+    { ...social, refreshToken: 'FAKE_RT_DIFFERENT', sourceAccountNames: ['shared-source-label'] }
+  ]))
+  assert.equal(plan.counts.valid, 2)
+  assert.equal(plan.counts.duplicate, 0)
+})
+
 function assertBackupPreviewMatchesRestore(plan: ReturnType<typeof parseAccountImportText>): void {
   assert.ok(plan.backup)
   const restored = planBackupRestore(plan.backup, {

@@ -1,6 +1,6 @@
 import {
   emptyOutcome,
-  findExistingDuplicate,
+  resolveExistingDuplicate,
   formatIssues,
   type ExistingAccountLike,
   type ImportOutcome,
@@ -9,6 +9,7 @@ import {
 } from '../../../shared/accountImport'
 import type { Account } from '../types/account'
 import { normalizeSubscriptionType } from '../../../shared/accountSubscription'
+import { mergeSourceAccountNames } from '../../../shared/accountSearch'
 
 type Verification = Awaited<ReturnType<Window['api']['verifyAccountCredentials']>>
 type AccountInput = Omit<Account, 'id' | 'createdAt' | 'isActive'>
@@ -18,6 +19,8 @@ export interface CredentialImportDependencies {
   verify: (credential: NormalizedCredential) => Promise<Verification>
   add: (account: AccountInput) => string
   persist: () => Promise<void>
+  updateSourceAccountNames?: (accountId: string, names: string[]) => void
+  getConsumedAccountId?: (credential: NormalizedCredential) => string | undefined
   wasConsumed?: (credential: NormalizedCredential) => boolean
   rememberConsumed?: (credential: NormalizedCredential, accountId: string) => void
   now?: () => number
@@ -48,9 +51,11 @@ export function verifiedAccount(
   const userId = data.userId?.trim() || credential.userId
   if (!email && !userId) throw new Error('Missing verified identity')
   const seconds = Number.isFinite(data.expiresIn) && data.expiresIn! > 0 ? data.expiresIn! : 0
+  const sourceAccountNames = mergeSourceAccountNames(credential.sourceAccountNames, [credential.email])
   return {
     email,
     userId,
+    ...(sourceAccountNames.length ? { sourceAccountNames } : {}),
     password: credential.password,
     nickname: credential.nickname || email.split('@')[0] || undefined,
     idp: credential.provider,
@@ -104,24 +109,62 @@ export async function executeCredentialImport(
     return outcome
   }
   const addedSources: string[] = []
-  const consumedRetrySources: string[] = []
+  const duplicateSaveSources = new Set<string>()
+  const resolvedAccounts = new Map<number, string>()
+  const credentialsByIndex = new Map(plan.records.map(record => [record.index, record.credential]))
+  const recordDuplicate = (index: number, source: string, credential: NormalizedCredential, accountId?: string, retrySave = false, stable = false): void => {
+    if (accountId) {
+      // Only verified or stable identity matches can bind rotated tokens to later rows.
+      if (stable) resolvedAccounts.set(index, accountId)
+      const names = mergeSourceAccountNames(credential.sourceAccountNames, [credential.email])
+      if (names.length && deps.updateSourceAccountNames) {
+        deps.updateSourceAccountNames(accountId, names)
+        // Save on retries too: a previous failed write may have already updated memory.
+        duplicateSaveSources.add(source)
+      }
+    }
+    if (retrySave) duplicateSaveSources.add(source)
+    outcome.duplicate++
+  }
+  const recordConflict = (source: string): void => {
+    outcome.failed++
+    outcome.errors.push({ source, message: '账户身份信息冲突，未更新来源账号，请检查导入记录' })
+  }
   for (const record of plan.records) {
     const source = `#${record.index + 1}`
     if (signal?.aborted) { outcome.cancelled++; continue }
-    if (record.status === 'duplicate') { outcome.duplicate++; continue }
     if (!record.credential || record.status === 'invalid') {
       outcome.invalid++
       outcome.errors.push({ source, message: formatIssues(record) })
       continue
     }
     const credential = record.credential
-    if (deps.wasConsumed?.(credential)) {
-      outcome.duplicate++
-      consumedRetrySources.push(source)
-      continue
-    }
-    if (findExistingDuplicate(deps.existing(), credential)) { outcome.duplicate++; continue }
     try {
+      const consumedId = deps.getConsumedAccountId?.(credential)
+      const previous = record.duplicateOf === undefined ? undefined : credentialsByIndex.get(record.duplicateOf)
+      const sharesStableIdentity = previous && (
+        previous.refreshToken === credential.refreshToken ||
+        (credential.userId && previous.userId === credential.userId)
+      )
+      const batchId = sharesStableIdentity ? resolvedAccounts.get(record.duplicateOf!) : undefined
+      const match = resolveExistingDuplicate(deps.existing(), credential, [consumedId, batchId])
+      if (match.conflict) {
+        recordConflict(source)
+        continue
+      }
+      if (match.account) {
+        recordDuplicate(record.index, source, credential, match.account.id, Boolean(consumedId), match.stable)
+        continue
+      }
+      if (consumedId || deps.wasConsumed?.(credential)) {
+        recordDuplicate(record.index, source, credential, undefined, true)
+        continue
+      }
+      if (record.status === 'duplicate') {
+        // A shared input label is not evidence that another row owns this token.
+        recordDuplicate(record.index, source, credential)
+        continue
+      }
       const result = await deps.verify(credential)
       if (signal?.aborted) { outcome.cancelled++; continue }
       if (!result.success || !result.data) {
@@ -130,12 +173,23 @@ export async function executeCredentialImport(
         continue
       }
       const account = verifiedAccount(credential, result.data, (deps.now || Date.now)(), groupId)
-      if (findExistingDuplicate(deps.existing(), {
+      const verifiedMatch = resolveExistingDuplicate(deps.existing(), {
         email: account.email, userId: account.userId, provider: credential.provider,
         refreshToken: account.credentials.refreshToken
-      })) { outcome.duplicate++; continue }
+      })
+      if (verifiedMatch.conflict) {
+        recordConflict(source)
+        continue
+      }
+      const verifiedDuplicate = verifiedMatch.account
+      if (verifiedDuplicate) {
+        recordDuplicate(record.index, source, credential, verifiedDuplicate.id, false, true)
+        if (verifiedDuplicate.id) deps.rememberConsumed?.(credential, verifiedDuplicate.id)
+        continue
+      }
       // No await between the final duplicate check and insertion.
       const accountId = deps.add(account)
+      resolvedAccounts.set(record.index, accountId)
       deps.rememberConsumed?.(credential, accountId)
       addedSources.push(source)
       outcome.added++
@@ -145,13 +199,13 @@ export async function executeCredentialImport(
       outcome.errors.push({ source, message: '账户验证或添加失败，请检查网络及账户状态' })
     }
   }
-  if (outcome.added > 0 || consumedRetrySources.length > 0) {
+  if (outcome.added > 0 || duplicateSaveSources.size > 0) {
     try { await deps.persist() } catch {
       // Keep the in-memory entries to avoid rotating the same token again on a retry.
-      outcome.failed += outcome.added + consumedRetrySources.length
-      outcome.duplicate -= consumedRetrySources.length
+      outcome.failed += outcome.added + duplicateSaveSources.size
+      outcome.duplicate -= duplicateSaveSources.size
       outcome.added = 0
-      for (const source of [...addedSources, ...consumedRetrySources]) outcome.errors.push({ source, message: '账户已在当前窗口保留，但保存失败；请重试保存后再退出' })
+      for (const source of [...addedSources, ...duplicateSaveSources]) outcome.errors.push({ source, message: '账户已在当前窗口保留，但保存失败；请重试保存后再退出' })
     }
   }
   return outcome

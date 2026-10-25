@@ -108,6 +108,7 @@ export interface Account {
   email: string
   password?: string // 注册密码（卡密导出/导入用）
   nickname?: string // 自定义别名
+  sourceAccountNames?: string[] // 导入时的原始账号，仅用于搜索，不参与认证或身份匹配
   idp: IdpType
   userId?: string
   visitorId?: string
@@ -154,7 +155,7 @@ export interface AccountGroup {
  * 筛选条件
  */
 export interface AccountFilter {
-  search?: string // 搜索关键词（邮箱/别名）
+  search?: string // 搜索关键词（邮箱/别名/原始账号）
   subscriptionTypes?: SubscriptionType[]
   statuses?: AccountStatus[]
   idps?: IdpType[]
@@ -213,6 +214,7 @@ export interface AccountImportItem {
   region?: string
   idp?: IdpType | string
   nickname?: string
+  sourceAccountNames?: string[]
   groupId?: string
   tags?: string[]
 }

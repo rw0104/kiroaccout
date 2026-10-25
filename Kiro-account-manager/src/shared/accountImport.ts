@@ -10,6 +10,7 @@
 
 import { normalizeAuthMethod, normalizeProvider, resolveIdentity } from './authIdentity'
 import type { CanonicalAuthMethod, CanonicalProvider } from './authIdentity'
+import { mergeSourceAccountNames } from './accountSearch'
 
 export type ImportFormat = 'json' | 'lines'
 export type ImportContainer =
@@ -47,6 +48,7 @@ export interface NormalizedCredential {
   password?: string
   userId?: string
   nickname?: string
+  sourceAccountNames?: string[]
 }
 
 export interface ImportRecord {
@@ -438,6 +440,8 @@ export function normalizeCredentialRecord(
   if (values.password && values.password !== 'no_password') credential.password = values.password
   if (values.userId) credential.userId = values.userId
   if (values.nickname) credential.nickname = values.nickname
+  const sourceAccountNames = mergeSourceAccountNames(raw.sourceAccountNames)
+  if (sourceAccountNames.length) credential.sourceAccountNames = sourceAccountNames
 
   return { credential, issues, warnings }
 }
@@ -656,6 +660,7 @@ export interface ExistingAccountLike {
   id?: string
   email?: string
   userId?: string
+  sourceAccountNames?: string[]
   idp?: string
   credentials?: { provider?: string; refreshToken?: string }
 }
@@ -678,17 +683,33 @@ export function findExistingDuplicate<T extends ExistingAccountLike>(
   existing: Iterable<T>,
   candidate: DuplicateCandidate
 ): T | undefined {
+  return resolveExistingDuplicate(existing, candidate).account
+}
+
+/** Mutating callers must handle conflict before using account; legacy lookup still detects duplicates. */
+export function resolveExistingDuplicate<T extends ExistingAccountLike>(
+  existing: Iterable<T>,
+  candidate: DuplicateCandidate,
+  knownAccountIds: readonly (string | undefined)[] = []
+): { account?: T; stable: boolean; conflict: boolean } {
   const candProvider = normalizeProvider(candidate.provider) ?? undefined
   const candEmail = candidate.email?.trim().toLowerCase()
+  const stableMatches: T[] = []
+  const emailMatches: T[] = []
   for (const acc of existing) {
-    if (candidate.userId && acc.userId && acc.userId === candidate.userId) return acc
-    if (candidate.refreshToken && acc.credentials?.refreshToken && acc.credentials.refreshToken === candidate.refreshToken) return acc
+    if ((acc.id && knownAccountIds.includes(acc.id)) ||
+        (candidate.userId && acc.userId === candidate.userId) ||
+        (candidate.refreshToken && acc.credentials?.refreshToken === candidate.refreshToken)) stableMatches.push(acc)
     if (candEmail && acc.email && acc.email.trim().toLowerCase() === candEmail) {
       const accProvider = normalizeProvider(acc.credentials?.provider) ?? normalizeProvider(acc.idp) ?? undefined
-      if (accProvider && candProvider && accProvider === candProvider) return acc
+      if (accProvider && candProvider && accProvider === candProvider) emailMatches.push(acc)
     }
   }
-  return undefined
+  // A weak email match must never hide a later token, user ID or consumed-token owner.
+  const matches = stableMatches.length ? stableMatches : emailMatches
+  const conflict = matches.length > 1 || matches.some(account =>
+    candidate.userId && account.userId && candidate.userId !== account.userId)
+  return { account: matches[0], stable: stableMatches.length > 0, conflict }
 }
 
 // ---------- 批量结果 ----------

@@ -8,6 +8,6 @@ The current project repository is [rw0104/kiroaccout](https://github.com/rw0104/
 
 ## Dependencies and product names
 
-The application uses third-party packages including Electron, React, TypeScript, Zustand, Tailwind CSS, Vite and Lucide. Their license notices remain in the distributed packages where applicable; the project's AGPL license does not replace dependency licenses.
+The application uses third-party packages including Electron, React, TypeScript, Zustand, Tailwind CSS, Vite, Lucide and Microsoft jsonc-parser and PeculiarVentures X.509 packages (MIT). Their license notices remain in the distributed packages where applicable; the project's AGPL license does not replace dependency licenses.
 
 Kiro and other product names, logos and service identifiers belong to their respective owners. This project does not claim to be an official Kiro product or to own those marks.

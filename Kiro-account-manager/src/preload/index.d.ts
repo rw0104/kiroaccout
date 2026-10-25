@@ -4,6 +4,7 @@ import type { WindowVisibilityState } from '../shared/windowVisibility'
 import type { AppUpdateState, UpdateActionResult } from '../main/appUpdater'
 import type { LoginResult, SocialLoginCallback } from '../main/loginSessions'
 import type { KiroInstancesApi } from '../shared/kiroInstances'
+import type { KiroSettingsTarget, KiroSettingsReadResult } from '../shared/kiroSettings'
 import type { AccountAddOnCredit } from '../shared/accountUsage'
 import { ElectronAPI } from '@electron-toolkit/preload'
 
@@ -494,21 +495,16 @@ interface KiroApi {
   // ============ Kiro 设置管理 API ============
 
   // 获取 Kiro 设置
-  getKiroSettings: () => Promise<{
-    settings?: Record<string, unknown>
-    mcpConfig?: { mcpServers: Record<string, unknown> }
-    steeringFiles?: string[]
-    error?: string
-  }>
+  getKiroSettings: (target?: KiroSettingsTarget) => Promise<KiroSettingsReadResult>
 
   // 获取 Kiro 可用模型列表
-  getKiroAvailableModels: () => Promise<{
+  getKiroAvailableModels: (target?: KiroSettingsTarget) => Promise<{
     models: Array<{ id: string; name: string; description: string }>
     error?: string
   }>
 
   // 保存 Kiro 设置
-  saveKiroSettings: (settings: Record<string, unknown>) => Promise<{ success: boolean; error?: string }>
+  saveKiroSettings: (settings: Record<string, unknown>, target?: KiroSettingsTarget) => Promise<{ success: boolean; error?: string }>
 
   // 打开 Kiro MCP 配置文件
   openKiroMcpConfig: (type: 'user' | 'workspace') => Promise<{ success: boolean; error?: string }>
@@ -517,7 +513,7 @@ interface KiroApi {
   openKiroSteeringFolder: () => Promise<{ success: boolean; error?: string }>
 
   // 打开 Kiro settings.json 文件
-  openKiroSettingsFile: () => Promise<{ success: boolean; error?: string }>
+  openKiroSettingsFile: (target?: KiroSettingsTarget) => Promise<{ success: boolean; error?: string }>
 
   // 打开指定的 Steering 文件
   openKiroSteeringFile: (filename: string) => Promise<{ success: boolean; error?: string }>

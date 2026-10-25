@@ -4,6 +4,7 @@ import type { WindowVisibilityState } from '../shared/windowVisibility'
 import type { AppUpdateState, UpdateActionResult } from '../main/appUpdater'
 import type { LoginResult, SocialLoginCallback } from '../main/loginSessions'
 import { KIRO_INSTANCE_CHANNELS, type KiroInstancesApi } from '../shared/kiroInstances'
+import type { KiroSettingsTarget, KiroSettingsReadResult } from '../shared/kiroSettings'
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
@@ -425,26 +426,21 @@ const api = {
   // ============ Kiro 设置管理 ============
 
   // 获取 Kiro 设置
-  getKiroSettings: (): Promise<{
-    settings?: Record<string, unknown>
-    mcpConfig?: { mcpServers: Record<string, unknown> }
-    steeringFiles?: string[]
-    error?: string
-  }> => {
-    return ipcRenderer.invoke('get-kiro-settings')
+  getKiroSettings: (target?: KiroSettingsTarget): Promise<KiroSettingsReadResult> => {
+    return ipcRenderer.invoke('get-kiro-settings', target)
   },
 
   // 获取 Kiro 可用模型列表
-  getKiroAvailableModels: (): Promise<{
+  getKiroAvailableModels: (target?: KiroSettingsTarget): Promise<{
     models: Array<{ id: string; name: string; description: string }>
     error?: string
   }> => {
-    return ipcRenderer.invoke('get-kiro-available-models')
+    return ipcRenderer.invoke('get-kiro-available-models', target)
   },
 
   // 保存 Kiro 设置
-  saveKiroSettings: (settings: Record<string, unknown>): Promise<{ success: boolean; error?: string }> => {
-    return ipcRenderer.invoke('save-kiro-settings', settings)
+  saveKiroSettings: (settings: Record<string, unknown>, target?: KiroSettingsTarget): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('save-kiro-settings', settings, target)
   },
 
   // 打开 Kiro MCP 配置文件
@@ -458,8 +454,8 @@ const api = {
   },
 
   // 打开 Kiro settings.json 文件
-  openKiroSettingsFile: (): Promise<{ success: boolean; error?: string }> => {
-    return ipcRenderer.invoke('open-kiro-settings-file')
+  openKiroSettingsFile: (target?: KiroSettingsTarget): Promise<{ success: boolean; error?: string }> => {
+    return ipcRenderer.invoke('open-kiro-settings-file', target)
   },
 
   // 打开指定的 Steering 文件

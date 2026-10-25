@@ -2,9 +2,13 @@
 
 Electron application source. See the [project README](../README.md), [stable download](https://github.com/rw0104/kiroaccout/releases/latest) and [all releases](https://github.com/rw0104/kiroaccout/releases).
 
-This source targets **1.8.8 · Windows x64**. Release availability and assets are listed in Releases. Account binding and rotation protection have synthetic-data regression coverage; login and refresh with two real bound accounts have not been validated. Runtime checks succeeded in one Social session; see the release notes for the scope of validation.
+This source targets **1.8.10 · Windows x64**. Release availability and assets are listed in Releases. Account binding and rotation protection have synthetic-data regression coverage; login and refresh with two real bound accounts have not been validated. Runtime checks succeeded in one Social session; see the release notes for the scope of validation.
 
 Use Add Account → Online Login → Sign in on Kiro website for portal login. For exports, select all or selected accounts, then Backup JSON or Credential JSON. Credentials are excluded by default; that export cannot restore login. Explicitly opt in to include credentials when needed and keep the resulting plain-text file private.
+
+Security update: HTTPS proxy traffic verifies destination certificates, remote images are restricted to public addresses, and inference keys cannot use HTTP admin endpoints. Account data migrates to an OS-protected encrypted store on first launch. Unlock your OS keychain before starting; migrate between computers using an explicit credential export.
+
+Kiro Settings now supports Memory and Workflows for the default IDE or a selected managed instance. Saves retain JSONC comments and unrelated settings. Account search also accepts original import names; model cards show documented context tiers when they match the current catalog rate.
 
 Kiro instances share one installed official Kiro.exe and use separate managed profile, home, extension, shared-data and temporary directories. Choose the executable, an instance name and an existing managed account, then create and start the instance. Its credentials are written only to that instance's cache. The instance can renew an expired access token; an invalid refresh token or expired IdC registration requires reauthorization. No extra Windows users, separate installations or system passwords are required.
 
@@ -14,4 +18,4 @@ If missing or expired cache data or a changed IDE account prevents synchronizati
 
 The instance page provides observed state, graceful stop and restart. Unsaved changes can prevent closure; no automatic force kill is performed. Removing a configuration preserves profile files. Old RC Windows-user configurations are inactive and must be recreated. Network, proxy, certificates, the Windows identity and DPAPI remain shared; this is not a security sandbox. A separate install directory or ZIP does not isolate the account manager itself.
 
-[1.8.8 notes](../docs/releases/v1.8.8.md) · [AGPL-3.0](../LICENSE) · [Source attribution](../docs/NOTICE.md) · [中文](README_CN.md)
+[1.8.10 notes](../docs/releases/v1.8.10.md) · [AGPL-3.0](../LICENSE) · [Source attribution](../docs/NOTICE.md) · [中文](README_CN.md)

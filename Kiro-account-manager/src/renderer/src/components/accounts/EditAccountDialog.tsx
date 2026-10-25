@@ -5,6 +5,7 @@ import { useAccountsStore } from '@/store'
 import { useTranslation } from '@/hooks/useTranslation'
 import type { Account, SubscriptionType } from '@/types/account'
 import type { AccountAddOnCredit } from '../../../../shared/accountUsage'
+import { mergeSourceAccountNames } from '../../../../shared/accountSearch'
 
 interface EditAccountDialogProps {
   open: boolean
@@ -45,6 +46,8 @@ export function EditAccountDialog({
 
   // 可编辑字段
   const [nickname, setNickname] = useState('')
+  const [sourceAccountNamesText, setSourceAccountNamesText] = useState('')
+  const verifiedChangesRef = useRef(false)
 
   // 自动获取的信息（只读显示）
   const [accountInfo, setAccountInfo] = useState<{
@@ -99,6 +102,8 @@ export function EditAccountDialog({
         clientSecretExpiresAt: account.credentials.clientSecretExpiresAt
       }
       setNickname(account.nickname || '')
+      setSourceAccountNamesText(mergeSourceAccountNames(account.sourceAccountNames).join('\n'))
+      verifiedChangesRef.current = false
       
       // 设置当前账号信息
       setAccountInfo({
@@ -172,6 +177,7 @@ export function EditAccountDialog({
       })
 
       if (result.success && result.data) {
+        verifiedChangesRef.current = true
         if (account) registrationRef.current = {
           accountId: account.id,
           clientId,
@@ -207,12 +213,26 @@ export function EditAccountDialog({
   const handleSave = () => {
     if (!account || !accountInfo) return
 
+    const metadata = {
+      nickname: nickname || undefined,
+      sourceAccountNames: mergeSourceAccountNames(sourceAccountNamesText.split(/\r?\n/))
+    }
+    const credentialsChanged = refreshToken !== (account.credentials.refreshToken || '') ||
+      clientId !== (account.credentials.clientId || '') ||
+      clientSecret !== (account.credentials.clientSecret || '') ||
+      region !== (account.credentials.region || 'us-east-1')
+    if (!verifiedChangesRef.current && !credentialsChanged) {
+      updateAccount(account.id, metadata)
+      onOpenChange(false)
+      return
+    }
+
     const now = Date.now()
 
     updateAccount(account.id, {
       email: accountInfo.email,
       userId: accountInfo.userId,
-      nickname: nickname || undefined,
+      ...metadata,
       credentials: {
         ...account.credentials,
         accessToken: accountInfo.accessToken,
@@ -316,6 +336,21 @@ export function EditAccountDialog({
               placeholder={isEn ? 'Give this account a memorable name' : '给这个账号起个好记的名字'}
               className="w-full h-10 px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2"
             />
+          </div>
+
+          {/* 原始账号：独立于登录邮箱，仅用于查找 */}
+          <div className="space-y-2">
+            <label htmlFor="source-account-names" className="text-sm font-medium">{t('accounts.originalAccount')}</label>
+            <textarea
+              id="source-account-names"
+              value={sourceAccountNamesText}
+              onChange={(e) => setSourceAccountNamesText(e.target.value)}
+              placeholder={t('editAccount.sourceAccountNamesPlaceholder')}
+              aria-describedby="source-account-names-hint"
+              rows={2}
+              className="w-full px-3 py-2 text-sm rounded-xl border border-input bg-background/50 ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 resize-y"
+            />
+            <p id="source-account-names-hint" className="text-xs text-muted-foreground">{t('editAccount.sourceAccountNamesHint')}</p>
           </div>
 
           {/* 凭证配置 */}

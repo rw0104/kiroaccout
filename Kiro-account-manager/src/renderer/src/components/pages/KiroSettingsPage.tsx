@@ -1,7 +1,9 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, Button, Toggle, Select } from '../ui'
 import { useTranslation } from '@/hooks/useTranslation'
 import { SteeringEditor, McpServerEditor } from '../kiro'
+import type { KiroMemoryMode, KiroSettingsTarget, KiroSettingsTargetInfo } from '../../../../shared/kiroSettings'
+import type { KiroManagedInstanceView } from '../../../../shared/kiroInstances'
 import { 
   FileText, 
   ChevronDown, 
@@ -22,6 +24,8 @@ import {
 } from 'lucide-react'
 
 interface KiroSettings {
+  memory: KiroMemoryMode
+  workflowsEnabled: boolean
   agentAutonomy: string
   modelSelection: string
   enableDebugLogs: boolean
@@ -75,6 +79,8 @@ const defaultDenyCommands = [
 
 // Kiro 默认设置（与 Kiro IDE 内置默认值一致）
 const defaultSettings: KiroSettings = {
+  memory: 'off',
+  workflowsEnabled: false,
   agentAutonomy: 'Autopilot',
   modelSelection: 'auto',
   enableDebugLogs: false,
@@ -116,6 +122,18 @@ const mcpOptionsEn = [
 
 export function KiroSettingsPage() {
   const [settings, setSettings] = useState<KiroSettings>(defaultSettings)
+  const baselineRef = useRef<KiroSettings>(defaultSettings)
+  const [targetValue, setTargetValue] = useState('default')
+  const targetRef = useRef<KiroSettingsTarget>({ type: 'default' })
+  const requestRef = useRef(0)
+  const modelRequestRef = useRef(0)
+  const resourceRequestRef = useRef(0)
+  const savingRef = useRef(false)
+  const [loaded, setLoaded] = useState(false)
+  const [saved, setSaved] = useState(false)
+  const [targetInfo, setTargetInfo] = useState<KiroSettingsTargetInfo | undefined>()
+  const [instances, setInstances] = useState<KiroManagedInstanceView[]>([])
+  const [instanceError, setInstanceError] = useState<string | null>(null)
   const [mcpConfig, setMcpConfig] = useState<McpConfig>({ mcpServers: {} })
   const [steeringFiles, setSteeringFiles] = useState<string[]>([])
   const [loading, setLoading] = useState(true)
@@ -140,61 +158,145 @@ export function KiroSettingsPage() {
   const isEn = t('common.unknown') === 'Unknown'
   const autonomyOptions = isEn ? autonomyOptionsEn : autonomyOptionsZh
   const mcpOptions = isEn ? mcpOptionsEn : mcpOptionsZh
+  const isDefaultTarget = targetValue === 'default'
+  const dirty = Object.keys(settings).some(key =>
+    JSON.stringify(settings[key as keyof KiroSettings]) !== JSON.stringify(baselineRef.current[key as keyof KiroSettings])
+  )
+  const memoryOptions = [
+    { value: 'off', label: isEn ? 'Off' : '关闭' },
+    { value: 'useAndLearn', label: isEn ? 'Use and learn' : '使用并学习' },
+    { value: 'useWithoutLearning', label: isEn ? "Use but don't learn" : '使用但不自动学习' },
+    { value: 'useOnly', label: isEn ? 'Use only (read-only)' : '仅使用（只读）' }
+  ]
 
   useEffect(() => {
-    loadKiroSettings()
-    loadAvailableModels()
+    let active = true
+    void window.api.kiroInstances.snapshot().then(result => {
+      if (!active) return
+      if (!result.success) {
+        setInstanceError(result.error)
+        return
+      }
+      setInstances(result.value.instances.filter((instance): instance is KiroManagedInstanceView => instance.schemaVersion === 2))
+      setInstanceError(null)
+    }).catch(() => {
+      if (active) setInstanceError(isEn ? 'Could not load managed instances. Default IDE settings remain available.' : '无法加载受管实例，仍可管理默认 IDE 设置。')
+    })
+    return () => { active = false; requestRef.current++; modelRequestRef.current++; resourceRequestRef.current++ }
   }, [])
 
+  useEffect(() => {
+    void loadKiroSettings()
+    void loadAvailableModels()
+  }, [targetValue])
+
+  const changeTarget = (value: string): void => {
+    if (savingRef.current || value === targetValue || value !== 'default' && !value.startsWith('instance:')) return
+    const nextTarget: KiroSettingsTarget = value === 'default'
+      ? { type: 'default' }
+      : { type: 'instance', instanceId: value.slice('instance:'.length) }
+    if (nextTarget.type === 'instance' && !instances.some(instance => instance.id === nextTarget.instanceId)) return
+    requestRef.current++
+    modelRequestRef.current++
+    resourceRequestRef.current++
+    targetRef.current = nextTarget
+    setTargetValue(value)
+    setLoaded(false)
+    setLoading(true)
+    setSaved(false)
+    setError(null)
+    setSettings(defaultSettings)
+    baselineRef.current = defaultSettings
+    setTargetInfo(undefined)
+    setAvailableModels([])
+    setEditingFile(null)
+    setEditingMcp(null)
+    setMcpConfig({ mcpServers: {} })
+    setSteeringFiles([])
+  }
+
   const loadAvailableModels = async () => {
+    const requestId = ++modelRequestRef.current
+    const target = { ...targetRef.current }
     setLoadingModels(true)
+    setAvailableModels([])
     try {
-      const result = await window.api.getKiroAvailableModels()
-      if (result.models && result.models.length > 0) {
-        setAvailableModels(result.models)
-      }
-    } catch (err) {
-      console.error('Failed to load models:', err)
+      const result = await window.api.getKiroAvailableModels(target)
+      if (requestId !== modelRequestRef.current) return
+      setAvailableModels(Array.isArray(result.models) ? result.models : [])
+    } catch {
+      if (requestId === modelRequestRef.current) setAvailableModels([])
     } finally {
-      setLoadingModels(false)
+      if (requestId === modelRequestRef.current) setLoadingModels(false)
     }
   }
 
   const loadKiroSettings = async () => {
+    if (savingRef.current) return
+    const requestId = ++requestRef.current
+    const target = { ...targetRef.current }
     setLoading(true)
+    setLoaded(false)
+    setSaved(false)
     setError(null)
     try {
-      const result = await window.api.getKiroSettings()
-      if (result.settings) {
+      const result = await window.api.getKiroSettings(target)
+      if (requestId !== requestRef.current) return
+      if (result.error || !result.settings) {
+        setError(result.error || (isEn ? 'Failed to load Kiro settings' : '加载 Kiro 设置失败'))
+        setSettings(defaultSettings)
+        setMcpConfig({ mcpServers: {} })
+        setSteeringFiles([])
+        return
+      }
+      {
         // 过滤掉 undefined 值，避免覆盖默认值
         const filteredSettings = Object.fromEntries(
           Object.entries(result.settings).filter(([, v]) => v !== undefined)
         ) as Partial<KiroSettings>
-        setSettings({ ...defaultSettings, ...filteredSettings })
+        const loadedSettings = { ...defaultSettings, ...filteredSettings }
+        baselineRef.current = loadedSettings
+        setSettings(loadedSettings)
       }
-      if (result.mcpConfig) {
+      setTargetInfo(result.target)
+      if (target.type === 'default' && result.mcpConfig) {
         setMcpConfig(result.mcpConfig as McpConfig)
       }
-      if (result.steeringFiles) {
+      if (target.type === 'default' && result.steeringFiles) {
         setSteeringFiles(result.steeringFiles)
       }
-    } catch (err) {
-      setError(isEn ? 'Failed to load Kiro settings' : '加载 Kiro 设置失败')
-      console.error(err)
+      setLoaded(true)
+    } catch {
+      if (requestId === requestRef.current) setError(isEn ? 'Failed to load Kiro settings' : '加载 Kiro 设置失败')
     } finally {
-      setLoading(false)
+      if (requestId === requestRef.current) setLoading(false)
     }
   }
 
   const saveSettings = async () => {
+    if (!loaded || loading || savingRef.current || !dirty) return
+    const target = { ...targetRef.current }
+    const requestId = requestRef.current
+    const patch = Object.fromEntries(Object.entries(settings).filter(([key, value]) =>
+      JSON.stringify(value) !== JSON.stringify(baselineRef.current[key as keyof KiroSettings])
+    ))
+    savingRef.current = true
     setSaving(true)
+    setSaved(false)
     setError(null)
     try {
-      await window.api.saveKiroSettings(settings as unknown as Record<string, unknown>)
-    } catch (err) {
-      setError(isEn ? 'Failed to save settings' : '保存设置失败')
-      console.error(err)
+      const result = await window.api.saveKiroSettings(patch, target)
+      if (requestId !== requestRef.current) return
+      if (!result.success) {
+        setError(result.error || (isEn ? 'Failed to save settings' : '保存设置失败'))
+        return
+      }
+      baselineRef.current = { ...baselineRef.current, ...patch }
+      setSaved(true)
+    } catch {
+      if (requestId === requestRef.current) setError(isEn ? 'Failed to save settings' : '保存设置失败')
     } finally {
+      savingRef.current = false
       setSaving(false)
     }
   }
@@ -204,15 +306,18 @@ export function KiroSettingsPage() {
   }
 
   const openKiroSettingsFile = async () => {
+    const requestId = requestRef.current
     // 打开 Kiro settings.json 文件
     try {
-      await window.api.openKiroSettingsFile()
-    } catch (err) {
-      console.error(err)
+      const result = await window.api.openKiroSettingsFile({ ...targetRef.current })
+      if (requestId === requestRef.current && !result.success) setError(result.error || (isEn ? 'Could not open settings file' : '无法打开设置文件'))
+    } catch {
+      if (requestId === requestRef.current) setError(isEn ? 'Could not open settings file' : '无法打开设置文件')
     }
   }
 
   const openMcpConfig = async (type: 'user' | 'workspace') => {
+    if (targetRef.current.type !== 'default') return
     try {
       await window.api.openKiroMcpConfig(type)
     } catch (err) {
@@ -221,6 +326,7 @@ export function KiroSettingsPage() {
   }
 
   const openSteeringFolder = async () => {
+    if (targetRef.current.type !== 'default') return
     try {
       await window.api.openKiroSteeringFolder()
     } catch (err) {
@@ -229,10 +335,12 @@ export function KiroSettingsPage() {
   }
 
   const openSteeringFile = (filename: string) => {
+    if (targetRef.current.type !== 'default') return
     setEditingFile(filename)
   }
 
   const openSteeringFileExternal = async (filename: string) => {
+    if (targetRef.current.type !== 'default') return
     try {
       await window.api.openKiroSteeringFile(filename)
     } catch (err) {
@@ -240,49 +348,73 @@ export function KiroSettingsPage() {
     }
   }
 
+  const refreshDefaultResources = async (generation: number): Promise<void> => {
+    if (generation !== requestRef.current || targetRef.current.type !== 'default') return
+    const resourceRequest = ++resourceRequestRef.current
+    const result = await window.api.getKiroSettings({ type: 'default' })
+    if (generation !== requestRef.current || resourceRequest !== resourceRequestRef.current || targetRef.current.type !== 'default') return
+    if (result.error) { setError(result.error); return }
+    if (result.mcpConfig) setMcpConfig(result.mcpConfig as McpConfig)
+    if (result.steeringFiles) setSteeringFiles(result.steeringFiles)
+  }
+
+  // Editors may finish after their target has been unmounted. Capture this visit.
+  const editorGeneration = requestRef.current
+  const onResourceSaved = async (): Promise<void> => {
+    try { await refreshDefaultResources(editorGeneration) } catch {
+      if (editorGeneration === requestRef.current) setError(isEn ? 'Failed to reload configuration files' : '刷新配置文件失败')
+    }
+  }
+
   const createDefaultRules = async () => {
+    if (targetRef.current.type !== 'default') return
+    const generation = requestRef.current
     try {
       const result = await window.api.createKiroDefaultRules()
+      if (generation !== requestRef.current) return
       if (result.success) {
-        // 重新加载设置以获取新创建的文件
-        await loadKiroSettings()
-      }
-    } catch (err) {
-      console.error(err)
+        await refreshDefaultResources(generation)
+      } else setError(result.error || (isEn ? 'Failed to create rules' : '创建规则失败'))
+    } catch {
+      if (generation === requestRef.current) setError(isEn ? 'Failed to create rules' : '创建规则失败')
     }
   }
 
   const deleteSteeringFile = async (filename: string) => {
+    if (targetRef.current.type !== 'default') return
+    const generation = requestRef.current
     if (!confirm(isEn ? `Delete "${filename}"? This cannot be undone.` : `确定要删除 "${filename}" 吗？此操作无法撤销。`)) {
       return
     }
     try {
       const result = await window.api.deleteKiroSteeringFile(filename)
+      if (generation !== requestRef.current) return
       if (result.success) {
-        await loadKiroSettings()
+        await refreshDefaultResources(generation)
       } else {
         setError(result.error || (isEn ? 'Failed to delete file' : '删除文件失败'))
       }
-    } catch (err) {
-      console.error(err)
-      setError(isEn ? 'Failed to delete file' : '删除文件失败')
+    } catch {
+      if (generation === requestRef.current) setError(isEn ? 'Failed to delete file' : '删除文件失败')
     }
   }
 
   const deleteMcpServer = async (name: string) => {
+    if (targetRef.current.type !== 'default') return
+    const generation = requestRef.current
     if (!confirm(isEn ? `Delete MCP server "${name}"?` : `确定要删除 MCP 服务器 "${name}" 吗？`)) {
       return
     }
     try {
       const result = await window.api.deleteMcpServer(name)
+      if (generation !== requestRef.current) return
       if (result.success) {
-        await loadKiroSettings()
+        await refreshDefaultResources(generation)
       } else {
         setError(result.error || (isEn ? 'Failed to delete server' : '删除服务器失败'))
       }
-    } catch (err) {
-      console.error(err)
-      setError(isEn ? 'Failed to delete server' : '删除服务器失败')
+    } catch {
+      if (generation === requestRef.current) setError(isEn ? 'Failed to delete server' : '删除服务器失败')
     }
   }
 
@@ -333,14 +465,6 @@ export function KiroSettingsPage() {
     }))
   }
 
-  if (loading) {
-    return (
-      <div className="flex-1 p-6 flex items-center justify-center">
-        <RefreshCw className="h-8 w-8 animate-spin text-muted-foreground" />
-      </div>
-    )
-  }
-
   return (
     <div className="flex-1 p-6 space-y-6 overflow-auto">
       {/* 页面头部 */}
@@ -358,15 +482,15 @@ export function KiroSettingsPage() {
             </div>
           </div>
           <div className="flex gap-2">
-            <Button variant="outline" size="sm" onClick={loadKiroSettings} className="bg-background/50 backdrop-blur-sm">
+            <Button variant="outline" size="sm" onClick={loadKiroSettings} disabled={saving} className="bg-background/50 backdrop-blur-sm">
               <RefreshCw className="h-4 w-4 mr-2" />
               {isEn ? 'Refresh' : '刷新'}
             </Button>
-            <Button variant="outline" size="sm" onClick={openKiroSettingsFile} className="bg-background/50 backdrop-blur-sm">
+            <Button variant="outline" size="sm" onClick={openKiroSettingsFile} disabled={saving} className="bg-background/50 backdrop-blur-sm">
               <ExternalLink className="h-4 w-4 mr-2" />
               {isEn ? 'Open File' : '打开设置文件'}
             </Button>
-            <Button size="sm" onClick={saveSettings} disabled={saving}>
+            <Button size="sm" onClick={saveSettings} disabled={saving || loading || !loaded || !dirty}>
               <Save className="h-4 w-4 mr-2" />
               {saving ? (isEn ? 'Saving...' : '保存中...') : (isEn ? 'Save' : '保存设置')}
             </Button>
@@ -374,13 +498,41 @@ export function KiroSettingsPage() {
         </div>
       </div>
 
+      <div className="flex flex-wrap items-start gap-4">
+        <div className="space-y-1">
+          <label htmlFor="kiro-settings-target" className="text-sm font-medium">{isEn ? 'Settings target' : '设置作用对象'}</label>
+          <select
+            id="kiro-settings-target"
+            value={targetValue}
+            disabled={saving}
+            onChange={event => changeTarget(event.target.value)}
+            aria-describedby="kiro-settings-target-hint"
+            className="block min-w-[240px] max-w-full px-3 py-2 rounded-xl border bg-background text-sm disabled:opacity-50"
+          >
+            <option value="default">{isEn ? 'Default Kiro IDE' : '默认 Kiro IDE'}</option>
+            {instances.map(instance => <option key={instance.id} value={`instance:${instance.id}`}>{instance.label}</option>)}
+          </select>
+        </div>
+        <div id="kiro-settings-target-hint" className="flex-1 min-w-[200px] text-sm text-muted-foreground pt-1">
+          <p>{isDefaultTarget
+            ? (isEn ? 'Changes apply to the default IDE user profile. Managed instances keep their own settings.' : '修改默认 IDE 的用户设置。受管实例使用各自的独立设置。')
+            : (isEn ? 'Changes apply only to this managed instance. MCP and Steering editing below is available for the default IDE only.' : '修改仅作用于所选受管实例。MCP 和 Steering 编辑目前仅支持默认 IDE。')}</p>
+          {targetInfo && <p className="mt-1 break-all font-mono text-xs">{targetInfo.settingsPath}</p>}
+          {instanceError && <p className="mt-1 text-destructive">{instanceError}</p>}
+        </div>
+      </div>
+
+      {loading && <p role="status" className="flex items-center gap-2 text-sm text-muted-foreground"><RefreshCw className="h-4 w-4 animate-spin" />{isEn ? 'Loading selected settings...' : '正在加载所选对象的设置…'}</p>}
+
       {error && (
-        <div className="flex items-center gap-2 p-3 bg-destructive/10 text-destructive rounded-lg">
+        <div role="alert" className="flex items-center gap-2 p-3 bg-destructive/10 text-destructive rounded-lg">
           <AlertCircle className="h-4 w-4" />
           {error}
         </div>
       )}
+      {saved && !dirty && <p role="status" className="text-sm text-muted-foreground">{isEn ? 'Settings saved to the selected IDE profile.' : '设置已保存至所选 IDE 配置。'}</p>}
 
+      <fieldset disabled={loading || saving || !loaded} className="space-y-6 disabled:opacity-60">
       {/* Agent 设置 */}
       <Card className="hover-lift">
         <CardHeader className="pb-2 cursor-pointer hover:bg-muted/30 transition-colors rounded-t-lg" onClick={() => toggleSection('agent')}>
@@ -396,6 +548,44 @@ export function KiroSettingsPage() {
         </CardHeader>
         {expandedSections.agent && (
           <CardContent className="space-y-4">
+            <div className="flex flex-wrap items-start justify-between gap-4">
+              <div className="flex-1 min-w-[220px]">
+                <label htmlFor="kiro-memory" className="font-medium">{isEn ? 'Memory' : '记忆'}</label>
+                <p id="kiro-memory-hint" className="text-sm text-muted-foreground mt-1">{isEn
+                  ? 'User-level setting for the selected IDE. Switching to or from Off or Use only applies to new sessions. Switching between the two learning modes applies immediately to local sessions.'
+                  : '所选 IDE 的用户级设置。切换关闭或仅使用（只读）需新建会话；在两种学习模式间切换会立即应用到本地会话。'}</p>
+              </div>
+              <Select
+                id="kiro-memory"
+                aria-describedby="kiro-memory-hint"
+                disabled={loading || saving || !loaded}
+                value={settings.memory}
+                options={memoryOptions}
+                onChange={value => setSettings(prev => ({ ...prev, memory: value as KiroMemoryMode }))}
+                className="w-[240px]"
+              />
+            </div>
+
+            <div className="space-y-2 border-t pt-4">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <label htmlFor="kiro-workflows-enabled" className="font-medium">{isEn ? 'Enable Workflows' : '启用工作流'}</label>
+                  <p id="kiro-workflows-hint" className="text-sm text-muted-foreground mt-1">{isEn ? 'Allows new workflows in new chat sessions. Existing runs and recipes remain available.' : '在新会话中允许启动工作流。已有运行记录和配方会保留。'}</p>
+                </div>
+                <Toggle
+                  id="kiro-workflows-enabled"
+                  aria-describedby="kiro-workflows-hint"
+                  disabled={loading || saving || !loaded}
+                  checked={settings.workflowsEnabled}
+                  onChange={checked => setSettings(prev => ({ ...prev, workflowsEnabled: checked }))}
+                />
+              </div>
+              <p className="text-sm text-muted-foreground">{isEn
+                ? 'Choose Only when asked, Only for large tasks, or As much as possible in Use workflows above the parent chat in Kiro. This session preference is separate from the switch here.'
+                : '请在 Kiro 主会话上方的 Use workflows 中选择“仅在要求时”“仅复杂任务”或“尽量使用”。会话偏好与此处的总开关分开。'}</p>
+              <button type="button" className="text-sm text-primary hover:underline" onClick={() => window.api.openExternal('https://kiro.dev/docs/workflows/')}>{isEn ? 'Workflows guide' : '工作流说明'}</button>
+            </div>
+
             {/* Agent Autonomy */}
             <div className="flex items-center justify-between">
               <div>
@@ -557,6 +747,7 @@ export function KiroSettingsPage() {
         )}
       </Card>
 
+      {isDefaultTarget && <>
       {/* MCP 设置 */}
       <Card className="hover-lift">
         <CardHeader className="pb-2 cursor-pointer hover:bg-muted/30 transition-colors rounded-t-lg" onClick={() => toggleSection('mcp')}>
@@ -712,6 +903,8 @@ export function KiroSettingsPage() {
         )}
       </Card>
 
+      </>}
+
       {/* 命令设置 */}
       <Card className="hover-lift">
         <CardHeader className="pb-2 cursor-pointer hover:bg-muted/30 transition-colors rounded-t-lg" onClick={() => toggleSection('commands')}>
@@ -863,23 +1056,24 @@ export function KiroSettingsPage() {
           </CardContent>
         )}
       </Card>
+      </fieldset>
 
       {/* Steering 文件编辑器 */}
-      {editingFile && (
+      {isDefaultTarget && editingFile && (
         <SteeringEditor
           filename={editingFile}
-          onClose={() => setEditingFile(null)}
-          onSaved={loadKiroSettings}
+          onClose={() => { if (editorGeneration === requestRef.current) setEditingFile(null) }}
+          onSaved={onResourceSaved}
         />
       )}
 
       {/* MCP 服务器编辑器 */}
-      {editingMcp && (
+      {isDefaultTarget && editingMcp && (
         <McpServerEditor
           serverName={editingMcp.name}
           server={editingMcp.server}
-          onClose={() => setEditingMcp(null)}
-          onSaved={loadKiroSettings}
+          onClose={() => { if (editorGeneration === requestRef.current) setEditingMcp(null) }}
+          onSaved={onResourceSaved}
         />
       )}
     </div>

@@ -19,6 +19,7 @@ import type {
 } from './types'
 import { AccountPool, ErrorType, classifyError } from './accountPool'
 import { RequestAdmission, RequestAdmissionError, requiresRequestAdmission } from './requestAdmission'
+import { downloadRemoteImageDataUrl } from './remoteImage'
 import { callKiroApiStream, callKiroApi, fetchKiroModels, mapModelId, setModelContextWindow, cleanupConversationCache, clearAllCaches, type KiroModel } from './kiroApi'
 import { proxyLogger } from './logger'
 import { getKProxyService, generateDeviceId } from '../kproxy'
@@ -258,6 +259,8 @@ export class ProxyServer {
   private refreshingTokens: Map<string, Promise<boolean>> = new Map() // 在途刷新去重（并发方共享同一结果）
   private isHttps: boolean = false
   private isStopping: boolean = false
+  private startGeneration = 0
+  private starting: Promise<void> | null = null
   private activeRequests: Set<AbortController> = new Set()
   private requestAdmission = new RequestAdmission()
   private sockets: Set<Socket> = new Set()
@@ -373,7 +376,15 @@ export class ProxyServer {
   }
 
   // 启动服务器
-  async start(): Promise<void> {
+  start(): Promise<void> {
+    if (this.starting) return this.starting
+    const pending = this.startServer()
+    this.starting = pending
+    void pending.finally(() => { if (this.starting === pending) this.starting = null }).catch(() => {})
+    return pending
+  }
+
+  private async startServer(): Promise<void> {
     if (this.server) {
       console.log('[ProxyServer] Server already running')
       return
@@ -396,6 +407,14 @@ export class ProxyServer {
       }
     }
 
+    const generation = ++this.startGeneration
+    let tlsOptions: https.ServerOptions | undefined
+    if (this.config.tls?.enabled) {
+      try { tlsOptions = await this.getTlsOptions() }
+      catch (error) { throw new Error(`TLS configuration error: ${(error as Error).message}`) }
+    }
+    if (generation !== this.startGeneration) throw new Error('Proxy start canceled')
+
     return new Promise((resolve, reject) => {
       this.isStopping = false
       this.requestAdmission.open()
@@ -405,8 +424,7 @@ export class ProxyServer {
       // 检查是否启用 TLS
       if (this.config.tls?.enabled) {
         try {
-          const tlsOptions = this.getTlsOptions()
-          this.server = https.createServer(tlsOptions, requestHandler)
+          this.server = https.createServer(tlsOptions!, requestHandler)
           this.isHttps = true
         } catch (error) {
           reject(new Error(`TLS configuration error: ${(error as Error).message}`))
@@ -503,7 +521,7 @@ export class ProxyServer {
 
   // 获取 TLS 配置选项
   // P1-13 当 tls.enabled 但未提供 cert/key 时，自动生成自签证书
-  private getTlsOptions(): https.ServerOptions {
+  private async getTlsOptions(): Promise<https.ServerOptions> {
     const tls = this.config.tls!
     
     let cert: string
@@ -523,7 +541,7 @@ export class ProxyServer {
         const { app } = require('electron')
         const { ensureProxySelfSignedCert } = require('./selfSignedCert')
         const hostnames = [this.config.host || '127.0.0.1']
-        const result = ensureProxySelfSignedCert(app.getPath('userData'), hostnames)
+        const result = await ensureProxySelfSignedCert(app.getPath('userData'), hostnames)
         proxyLogger.info('ProxyServer', `Using self-signed TLS cert (SAN=${result.altNames.join(',')}, fingerprint=${result.fingerprint.slice(0, 19)}...)`)
         cert = result.cert
         key = result.key
@@ -538,11 +556,11 @@ export class ProxyServer {
   /**
    * 获取（或生成）反代自签证书信息（供 UI 显示/导出 PEM）
    */
-  getSelfSignedCertInfo(): import('./selfSignedCert').ProxySelfSignedCert | null {
+  async getSelfSignedCertInfo(): Promise<import('./selfSignedCert').ProxySelfSignedCert | null> {
     try {
       const { app } = require('electron')
       const { ensureProxySelfSignedCert } = require('./selfSignedCert')
-      return ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'])
+      return await ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'])
     } catch (err) {
       proxyLogger.warn('ProxyServer', `getSelfSignedCertInfo failed: ${(err as Error).message}`)
       return null
@@ -550,12 +568,12 @@ export class ProxyServer {
   }
 
   /** 强制重新生成自签证书（用户在 UI 上点"重新生成"） */
-  regenerateSelfSignedCert(): import('./selfSignedCert').ProxySelfSignedCert | null {
+  async regenerateSelfSignedCert(): Promise<import('./selfSignedCert').ProxySelfSignedCert | null> {
     try {
       const { app } = require('electron')
       const { ensureProxySelfSignedCert } = require('./selfSignedCert')
       this.appendAuditLog('regenerate_self_signed_cert', { host: this.config.host })
-      return ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'], true)
+      return await ensureProxySelfSignedCert(app.getPath('userData'), [this.config.host || '127.0.0.1'], true)
     } catch (err) {
       proxyLogger.warn('ProxyServer', `regenerateSelfSignedCert failed: ${(err as Error).message}`)
       return null
@@ -569,6 +587,8 @@ export class ProxyServer {
    * - 同时停 fallback HTTP 服务器
    */
   async stop(gracefulMs: number = 5000): Promise<void> {
+    this.startGeneration++
+    this.starting = null
     this.requestAdmission.close()
     this.clearModelCache()
     clearAllCaches()
@@ -700,46 +720,16 @@ export class ProxyServer {
   }
 
   private async downloadImageDataUrl(url: string, signal?: AbortSignal): Promise<string> {
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 15000)
-    const abort = () => controller.abort(this.getAbortError(signal))
-    try {
-      if (signal?.aborted) throw this.getAbortError(signal)
-      signal?.addEventListener('abort', abort, { once: true })
-      const agent = (() => {
-        const { getSystemProxy, safeCreateProxyAgent } = require('./systemProxy')
-        const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
-        const envAgent = safeCreateProxyAgent(envProxy)
-        if (envAgent) return envAgent
-        return safeCreateProxyAgent(getSystemProxy())
-      })()
-      const { fetch: undiciFetch } = require('undici')
-      const response = agent
-        ? await undiciFetch(url, { signal: controller.signal, dispatcher: agent }) as unknown as globalThis.Response
-        : await fetch(url, { signal: controller.signal })
-      if (!response.ok) {
-        throw new Error(`Failed to download image: HTTP ${response.status}`)
-      }
-      const contentType = response.headers.get('content-type')?.split(';')[0]?.toLowerCase()
-      if (!contentType || !['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(contentType)) {
-        throw new Error(`Unsupported image content-type: ${contentType || 'unknown'}`)
-      }
-      const arrayBuffer = await response.arrayBuffer()
-      if (arrayBuffer.byteLength > 10 * 1024 * 1024) {
-        throw new Error('Image exceeds 10MB limit')
-      }
-      return `data:${contentType};base64,${Buffer.from(arrayBuffer).toString('base64')}`
-    } finally {
-      clearTimeout(timeout)
-      signal?.removeEventListener('abort', abort)
-    }
+    return downloadRemoteImageDataUrl(url, signal)
   }
 
   private async resolveOpenAIHttpImages(request: OpenAIChatRequest, signal?: AbortSignal): Promise<OpenAIChatRequest> {
     await Promise.all(request.messages.map(async message => {
       if (!Array.isArray(message.content)) return
       await Promise.all(message.content.map(async part => {
-        if (part.type !== 'image_url' || !part.image_url?.url.startsWith('http')) return
+        if (part.type !== 'image_url') return
+        if (!part.image_url || typeof part.image_url.url !== 'string') throw new Error('Image URL is required')
+        if (part.image_url.url.startsWith('data:')) return
         part.image_url.url = await this.downloadImageDataUrl(part.image_url.url, signal)
       }))
     }))
@@ -1107,9 +1097,9 @@ export class ProxyServer {
     return extractThinkingSchema(model.additionalModelRequestFieldsSchema)
   }
 
-  async getAvailableModels(signal?: AbortSignal): Promise<{ models: ReturnType<typeof toAccountModel>[]; fromCache: boolean; accountId: string }> {
+  async getAvailableModels(signal?: AbortSignal, apiKeyId?: string): Promise<{ models: ReturnType<typeof toAccountModel>[]; fromCache: boolean; accountId: string }> {
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal)
+    const account = await this.getAvailableAccount(signal, undefined, apiKeyId)
     if (!account) throw new Error('No available account for the Kiro model catalog')
     const result = await this.loadModelCatalog(account, signal)
     return { models: filterAvailableModels(result.models).map(toAccountModel), fromCache: result.fromCache, accountId: account.id }
@@ -1203,24 +1193,32 @@ export class ProxyServer {
     return new Set(bindings)
   }
 
+  /** Apply the same intersection to initial selection, affinity, refresh and retries. */
+  private isAccountAllowed(account: ProxyAccount, apiKeyId?: string, allowedIds = this.getAllowedAccountIds(apiKeyId)): boolean {
+    if (apiKeyId && !this.config.apiKeys?.some(key => key.id === apiKeyId && key.enabled)) return false
+    if (allowedIds && !allowedIds.has(account.id)) return false
+    const groupId = account.groupId || '__ungrouped__'
+    const keyGroups = apiKeyId ? this.config.apiKeyGroupBindings?.[apiKeyId] : undefined
+    if (keyGroups?.length && !keyGroups.includes(groupId)) return false
+    if (this.config.multiAccountSelectionMode === 'groups' && !this.config.multiAccountGroupIds?.includes(groupId)) return false
+    return true
+  }
+
+  private getScopedNextAccount(excluded: Set<string>, apiKeyId?: string): ProxyAccount | null {
+    const skip = new Set(excluded)
+    const allowedIds = this.getAllowedAccountIds(apiKeyId)
+    for (const account of this.accountPool.getAllAccounts()) {
+      if (!this.isAccountAllowed(account, apiKeyId, allowedIds) || account.isAvailable === false
+        || this.accountPool.isSuspended(account) || this.accountPool.isQuotaExhausted(account)) skip.add(account.id)
+    }
+    const account = this.accountPool.getNextAccount(skip)
+    return account && !skip.has(account.id) && this.isAccountAllowed(account, apiKeyId) ? account : null
+  }
+
   // 获取可用账号（包含 Token 刷新检查）
   // P1-8 sessionHint：相同会话尽量复用同一账号（命中 prompt cache + 防风控）
   // P2-21 apiKeyId：用于过滤 API Key 允许使用的账号子集
   private async getAvailableAccount(signal?: AbortSignal, sessionHint?: string, apiKeyId?: string): Promise<ProxyAccount | null> {
-    const allowedIds = this.getAllowedAccountIds(apiKeyId)
-    const groupMode = this.config.multiAccountSelectionMode === 'groups'
-    const allowedGroupIds = groupMode ? new Set(this.config.multiAccountGroupIds || []) : null
-    const isAllowed = (acc: ProxyAccount | null): boolean => {
-      if (!acc) return true
-      // API Key 白名单（apiKeyAccountBindings）
-      if (allowedIds && !allowedIds.has(acc.id)) return false
-      // 分组过滤（双保险：即便前端忘了重新同步账号池，这里也能拦住非选中分组的账号）
-      if (groupMode && allowedGroupIds) {
-        const gid = acc.groupId || '__ungrouped__'
-        if (!allowedGroupIds.has(gid)) return false
-      }
-      return true
-    }
     this.throwIfAborted(signal)
     // 如果 pool 为空，触发懒加载回调尝试同步账号（冷启动场景）
     if (this.accountPool.size === 0 && this.events.onPoolEmpty) {
@@ -1229,92 +1227,46 @@ export class ProxyServer {
     }
     this.throwIfAborted(signal)
 
-    // P1-8 会话粘性：优先复用已绑定的账号（同时受 API Key 绑定过滤）
-    if (this.config.sessionAffinityEnabled && sessionHint) {
+    const excluded = new Set<string>()
+    let account: ProxyAccount | null = null
+    if (!this.config.enableMultiAccount && this.config.selectedAccountIds?.length) {
+      account = this.accountPool.getAccount(this.config.selectedAccountIds[0])
+      // An explicit single-account selection never grants access outside this Key's scope.
+      if (account && !this.isAccountAllowed(account, apiKeyId)) return null
+      if (account && this.accountPool.isQuotaExhausted(account)) {
+        if (!this.config.autoSwitchOnQuotaExhausted) return null
+        excluded.add(account.id)
+        account = this.getScopedNextAccount(excluded, apiKeyId)
+        if (account) {
+          this.config.selectedAccountIds = [account.id]
+          this.events.onAccountUpdate?.(account)
+        }
+      }
+    } else if (this.config.sessionAffinityEnabled && sessionHint) {
       const sticky = this.pickAccountWithAffinity(sessionHint)
-      if (sticky && isAllowed(sticky)) {
-        proxyLogger.debug('ProxyServer', `Session affinity hit: ${sessionHint.slice(0, 16)} → ${sticky.email || sticky.id.slice(0, 8)}`)
-        // 仍需检查 token 是否需要刷新
-        if (this.isTokenExpiringSoon(sticky)) {
-          const refreshed = await this.refreshToken(sticky, signal)
-          if (refreshed) {
-            return this.accountPool.getAccount(sticky.id) || sticky
-          }
-        } else {
-          return sticky
-        }
-      }
+      if (sticky && this.isAccountAllowed(sticky, apiKeyId) && !this.accountPool.isQuotaExhausted(sticky)) account = sticky
     }
+    account ||= this.getScopedNextAccount(excluded, apiKeyId)
 
-    let account: ProxyAccount | null
-
-    if (this.config.enableMultiAccount) {
-      account = this.accountPool.getNextAccount()
-      if (account && !isAllowed(account)) {
-        // 尝试找一个允许的账号（白名单 + 分组都已合并进 isAllowed）
-        const allAccounts = this.accountPool.getAllAccounts()
-        const exclude = new Set<string>()
-        for (const a of allAccounts) {
-          if (!isAllowed(a)) exclude.add(a.id)
-        }
-        account = this.accountPool.getNextAccount(exclude)
-      }
-      if (!account) {
-        const status = this.accountPool.getQuotaStatus()
-        if (status.exhausted > 0 && status.available === 0) {
-          console.log(`[ProxyServer] All accounts quota exhausted (${status.exhausted}/${status.total}), no available accounts`)
+    // Each candidate is attempted at most once, including refresh failures.
+    while (account && !excluded.has(account.id)) {
+      this.throwIfAborted(signal)
+      excluded.add(account.id)
+      if (!this.isAccountAllowed(account, apiKeyId) || account.isAvailable === false || this.accountPool.isSuspended(account)) return null
+      if (!this.isTokenExpiringSoon(account) || await this.refreshToken(account, signal)) {
+        this.throwIfAborted(signal)
+        // Refresh can race account removal, group changes or Key binding updates.
+        const current = this.accountPool.getAccount(account.id)
+        if (current && this.isAccountAllowed(current, apiKeyId) && current.isAvailable !== false && !this.accountPool.isSuspended(current) && !this.accountPool.isQuotaExhausted(current)) {
+          this.syncKProxyDeviceId(current)
+          if (sessionHint) this.rememberAffinity(sessionHint, current.id)
+          return current
         }
       }
-    } else {
-      // 禁用多账号轮询时，优先使用指定的账号
-      if (this.config.selectedAccountIds && this.config.selectedAccountIds.length > 0) {
-        // 使用指定的第一个账号
-        account = this.accountPool.getAccount(this.config.selectedAccountIds[0])
-        // 检查指定账号是否配额耗尽，若是则尝试自动切换
-        if (account && this.accountPool.isQuotaExhausted(account) && this.config.autoSwitchOnQuotaExhausted) {
-          const nextAccount = this.accountPool.getNextAvailableAccount(account.id)
-          if (nextAccount) {
-            console.log(`[ProxyServer] Selected account ${account.email || account.id} quota exhausted, auto-switching to ${nextAccount.email || nextAccount.id}`)
-            this.config.selectedAccountIds = [nextAccount.id]
-            this.events.onAccountUpdate?.(nextAccount)
-            account = nextAccount
-          }
-        }
-        if (!account) {
-          console.log(`[ProxyServer] Selected account ${this.config.selectedAccountIds[0]} not found, using first available`)
-          const allAccounts = this.accountPool.getAllAccounts()
-          account = allAccounts.length > 0 ? allAccounts[0] : null
-        }
-      } else {
-        // 没有指定账号，使用第一个可用账号
-        const allAccounts = this.accountPool.getAllAccounts()
-        account = allAccounts.length > 0 ? allAccounts[0] : null
-      }
+      if (!this.config.enableMultiAccount) return null
+      account = this.getScopedNextAccount(excluded, apiKeyId)
     }
-    
-    if (!account) return null
-
-    // 自动切换 K-Proxy 设备 ID（如果 K-Proxy 服务可用）
-    this.syncKProxyDeviceId(account)
-
-    // 检查是否需要刷新 Token
-    if (this.isTokenExpiringSoon(account)) {
-      const refreshed = await this.refreshToken(account, signal)
-      if (!refreshed) {
-        // 刷新失败，如果启用多账号才尝试获取下一个账号
-        if (this.config.enableMultiAccount) {
-          return this.accountPool.getNextAccount()
-        }
-        return null
-      }
-      // 返回更新后的账号
-      const refreshedAccount = this.accountPool.getAccount(account.id)
-      if (refreshedAccount && sessionHint) this.rememberAffinity(sessionHint, refreshedAccount.id)
-      return refreshedAccount
-    }
-
-    if (sessionHint) this.rememberAffinity(sessionHint, account.id)
-    return account
+    return null
   }
 
   // 同步 K-Proxy 设备 ID（根据账号自动切换）
@@ -1348,7 +1300,8 @@ export class ProxyServer {
     account: ProxyAccount,
     apiCall: (acc: ProxyAccount, endpointIndex: number) => Promise<T>,
     _path: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    apiKeyId?: string
   ): Promise<{ result: T; account: ProxyAccount }> {
     const maxRetries = this.config.maxRetries || 3
     const retryDelay = this.config.retryDelayMs || 1000
@@ -1357,19 +1310,32 @@ export class ProxyServer {
     let endpointIndex = 0
     // 本次请求累计已尝试的账号 ID，避免重试时循环命中已经失败过的账号
     const triedIds = new Set<string>([account.id])
-    /** 切到下一个可用账号；多账号模式带 triedIds 排除，单账号场景退化为旧逻辑 */
-    const switchToNextAccount = (): ProxyAccount | null => {
-      if (this.config.enableMultiAccount) {
-        return this.accountPool.getNextAccount(triedIds)
-      }
-      if (this.config.autoSwitchOnQuotaExhausted) {
-        return this.accountPool.getNextAvailableAccount(triedIds)
+    const switchToNextAccount = async (): Promise<ProxyAccount | null> => {
+      if (!this.config.enableMultiAccount && !this.config.autoSwitchOnQuotaExhausted) return null
+      const skipped = new Set(triedIds)
+      let next = this.getScopedNextAccount(skipped, apiKeyId)
+      while (next && !skipped.has(next.id)) {
+        this.throwIfAborted(signal)
+        skipped.add(next.id)
+        if (!this.isTokenExpiringSoon(next) || await this.refreshToken(next, signal)) {
+          this.throwIfAborted(signal)
+          const current = this.accountPool.getAccount(next.id)
+          if (current && this.isAccountAllowed(current, apiKeyId) && current.isAvailable !== false && !this.accountPool.isSuspended(current) && !this.accountPool.isQuotaExhausted(current)) {
+            this.syncKProxyDeviceId(current)
+            return current
+          }
+        }
+        triedIds.add(next.id)
+        next = this.getScopedNextAccount(skipped, apiKeyId)
       }
       return null
     }
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       this.throwIfAborted(signal)
+      const latestAccount = this.accountPool.getAccount(currentAccount.id)
+      if (!latestAccount || !this.isAccountAllowed(latestAccount, apiKeyId)) throw new Error('No available accounts in API Key scope')
+      currentAccount = latestAccount
       try {
         const result = await apiCall(currentAccount, endpointIndex)
         return { result, account: currentAccount }
@@ -1415,7 +1381,7 @@ export class ProxyServer {
           }
           console.warn(`[ProxyServer] Account ${currentAccount.email || currentAccount.id} suspended (${suspendInfo.reason}), switching to next available account`)
           // 切到下个可用账号（跳过被 suspended 的 + 本请求已试过的）
-          const nextAccount = switchToNextAccount()
+          const nextAccount = await switchToNextAccount()
           if (nextAccount && !triedIds.has(nextAccount.id)) {
             currentAccount = nextAccount
             triedIds.add(nextAccount.id)
@@ -1434,11 +1400,13 @@ export class ProxyServer {
           console.log('[ProxyServer] Auth error, attempting token refresh')
           const refreshed = await this.refreshToken(currentAccount, signal)
           if (refreshed) {
-            currentAccount = this.accountPool.getAccount(currentAccount.id) || currentAccount
+            const refreshedAccount = this.accountPool.getAccount(currentAccount.id)
+            if (!refreshedAccount || !this.isAccountAllowed(refreshedAccount, apiKeyId)) break
+            currentAccount = refreshedAccount
             continue
           }
           // 刷新失败 → 切到没试过的下个账号
-          const nextAccount = switchToNextAccount()
+          const nextAccount = await switchToNextAccount()
           if (nextAccount && !triedIds.has(nextAccount.id)) {
             currentAccount = nextAccount
             triedIds.add(nextAccount.id)
@@ -1453,7 +1421,7 @@ export class ProxyServer {
           endpointIndex = (endpointIndex + 1) % 2 // 切换端点
           if (endpointIndex === 0) {
             // 已尝试所有端点，切换到没试过的下个账号
-            const nextAccount = switchToNextAccount()
+            const nextAccount = await switchToNextAccount()
             if (nextAccount && !triedIds.has(nextAccount.id)) {
               console.log(`[ProxyServer] Auto-switching to ${nextAccount.email || nextAccount.id.slice(0, 8)} due to quota exhausted`)
               currentAccount = nextAccount
@@ -1472,7 +1440,7 @@ export class ProxyServer {
           console.log('[ProxyServer] Server error, retrying')
           // 第二次及以后的 5xx → 切换账号（旧逻辑会同账号撞死）
           if (attempt > 0) {
-            const nextAccount = switchToNextAccount()
+            const nextAccount = await switchToNextAccount()
             if (nextAccount && !triedIds.has(nextAccount.id)) {
               console.log(`[ProxyServer] Persistent 5xx on ${currentAccount.email || currentAccount.id.slice(0, 8)}, switching account`)
               currentAccount = nextAccount
@@ -1787,6 +1755,13 @@ export class ProxyServer {
   // 处理请求
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const path = req.url || '/'
+    const pathWithoutQuery = path.split('?')[0]
+    // Management is desktop IPC only. This also rejects browser preflights and
+    // no-Key installations before authentication, parsing or admission.
+    if (pathWithoutQuery === '/admin' || pathWithoutQuery.startsWith('/admin/')) {
+      await this.handleAdminApi(req, res, pathWithoutQuery)
+      return
+    }
     const method = req.method || 'GET'
     const clientIP = this.getClientIP(req)
     const controller = new AbortController()
@@ -1857,7 +1832,6 @@ export class ProxyServer {
       }
 
       // 路由（移除查询参数）
-      const pathWithoutQuery = path.split('?')[0]
       if (requiresRequestAdmission(method, pathWithoutQuery)) {
         // Pause before waiting: queued requests must not accumulate parsed body
         // buffers. readBody resumes only after all of its listeners are ready.
@@ -1868,7 +1842,7 @@ export class ProxyServer {
       }
       
       if (pathWithoutQuery === '/v1/models' || pathWithoutQuery === '/models') {
-        await this.handleModels(res, controller.signal)
+        await this.handleModels(res, controller.signal, (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey?.id)
       } else if (pathWithoutQuery === '/v1/chat/completions' || pathWithoutQuery === '/chat/completions') {
         await this.handleOpenAIChat(req, res, controller.signal)
       } else if (pathWithoutQuery === '/v1/responses' || pathWithoutQuery === '/responses') {
@@ -1887,16 +1861,13 @@ export class ProxyServer {
         await this.handleGeminiRequest(req, res, pathWithoutQuery, controller.signal)
       } else if (pathWithoutQuery === '/v1beta/models') {
         // Gemini 模型列表
-        await this.handleGeminiModels(res, controller.signal)
+        await this.handleGeminiModels(res, controller.signal, (req as unknown as { matchedApiKey?: import('./types').ApiKey }).matchedApiKey?.id)
       } else if (pathWithoutQuery === '/health' || pathWithoutQuery === '/') {
         this.handleHealth(res)
       } else if (pathWithoutQuery === '/metrics' && this.config.enableMetrics) {
         // P2-16 Prometheus metrics
         res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8' })
         res.end(this.renderPrometheusMetrics())
-      } else if (pathWithoutQuery.startsWith('/admin/')) {
-        // 管理 API 端点
-        await this.handleAdminApi(req, res, pathWithoutQuery, controller.signal)
       } else {
         // 记录未知路径以便调试
         console.log(`[ProxyServer] Unknown path: ${path} (method: ${method})`)
@@ -1932,160 +1903,10 @@ export class ProxyServer {
     }
   }
 
-  // 管理 API 端点
-  private async handleAdminApi(req: http.IncomingMessage, res: http.ServerResponse, path: string, signal?: AbortSignal): Promise<void> {
-    const method = req.method || 'GET'
-
-    // 管理 API 需要 API Key 验证
-    const authResult = this.validateApiKey(req)
-    if (!authResult.valid) {
-      this.sendError(res, 401, 'Admin API requires authentication')
-      return
-    }
-
-    if (path === '/admin/stats' && method === 'GET') {
-      // 获取详细统计
-      this.handleAdminStats(res)
-    } else if (path === '/admin/accounts' && method === 'GET') {
-      // 获取账号列表
-      this.handleAdminAccounts(res)
-    } else if (path === '/admin/config' && method === 'GET') {
-      // 获取配置
-      this.handleAdminConfig(res)
-    } else if (path === '/admin/config' && method === 'POST') {
-      // 更新配置（P1-9 schema 白名单校验，防止任意字段注入）
-      const body = await this.readBody(req, signal)
-      let parsed: Record<string, unknown>
-      try { parsed = JSON.parse(body) } catch {
-        this.sendError(res, 400, 'Invalid JSON body')
-        return
-      }
-      const safeUpdate = this.filterAdminConfigUpdate(parsed)
-      this.updateConfig(safeUpdate)
-      this.appendAuditLog('config_updated', { fields: Object.keys(safeUpdate) })
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ success: true, applied: Object.keys(safeUpdate), config: this.handleAdminConfigPayload() }))
-    } else if (path === '/admin/audit' && method === 'GET') {
-      // P2-17 审计日志
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ entries: this.auditLog.slice(-100) }))
-    } else if (path === '/admin/logs' && method === 'GET') {
-      // 获取最近日志
-      this.handleAdminLogs(res)
-    } else if (path === '/admin/cache/clear' && method === 'POST') {
-      // 清除内存缓存（conversationId 映射、模型缓存、prompt cache）
-      const cleared = clearAllCaches()
-      cleared.model = this.modelCache.size
-      this.clearModelCache()
-      const promptCacheCleared = promptCacheTracker.clear()
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ success: true, cleared: { ...cleared, promptCache: promptCacheCleared } }))
-    } else {
-      this.sendError(res, 404, 'Admin endpoint not found')
-    }
-  }
-
-  // 管理 API - 详细统计
-  private handleAdminStats(res: http.ServerResponse): void {
-    const stats = this.getStats()
-    const accountStats: Record<string, unknown> = {}
-    stats.accountStats.forEach((v, k) => { accountStats[k] = v })
-
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({
-      totalRequests: stats.totalRequests,
-      successRequests: stats.successRequests,
-      failedRequests: stats.failedRequests,
-      totalTokens: stats.totalTokens,
-      inputTokens: stats.inputTokens,
-      outputTokens: stats.outputTokens,
-      uptime: Date.now() - stats.startTime,
-      startTime: stats.startTime,
-      accountStats,
-      recentRequests: stats.recentRequests.slice(-50)
-    }))
-  }
-
-  // 管理 API - 账号列表
-  private handleAdminAccounts(res: http.ServerResponse): void {
-    const accounts = this.accountPool.getAllAccounts().map(acc => ({
-      id: acc.id,
-      email: acc.email,
-      isAvailable: acc.isAvailable !== false,
-      lastUsed: acc.lastUsed,
-      requestCount: acc.requestCount || 0,
-      errorCount: acc.errorCount || 0,
-      expiresAt: acc.expiresAt,
-      authMethod: acc.authMethod
-    }))
-
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({
-      total: accounts.length,
-      available: accounts.filter(a => a.isAvailable).length,
-      accounts
-    }))
-  }
-
-  /**
-   * P1-12 构造脱敏后的配置（apiKeys[].key 全部脱敏，tls 私钥不返回）
-   * 暴露给 /admin/config GET
-   */
-  private handleAdminConfigPayload(): Record<string, unknown> {
-    const config = this.getConfig()
-    const maskKey = (k: string | undefined): string | undefined => {
-      if (!k) return undefined
-      if (k.length <= 8) return '***'
-      return `${k.slice(0, 4)}***${k.slice(-4)}`
-    }
-    return {
-      ...config,
-      apiKey: maskKey(config.apiKey),
-      apiKeys: config.apiKeys?.map(k => ({ ...k, key: maskKey(k.key) || '***' })),
-      tls: config.tls ? { enabled: config.tls.enabled, hasCert: !!(config.tls.cert || config.tls.certPath), hasKey: !!(config.tls.key || config.tls.keyPath) } : undefined
-    }
-  }
-
-  // 管理 API - 配置
-  private handleAdminConfig(res: http.ServerResponse): void {
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify(this.handleAdminConfigPayload()))
-  }
-
-  /**
-   * P1-9 admin/config POST 字段白名单过滤
-   * 仅允许"可远程改"的字段；apiKeys/apiKey 等敏感字段必须通过本地 IPC 改
-   */
-  private filterAdminConfigUpdate(input: Record<string, unknown>): Partial<ProxyConfig> {
-    const allowed: Array<keyof ProxyConfig> = [
-      'enabled', 'enableMultiAccount', 'logRequests', 'logStreamEvents',
-      'maxConcurrent', 'maxRetries', 'retryDelayMs', 'preferredEndpoint',
-      'tokenRefreshBeforeExpiry', 'autoStart', 'clientDrivenToolExecution',
-      'disableTools', 'payloadSizeLimitKB', 'enableTokenBufferReserve',
-      'tokenBufferReserve', 'autoSwitchOnQuotaExhausted', 'accountSelectionStrategy',
-      'multiAccountSelectionMode', 'multiAccountGroupIds', 'modelMappings',
-      'maxRequestBodyBytes', 'allowedIPs', 'deniedIPs',
-      'rateLimitPerKeyPerMinute', 'sessionAffinityEnabled',
-      'keepAliveTimeoutMs', 'headersTimeoutMs', 'recentRequestsLimit',
-      'enableMetrics', 'apiKeyGroupBindings', 'enableAuditLog'
-      // 故意排除：port / host / apiKey / apiKeys / tls / fallbackPort / allowExternalWithoutApiKey
-      // 这些字段会改变监听行为或安全策略，必须本地 IPC 改
-    ]
-    const out: Partial<ProxyConfig> = {}
-    for (const key of allowed) {
-      if (key in input) {
-        (out as Record<string, unknown>)[key] = input[key as string]
-      }
-    }
-    return out
-  }
-
-  // 管理 API - 日志
-  private handleAdminLogs(res: http.ServerResponse): void {
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({
-      recentRequests: this.stats.recentRequests.slice(-100)
-    }))
+  // HTTP inference credentials never authorize management, even on loopback.
+  private async handleAdminApi(_req: http.IncomingMessage, res: http.ServerResponse, _path: string): Promise<void> {
+    void _path
+    this.sendError(res, 403, 'HTTP management API is disabled; use the desktop application')
   }
 
   // 设置 CORS 头
@@ -2193,8 +2014,8 @@ export class ProxyServer {
   }
 
   // Gemini v1beta 模型列表
-  private async handleGeminiModels(res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
-    const result = await this.getAvailableModels(signal)
+  private async handleGeminiModels(res: http.ServerResponse, signal?: AbortSignal, apiKeyId?: string): Promise<void> {
+    const result = await this.getAvailableModels(signal, apiKeyId)
     const geminiModels = result.models.map(m => ({
       name: `models/${m.id}`,
       version: '001',
@@ -2253,9 +2074,10 @@ export class ProxyServer {
     const startTime = Date.now()
     this.recordNewRequest()
     this.throwIfAborted(signal)
-    const account = await this.getAvailableAccount(signal)
+    const account = await this.getAvailableAccount(signal, undefined, matchedApiKey?.id)
     this.throwIfAborted(signal)
     if (!account) {
+      this.recordRequestFailed()
       this.sendError(res, 503, 'No available accounts')
       return
     }
@@ -2263,6 +2085,23 @@ export class ProxyServer {
     try {
       const toolNameRegistry = new ToolNameRegistry()
       const kiroPayload = openaiToKiro(openaiRequest, account.profileArn, toolNameRegistry, await this.getThinkingConfig(openaiRequest.model, account, signal))
+      let completed = false
+      const recordSuccess = (usage: { inputTokens: number; outputTokens: number; credits?: number; cacheReadTokens?: number; reasoningTokens?: number }): void => {
+        if (completed) return
+        completed = true
+        this.recordRequestSuccess()
+        this.stats.totalTokens += usage.inputTokens + usage.outputTokens
+        this.stats.inputTokens += usage.inputTokens
+        this.stats.outputTokens += usage.outputTokens
+        this.stats.totalCredits += usage.credits || 0
+        this.events.onCreditsUpdate?.(this.stats.totalCredits)
+        this.events.onTokensUpdate?.(this.stats.inputTokens, this.stats.outputTokens)
+        this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
+        const responseTime = Date.now() - startTime
+        this.events.onResponse?.({ path, model: openaiRequest.model, status: 200, tokens: usage.inputTokens + usage.outputTokens, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, cacheReadTokens: usage.cacheReadTokens, reasoningTokens: usage.reasoningTokens, credits: usage.credits, responseTime })
+        this.recordRequest({ path, model: openaiRequest.model, accountId: account.id, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, credits: usage.credits, responseTime, success: true })
+        if (matchedApiKey) this.recordApiKeyUsage(matchedApiKey.id, usage.credits || 0, usage.inputTokens, usage.outputTokens, openaiRequest.model, path)
+      }
 
       if (isStream) {
         // SSE 流式
@@ -2280,19 +2119,14 @@ export class ProxyServer {
               return this.waitForDrain(res)
             },
             (usage) => {
-              if (signal?.aborted || this.isResponseClosed(res)) {
+              if (completed || signal?.aborted || this.isResponseClosed(res)) {
                 resolve()
                 return
               }
+              recordSuccess(usage)
               const finalChunk = { candidates: [{ content: { parts: [{ text: '' }], role: 'model' }, finishReason: 'STOP' }], usageMetadata: { promptTokenCount: usage.inputTokens, candidatesTokenCount: usage.outputTokens, totalTokenCount: usage.inputTokens + usage.outputTokens } }
               res.write(`data: ${JSON.stringify(finalChunk)}\n\n`)
               res.end()
-              this.recordRequestSuccess()
-              this.stats.totalTokens += usage.inputTokens + usage.outputTokens
-              this.stats.inputTokens += usage.inputTokens
-              this.stats.outputTokens += usage.outputTokens
-              this.stats.totalCredits += usage.credits || 0
-              this.accountPool.recordSuccess(account.id, usage.inputTokens + usage.outputTokens)
               resolve()
             },
             (error) => {
@@ -2320,8 +2154,7 @@ export class ProxyServer {
         // 非流式
         const result = await callKiroApi(account as ProxyAccount, kiroPayload, signal)
         this.throwIfResponseClosed(res, signal)
-        this.recordRequestSuccess()
-        this.stats.totalTokens += result.usage.inputTokens + result.usage.outputTokens
+        recordSuccess(result.usage)
         res.writeHead(200, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({
           candidates: [{ content: { parts: [{ text: result.content }], role: 'model' }, finishReason: 'STOP' }],
@@ -2393,9 +2226,9 @@ export class ProxyServer {
 
   // Only account-authorized server records are advertised. A transport failure
   // is distinct from a successful, empty catalog.
-  private async handleModels(res: http.ServerResponse, signal?: AbortSignal): Promise<void> {
+  private async handleModels(res: http.ServerResponse, signal?: AbortSignal, apiKeyId?: string): Promise<void> {
     try {
-      const { models } = await this.getAvailableModels(signal)
+      const { models } = await this.getAvailableModels(signal, apiKeyId)
       const now = Date.now()
       const data = models.map(model => buildClientModel({
         id: model.id, created: now, ownedBy: 'kiro-api', modelName: model.name,
@@ -2511,7 +2344,8 @@ export class ProxyServer {
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/chat/completions',
-          signal
+          signal,
+          matchedApiKey?.id
         )
         const response = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
@@ -2607,7 +2441,8 @@ export class ProxyServer {
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/responses',
-          signal
+          signal,
+          matchedApiKey?.id
         )
         const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
         this.throwIfResponseClosed(res, signal)
@@ -2659,7 +2494,8 @@ export class ProxyServer {
           return callKiroApi(acc, retryPayload, signal)
         },
         '/v1/responses',
-        signal
+        signal,
+        matchedApiKey?.id
       )
       const chatResponse = kiroToOpenaiResponse(result.content, result.toolUses, result.usage, chatRequest.model, toolNameRegistry, result.reasoningContent)
       this.throwIfResponseClosed(res, signal)
@@ -2950,7 +2786,8 @@ export class ProxyServer {
             return callKiroApi(acc, retryPayload, signal)
           },
           '/v1/messages',
-          signal
+          signal,
+          matchedApiKey?.id
         )
         const response = kiroToClaudeResponse(result.content, result.toolUses, result.usage, request.model, toolNameRegistry, result.reasoningContent)
 
@@ -2973,6 +2810,9 @@ export class ProxyServer {
         const respTime = Date.now() - startTime
         this.events.onResponse?.({ path: '/v1/messages', model: request.model, status: 200, tokens: result.usage.inputTokens + result.usage.outputTokens, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, cacheReadTokens: result.usage.cacheReadTokens, reasoningTokens: result.usage.reasoningTokens, credits: result.usage.credits, responseTime: respTime })
         this.recordRequest({ path: '/v1/messages', model: request.model, accountId: usedAccount.id, inputTokens: result.usage.inputTokens, outputTokens: result.usage.outputTokens, credits: result.usage.credits, responseTime: respTime, success: true })
+        if (matchedApiKey) {
+          this.recordApiKeyUsage(matchedApiKey.id, result.usage.credits || 0, result.usage.inputTokens, result.usage.outputTokens, request.model, '/v1/messages')
+        }
       }
     } catch (error) {
       this.handleApiError(res, account, error as Error, '/v1/messages', request.model, startTime, signal)

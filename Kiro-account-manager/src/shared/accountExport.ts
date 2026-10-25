@@ -12,6 +12,7 @@ export interface ExportAccountLike {
   email: string
   idp?: string
   nickname?: string
+  sourceAccountNames?: string[]
   password?: string
   credentials: {
     accessToken?: string
@@ -133,6 +134,7 @@ function minimalCredential(
     region: credential.region
   }
   if (credential.nickname) record.nickname = credential.nickname
+  if (credential.sourceAccountNames?.length) record.sourceAccountNames = credential.sourceAccountNames
   if (credential.startUrl) record.startUrl = credential.startUrl
   if (credential.profileArn) record.profileArn = credential.profileArn
   if (includeCredentials) {

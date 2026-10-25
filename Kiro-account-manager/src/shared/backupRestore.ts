@@ -10,9 +10,10 @@
 // - 不完整的账户（非对象、缺少 credentials、身份无法识别）计为 invalid
 // ============================================
 
-import { emptyOutcome, findExistingDuplicate, normalizeCredentialRecord } from './accountImport'
+import { emptyOutcome, resolveExistingDuplicate, normalizeCredentialRecord } from './accountImport'
 import type { BackupPayload, ExistingAccountLike, ImportOutcome } from './accountImport'
 import { normalizeAccountSubscription } from './accountSubscription'
+import { mergeSourceAccountNames } from './accountSearch'
 
 export interface GroupLike {
   id: string
@@ -43,6 +44,7 @@ export type RestoredAccount = Record<string, unknown> & {
   id: string
   email: string
   idp: string
+  sourceAccountNames?: string[]
   credentials: Record<string, unknown>
   tags: string[]
   isActive: false
@@ -50,6 +52,7 @@ export type RestoredAccount = Record<string, unknown> & {
 
 export interface BackupRestorePlan {
   accounts: RestoredAccount[]
+  sourceAccountNameUpdates: Array<{ id: string; sourceAccountNames: string[] }>
   groups: GroupLike[]
   tags: TagLike[]
   outcome: ImportOutcome
@@ -102,6 +105,8 @@ function allocateId(ids: Set<string>, generateId: () => string): string {
 export function planBackupRestore(backup: BackupPayload, ctx: RestoreContext): BackupRestorePlan {
   const outcome = emptyOutcome(backup.accounts.length)
   const notes: string[] = []
+  const sourceAccountNameUpdates: BackupRestorePlan['sourceAccountNameUpdates'] = []
+  const pendingSourceNames = new Map<string, string[]>()
 
   // ---------- 分组 ----------
   const groupIdMap = new Map<string, string>()
@@ -232,10 +237,33 @@ export function planBackupRestore(backup: BackupPayload, ctx: RestoreContext): B
       continue
     }
 
-    const dup =
-      findExistingDuplicate(existingList, credential) ??
-      findExistingDuplicate(accepted as unknown as ExistingAccountLike[], credential)
+    const match = resolveExistingDuplicate([...existingList, ...accepted], credential)
+    if (match.conflict) {
+      outcome.failed++
+      outcome.errors.push({ source: entry.source, message: '账户身份信息冲突，未更新来源账号，请检查导入记录' })
+      continue
+    }
+    const dup = match.account
+    const existingDuplicate = dup && existingList.includes(dup) ? dup : undefined
+    const acceptedDuplicate = dup && !existingDuplicate ? dup : undefined
     if (dup) {
+      const incomingSourceNames = mergeSourceAccountNames(
+        credential.sourceAccountNames,
+        credential.email && credential.email.toLowerCase() !== dup.email?.toLowerCase() ? [credential.email] : []
+      )
+      if (incomingSourceNames.length) {
+        const sourceAccountNames = mergeSourceAccountNames(
+          dup.sourceAccountNames,
+          dup.id ? pendingSourceNames.get(dup.id) : undefined,
+          incomingSourceNames
+        )
+        if (existingDuplicate?.id) {
+          sourceAccountNameUpdates.push({ id: existingDuplicate.id, sourceAccountNames })
+          pendingSourceNames.set(existingDuplicate.id, sourceAccountNames)
+        } else if (acceptedDuplicate) {
+          acceptedDuplicate.sourceAccountNames = sourceAccountNames
+        }
+      }
       outcome.duplicate++
       outcome.errors.push({ source: entry.source, message: '该账户已存在，已跳过' })
       continue
@@ -281,6 +309,7 @@ export function planBackupRestore(backup: BackupPayload, ctx: RestoreContext): B
       idp: credential.provider,
       password: credential.password,
       nickname: credential.nickname,
+      sourceAccountNames: credential.sourceAccountNames,
       machineId: nonEmptyString(src.machineId) ?? ctx.generateMachineId(),
       credentials: {
         ...creds,
@@ -310,5 +339,5 @@ export function planBackupRestore(backup: BackupPayload, ctx: RestoreContext): B
     outcome.added++
   }
 
-  return { accounts: accepted, groups: groupsToAdd, tags: tagsToAdd, outcome, notes }
+  return { accounts: accepted, sourceAccountNameUpdates, groups: groupsToAdd, tags: tagsToAdd, outcome, notes }
 }

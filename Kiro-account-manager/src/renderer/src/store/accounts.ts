@@ -22,9 +22,10 @@ import type {
 } from '../types/proxy'
 import { DEFAULT_PROXY_POOL_CONFIG } from '../types/proxy'
 import { useWebhookStore, type WebhookEvent, type WebhookMessage } from './webhooks'
-import { emptyOutcome, findExistingDuplicate, normalizeCredentialRecord, planFromJsonValue, type ImportPlan, type ImportOutcome } from '../../../shared/accountImport'
+import { emptyOutcome, resolveExistingDuplicate, normalizeCredentialRecord, planFromJsonValue, type ImportPlan, type ImportOutcome } from '../../../shared/accountImport'
 import { planBackupRestore } from '../../../shared/backupRestore'
 import { executeCredentialImport } from '../utils/accountImport'
+import { matchesAccountSearch, mergeSourceAccountNames } from '../../../shared/accountSearch'
 import { compareSubscriptionTypes, emptySubscriptionCounts, mergeAccountSubscription, normalizeAccountSubscription, normalizeSubscriptionType } from '../../../shared/accountSubscription'
 import { switchAccountToClients, type AccountSwitchResult, type AccountSwitchTarget } from '../../../shared/switchAccount'
 
@@ -1113,12 +1114,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     // 应用筛选
     if (filter.search) {
-      const search = filter.search.toLowerCase()
-      result = result.filter(
-        (a) =>
-          a.email.toLowerCase().includes(search) ||
-          a.nickname?.toLowerCase().includes(search)
-      )
+      result = result.filter((account) => matchesAccountSearch(account, filter.search!))
     }
 
     if (filter.subscriptionTypes?.length) {
@@ -1298,15 +1294,27 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         continue
       }
       const credential = normalized.credential
-      if (findExistingDuplicate(get().accounts.values(), credential)) {
+      const match = resolveExistingDuplicate(get().accounts.values(), credential)
+      if (match.conflict) {
+        result.failed++
+        result.errors.push({ id: `#${index + 1}`, error: '账户身份信息冲突，未更新来源账号，请检查导入记录' })
+        continue
+      }
+      const existing = match.account
+      if (existing) {
+        const sourceAccountNames = mergeSourceAccountNames(existing.sourceAccountNames, credential.sourceAccountNames, [credential.email])
+        if (sourceAccountNames.length) get().updateAccount(existing.id, { sourceAccountNames })
         result.errors.push({ id: 'skipped', error: `#${index + 1}: 已存在，跳过` })
         continue
       }
       const now = Date.now()
+      const credentials = { ...credential }
+      delete credentials.sourceAccountNames
       get().addAccount({
         email: item.email.trim(), password: credential.password, nickname: credential.nickname,
+        sourceAccountNames: mergeSourceAccountNames(credential.sourceAccountNames, [credential.email]),
         userId: credential.userId, idp: credential.provider, groupId: item.groupId,
-        credentials: { ...credential, accessToken: credential.accessToken || '', csrfToken: '', expiresAt: credential.expiresAt || now },
+        credentials: { ...credentials, accessToken: credential.accessToken || '', csrfToken: '', expiresAt: credential.expiresAt || now },
         subscription: { type: 'Unknown' },
         usage: { current: 0, limit: 0, percentUsed: 0, lastUpdated: now },
         tags: item.tags || [], status: 'unknown', lastUsedAt: now
@@ -1330,6 +1338,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const groups = new Map(state.groups)
       const tags = new Map(state.tags)
       for (const account of restored.accounts) accounts.set(account.id, account as unknown as Account)
+      for (const update of restored.sourceAccountNameUpdates) {
+        const account = accounts.get(update.id)
+        if (account) accounts.set(update.id, { ...account, sourceAccountNames: update.sourceAccountNames })
+      }
       for (const group of restored.groups) groups.set(group.id, group)
       for (const tag of restored.tags) tags.set(tag.id, tag)
       return { accounts, groups, tags }
@@ -1362,13 +1374,18 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         const groups = new Map(state.groups)
         const tags = new Map(state.tags)
         for (const account of restored.accounts) accounts.set(account.id, account as unknown as Account)
+        for (const update of restored.sourceAccountNameUpdates) {
+          const account = accounts.get(update.id)
+          if (account) accounts.set(update.id, { ...account, sourceAccountNames: update.sourceAccountNames })
+        }
         for (const group of restored.groups) groups.set(group.id, group)
         for (const tag of restored.tags) tags.set(tag.id, tag)
         return { accounts, groups, tags }
       })
       if (restored.notes.length) restored.outcome.errors.push({ source: '$metadata', message: '部分分组或标签已忽略或重建，请核对导入结果' })
       try { await persist() } catch {
-        restored.outcome.failed += restored.outcome.added
+        restored.outcome.failed += restored.outcome.added + restored.sourceAccountNameUpdates.length
+        restored.outcome.duplicate -= restored.sourceAccountNameUpdates.length
         restored.outcome.added = 0
         restored.outcome.errors.push({ source: '$', message: '当前窗口已保留导入数据，但保存失败，请重试保存后再退出' })
       }
@@ -1376,17 +1393,30 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     }
     return executeCredentialImport(plan, {
       existing: () => get().accounts.values(),
-      verify: (credential) => window.api.verifyAccountCredentials({
-        ...credential, clientId: credential.clientId || '', clientSecret: credential.clientSecret || ''
-      }),
+      verify: (credential) => {
+        const input = { ...credential, clientId: credential.clientId || '', clientSecret: credential.clientSecret || '' }
+        delete input.sourceAccountNames
+        return window.api.verifyAccountCredentials(input)
+      },
       add: (account) => get().addAccount(account),
       persist,
-      wasConsumed: (credential) => {
+      updateSourceAccountNames: (accountId, names) => {
+        set((state) => {
+          const account = state.accounts.get(accountId)
+          if (!account) return {}
+          const sourceAccountNames = mergeSourceAccountNames(account.sourceAccountNames, names)
+          if (sourceAccountNames.length === account.sourceAccountNames?.length && sourceAccountNames.every((name, index) => name === account.sourceAccountNames![index])) return {}
+          const accounts = new Map(state.accounts)
+          accounts.set(accountId, { ...account, sourceAccountNames })
+          return { accounts }
+        })
+      },
+      getConsumedAccountId: (credential) => {
         const accountId = consumedImportTokens.get(credential.refreshToken)
-        if (!accountId) return false
-        if (get().accounts.has(accountId)) return true
+        if (!accountId) return undefined
+        if (get().accounts.has(accountId)) return accountId
         consumedImportTokens.delete(credential.refreshToken)
-        return false
+        return undefined
       },
       rememberConsumed: (credential, accountId) => { consumedImportTokens.set(credential.refreshToken, accountId) }
     }, groupId && get().groups.has(groupId) ? groupId : undefined, signal)

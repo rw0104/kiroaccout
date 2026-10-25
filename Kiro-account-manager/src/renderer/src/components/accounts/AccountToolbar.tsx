@@ -313,7 +313,7 @@ export function AccountToolbar({
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <input
             type="text"
-            placeholder={isEn ? 'Search accounts...' : '搜索账号...'}
+            placeholder={t('accounts.searchPlaceholder')}
             className="w-full pl-9 pr-4 py-2 text-sm rounded-xl bg-[var(--glass-bg-subtle)] backdrop-blur-md border border-[var(--glass-border)] focus:outline-none focus:ring-2 focus:ring-primary/40 focus:border-primary/30 transition-all"
             value={filter.search ?? ''}
             onChange={(e) => handleSearch(e.target.value)}

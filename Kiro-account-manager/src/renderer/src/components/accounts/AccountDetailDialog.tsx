@@ -1,6 +1,6 @@
 import { createPortal } from 'react-dom'
 import { useState, useEffect } from 'react'
-import { X, RefreshCw, User, CreditCard, Key, Cpu, Loader2, FileText, Image, Hash, Zap, Brain, Database } from 'lucide-react'
+import { X, RefreshCw, User, CreditCard, Key, Cpu, Loader2, FileText, Image, Hash, Brain, Database } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Progress } from '@/components/ui/progress'
@@ -10,6 +10,8 @@ import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import { getSubscriptionColor } from './_helpers'
 import { AddOnCredits } from './AddOnCredits'
+import { ModelPricing } from '../ModelPricing'
+import { mergeSourceAccountNames } from '../../../../shared/accountSearch'
 
 import type { AccountModelInfo } from '../../../../shared/modelCatalog'
 
@@ -297,6 +299,10 @@ export function AccountDetailDialog({
                    </div>
                  </div>
                  <div className="space-y-1">
+                    <label className="text-xs font-medium text-muted-foreground">{t('accounts.originalAccount')}</label>
+                    <div className="text-sm font-mono break-all whitespace-pre-wrap select-all">{privacyMode ? '********' : (mergeSourceAccountNames(account.sourceAccountNames).join('\n') || '-')}</div>
+                 </div>
+                 <div className="space-y-1">
                     <label className="text-xs font-medium text-muted-foreground">{isEn ? 'User ID' : '用户 ID'}</label>
                     <div className="text-xs font-mono break-all bg-primary/[0.06] px-3 py-2 rounded-lg border border-primary/15 select-all text-foreground/80">{privacyMode ? '********' : (account.userId || '-')}</div>
                  </div>
@@ -418,11 +424,6 @@ export function AccountDetailDialog({
                               <Image className="h-3 w-3 mr-0.5" />Image
                             </Badge>
                           )}
-                          {model.rateMultiplier !== undefined && (
-                            <Badge variant="secondary" className="text-[10px] px-1.5 h-5 bg-amber-500/10 text-amber-600 dark:text-amber-400 border-0">
-                              <Zap className="h-3 w-3 mr-0.5" />{model.rateMultiplier}x
-                            </Badge>
-                          )}
                         </div>
                         <div className="flex items-center gap-1 text-[10px] text-muted-foreground font-mono">
                           <Hash className="h-3 w-3" />
@@ -435,6 +436,7 @@ export function AccountDetailDialog({
                           </span>
                         </div>
                       </div>
+                      <ModelPricing model={model} isEn={isEn} />
                     </div>
                   ))}
                 </div>

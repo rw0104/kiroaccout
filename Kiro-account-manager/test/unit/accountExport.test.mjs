@@ -64,6 +64,28 @@ const restore = (exported) => {
   })
 }
 
+test('original account names survive full backups and minimal credential exports', () => {
+  const row = account('github', 'Github')
+  row.sourceAccountNames = ['synthetic-login-42', 'older-login']
+  for (const includeCredentials of [false, true]) {
+    for (const format of ['json', 'oidc']) {
+      const exported = createAccountExport(input({ accounts: [row], format, includeCredentials }))
+      assert.equal(exported.ok, true)
+      const raw = JSON.parse(exported.content)
+      assert.deepEqual((format === 'json' ? raw.accounts[0] : raw[0]).sourceAccountNames, row.sourceAccountNames)
+      if (includeCredentials || format === 'json') {
+        const parsed = parseAccountImportText(exported.content)
+        assert.deepEqual(parsed.records[0].credential.sourceAccountNames, row.sourceAccountNames)
+      }
+      if (format === 'json') {
+        const restored = restore(exported).accounts[0]
+        assert.equal(restored.email, row.email)
+        assert.deepEqual(restored.sourceAccountNames, row.sourceAccountNames)
+      }
+    }
+  }
+})
+
 test('credential-free backup removes legacy device authorization codes and AWS access key identifiers', () => {
   const row = account('builder', 'BuilderId')
   row.deviceCode = 'SYNTHETIC_DEVICE_CODE'

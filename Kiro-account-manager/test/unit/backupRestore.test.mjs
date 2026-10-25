@@ -32,6 +32,93 @@ const acct = (id, email, extra = {}) => ({
 
 const backupOf = (accounts, groups = [], tags = []) => parseAccountImportText(JSON.stringify({ version: '1.7.6', exportedAt: 1, accounts, groups, tags })).backup
 
+test('restore normalizes original account names without replacing the real email', () => {
+  const plan = planBackupRestore(backupOf([
+    acct('source', 'verified@example.invalid', { sourceAccountNames: ['  synthetic-login-42 ', 'SYNTHETIC-LOGIN-42', null] })
+  ]), ctx())
+  assert.equal(plan.accounts[0].email, 'verified@example.invalid')
+  assert.deepEqual(plan.accounts[0].sourceAccountNames, ['synthetic-login-42'])
+})
+
+test('duplicate backup accounts supply only source name updates for the matched account', () => {
+  const existing = acct('local', 'verified@example.invalid', { sourceAccountNames: ['older-login'] })
+  const incoming = acct('external', existing.email, { sourceAccountNames: ['synthetic-login-42'] })
+  const plan = planBackupRestore(backupOf([incoming]), ctx({ existingAccounts: [existing] }))
+  assert.equal(plan.accounts.length, 0)
+  assert.equal(plan.outcome.duplicate, 1)
+  assert.deepEqual(plan.sourceAccountNameUpdates, [{ id: existing.id, sourceAccountNames: ['older-login', 'synthetic-login-42'] }])
+  assert.deepEqual(existing.sourceAccountNames, ['older-login'])
+  assert.equal(existing.credentials.refreshToken, 'FAKE_RT_local')
+})
+
+test('multiple duplicate backup records accumulate source names for an existing account', () => {
+  const existing = acct('local', 'verified@example.invalid', { sourceAccountNames: ['first-login'] })
+  const plan = planBackupRestore(backupOf([
+    acct('external-1', existing.email, { sourceAccountNames: ['second-login'] }),
+    acct('external-2', existing.email, { sourceAccountNames: ['third-login'] })
+  ]), ctx({ existingAccounts: [existing] }))
+  assert.equal(plan.outcome.duplicate, 2)
+  assert.deepEqual(plan.sourceAccountNameUpdates.at(-1).sourceAccountNames, ['first-login', 'second-login', 'third-login'])
+  assert.deepEqual(existing.sourceAccountNames, ['first-login'])
+})
+
+test('duplicates within a new backup retain all source names on the single restored account', () => {
+  const plan = planBackupRestore(backupOf([
+    acct('external-1', 'verified@example.invalid', { sourceAccountNames: ['first-login'] }),
+    acct('external-2', 'verified@example.invalid', { sourceAccountNames: ['second-login'] })
+  ]), ctx())
+  assert.equal(plan.outcome.added, 1)
+  assert.equal(plan.outcome.duplicate, 1)
+  assert.deepEqual(plan.accounts[0].sourceAccountNames, ['first-login', 'second-login'])
+  assert.deepEqual(plan.sourceAccountNameUpdates, [])
+})
+
+test('legacy backup labels can supplement an existing verified account through its unchanged credential', () => {
+  const existing = acct('local', 'verified@example.invalid')
+  const incoming = acct('external', 'synthetic-old-login', { credentials: { ...existing.credentials } })
+  const plan = planBackupRestore(backupOf([incoming]), ctx({ existingAccounts: [existing] }))
+  assert.equal(plan.accounts.length, 0)
+  assert.equal(plan.outcome.duplicate, 1)
+  assert.deepEqual(plan.sourceAccountNameUpdates, [{ id: existing.id, sourceAccountNames: ['synthetic-old-login'] }])
+  assert.equal(existing.email, 'verified@example.invalid')
+})
+
+test('backup source names follow the stable token even when an earlier local email also matches', () => {
+  const first = acct('first', 'shared@example.invalid')
+  const second = acct('second', 'verified@example.invalid')
+  const incoming = acct('incoming', first.email, { credentials: { ...second.credentials }, sourceAccountNames: ['second-source'] })
+  const plan = planBackupRestore(backupOf([incoming]), ctx({ existingAccounts: [first, second] }))
+  assert.equal(plan.outcome.duplicate, 1)
+  assert.equal(plan.accounts.length, 0)
+  assert.deepEqual(plan.sourceAccountNameUpdates, [{ id: 'second', sourceAccountNames: ['second-source', 'shared@example.invalid'] }])
+  assert.equal(first.sourceAccountNames, undefined)
+  assert.equal(second.sourceAccountNames, undefined)
+  assert.ok(isOutcomeBalanced(plan.outcome))
+})
+
+test('a newly accepted backup token outranks a weak email match in the local accounts', () => {
+  const existing = acct('local', 'shared@example.invalid')
+  const first = acct('first', 'verified@example.invalid', { sourceAccountNames: ['first-source'] })
+  const second = acct('second', existing.email, { credentials: { ...first.credentials }, sourceAccountNames: ['second-source'] })
+  const plan = planBackupRestore(backupOf([first, second]), ctx({ existingAccounts: [existing] }))
+  assert.equal(plan.outcome.added, 1)
+  assert.equal(plan.outcome.duplicate, 1)
+  assert.deepEqual(plan.sourceAccountNameUpdates, [])
+  assert.deepEqual(plan.accounts[0].sourceAccountNames, ['first-source', 'second-source', 'shared@example.invalid'])
+  assert.ok(isOutcomeBalanced(plan.outcome))
+})
+
+test('backup conflicting token and user identities neither update source names nor add an account', () => {
+  const first = acct('first', 'first@example.invalid', { userId: 'first-user' })
+  const second = acct('second', 'second@example.invalid', { userId: 'second-user' })
+  const incoming = acct('incoming', 'synthetic-source', { credentials: { ...first.credentials }, userId: second.userId, sourceAccountNames: ['conflicting-source'] })
+  const plan = planBackupRestore(backupOf([incoming]), ctx({ existingAccounts: [first, second] }))
+  assert.equal(plan.outcome.failed, 1)
+  assert.deepEqual(plan.accounts, [])
+  assert.deepEqual(plan.sourceAccountNameUpdates, [])
+  assert.ok(isOutcomeBalanced(plan.outcome))
+})
+
 test('AC-01：完整备份往返，保留分组/标签关系', () => {
   const b = backupOf(
     [acct('a1', 'a@example.invalid', { groupId: 'g1', tags: ['t1'] })],

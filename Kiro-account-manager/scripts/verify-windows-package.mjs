@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { createHash } from 'node:crypto'
 import { gunzipSync } from 'node:zlib'
 import { validateStableManifest } from './lib/releaseArtifacts.mjs'
+import { tlsLibrarySpec } from './lib/platformResources.mjs'
 
 const require = createRequire(import.meta.url)
 const asar = require('@electron/asar')
@@ -23,16 +24,16 @@ assert.ok(entries.every(entry => allowedRoots.has(entry.split('/')[0])), 'Unexpe
 assert.ok(!entries.some(entry => /(^|\/)(\.env(?:\.[^/]*)?|\.kiro|\.local|\.git|kiro-accounts[^/]*\.json)$/.test(entry)), 'Local state must not be packaged')
 assert.ok(!entries.some(entry => /author-avatar|支付宝支付|微信支付|交流群/.test(entry)), 'Old promotional resources must not be packaged')
 for (const entry of ['out/main/index.js', 'out/preload/index.js', 'out/renderer/index.html',
-  'node_modules/electron-store/package.json', 'node_modules/undici/package.json',
+  'node_modules/undici/package.json',
   'node_modules/@cbor-extract/cbor-extract-win32-x64/node.napi.node',
-  'node_modules/koffi/build/koffi/win32_x64/koffi.node',
+  'node_modules/@koromix/koffi-win32-x64/win32_x64/koffi.node',
   'node_modules/tlsclientwrapper/package.json', 'node_modules/koffi/package.json']) {
   assert.ok(entries.includes(entry), `Required application entry missing: ${entry}`)
 }
 const packaged = JSON.parse(asar.extractFile(archive, 'package.json').toString('utf8'))
 assert.equal(packaged.version, metadata.version, 'Package version must match source')
 assert.equal(packaged.main, './out/main/index.js')
-const dll = join(unpacked, 'resources', 'tls-client-xgo-1.14.0-windows-amd64.dll')
+const dll = join(unpacked, 'resources', tlsLibrarySpec(appRoot, 'win32', 'x64').filename)
 assert.ok(statSync(dll).size > 1000000, 'Required Windows x64 TLS library missing')
 assert.ok(statSync(join(unpacked, 'LICENSE.kiroaccout.txt')).size > 10000, 'AGPL license must accompany the package')
 assert.ok(statSync(join(unpacked, 'THIRD_PARTY_NOTICES.md')).size > 0, 'Upstream and third-party notices must accompany the package')

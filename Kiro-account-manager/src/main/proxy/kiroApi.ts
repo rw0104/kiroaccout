@@ -19,6 +19,7 @@ import type {
 import { proxyLogger } from './logger'
 import { executeRuntimeRequest } from './kiroRuntime'
 import { requestControlPlane } from '../kiroControlPlane'
+import { KIRO_LEGACY_IDENTITY } from '../../shared/kiroClientCompatibility'
 import { isRetiredModelId, ModelRequestError, type KiroModel } from '../../shared/modelCatalog'
 export type { KiroModel } from '../../shared/modelCatalog'
 import { getKProxyService } from '../kproxy'
@@ -123,7 +124,7 @@ function getNetworkAgent(account?: ProxyAccount): Dispatcher | undefined {
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      const agent = safeCreateProxyAgent(proxyUrl)
+      const agent = safeCreateProxyAgent(proxyUrl, { targetCa: kproxyService.getCACertPem() || undefined })
       if (agent) return agent
     }
   }
@@ -148,8 +149,8 @@ async function fetchWithProxy(url: string, options: RequestInit, account?: Proxy
   return await fetch(url, options)
 }
 
-// Kiro 版本号（跟随官方 IDE 更新）
-const KIRO_VERSION = '0.12.155'
+// Existing streaming compatibility identity; independent of the IDE release.
+const KIRO_VERSION = KIRO_LEGACY_IDENTITY.streaming
 const AWS_SDK_VERSION = '1.0.34'
 const AWS_STREAMING_API_VERSION = '1.0.34'
 
@@ -1299,7 +1300,7 @@ export interface SubscriptionListResponse {
 }
 
 // 订阅请求专用 User-Agent（匹配 Kiro IDE 实际报文格式）
-const KIRO_SUBSCRIPTION_VERSION = '0.12.155'
+const KIRO_SUBSCRIPTION_VERSION = KIRO_LEGACY_IDENTITY.subscription
 
 function getSubscriptionUserAgent(machineId?: string): string {
   const suffix = machineId ? `KiroIDE-${KIRO_SUBSCRIPTION_VERSION}-${machineId}` : `KiroIDE-${KIRO_SUBSCRIPTION_VERSION}`

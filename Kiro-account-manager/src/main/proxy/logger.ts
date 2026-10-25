@@ -434,7 +434,8 @@ export function interceptConsole(): void {
   const originalError = console.error
 
   const parseConsoleCategory = (args: unknown[]): { category: string; message: string } => {
-    const first = String(args[0] || '')
+    // Do not invoke arbitrary toString/getters while constructing a diagnostic.
+    const first = typeof args[0] === 'string' ? args[0] : ''
     // 匹配 [Category] 或 [INFO][Category] 格式
     const bracketMatch = first.match(/^\[(?:DEBUG|INFO|WARN|ERROR)\]?\[?([^\]]*)\]?\s*(.*)/)
     if (bracketMatch) {
@@ -449,7 +450,7 @@ export function interceptConsole(): void {
 
   const buildEntry = (args: unknown[], level: 'INFO' | 'WARN' | 'ERROR'): LogEntry => {
     const { category, message } = parseConsoleCategory(args)
-    const rest = args.slice(1, 21)
+    const rest = typeof args[0] === 'string' ? args.slice(1, 21) : args.slice(0, 20)
     // data: 后续参数（对象/数组保留结构，字符串拼接）
     let data: unknown = undefined
     if (rest.length === 1) {
@@ -460,21 +461,19 @@ export function interceptConsole(): void {
     return { timestamp: new Date().toISOString(), level, category, message, data, ...(args.length > 21 ? { truncated: true } : {}) }
   }
 
-  console.log = (...args: unknown[]) => {
-    originalLog.apply(console, args)
-    if (proxyLogger._isWriting) return
-    proxyLogStore.add(buildEntry(args, 'INFO'))
+  let capturing = false
+  const capture = (original: (...args: unknown[]) => void, args: unknown[], level: 'INFO' | 'WARN' | 'ERROR'): void => {
+    if (capturing) return
+    capturing = true
+    try {
+      const raw = buildEntry(args, level)
+      // The original console must receive the same safe bounded snapshot as history.
+      // Logger.write already stored its entry: do not add it again here.
+      const entry = proxyLogger._isWriting ? snapshotLogEntry(raw, redactValue) : proxyLogStore.add(raw)
+      original.call(console, `[${entry.category}] ${entry.message}`, ...(entry.data === undefined ? [] : [entry.data]))
+    } finally { capturing = false }
   }
-
-  console.warn = (...args: unknown[]) => {
-    originalWarn.apply(console, args)
-    if (proxyLogger._isWriting) return
-    proxyLogStore.add(buildEntry(args, 'WARN'))
-  }
-
-  console.error = (...args: unknown[]) => {
-    originalError.apply(console, args)
-    if (proxyLogger._isWriting) return
-    proxyLogStore.add(buildEntry(args, 'ERROR'))
-  }
+  console.log = (...args: unknown[]) => capture(originalLog, args, 'INFO')
+  console.warn = (...args: unknown[]) => capture(originalWarn, args, 'WARN')
+  console.error = (...args: unknown[]) => capture(originalError, args, 'ERROR')
 }

@@ -4,6 +4,7 @@ import type { SessionClient } from 'tlsclientwrapper'
 import { getSystemProxy, safeCreateProxyAgent } from '../proxy/systemProxy'
 import { randomEmailPrefix } from './names'
 import { waitProtonOtp } from './proton-mail-window'
+import { redactString } from '../utils/redact'
 
 function getRegistrationProxyUrl(): string | undefined {
   return process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || getSystemProxy() || undefined
@@ -104,7 +105,7 @@ export class MoEmailService implements TempEmailService {
       ''
 
     if (!addr) {
-      console.log('[MoEmail] 创建邮箱失败:', JSON.stringify(data))
+      console.log('[MoEmail] 创建邮箱失败')
       return ''
     }
     this.address = addr
@@ -121,8 +122,8 @@ export class MoEmailService implements TempEmailService {
       try {
         const code = await this.fetchCode()
         if (code) return code
-      } catch (err) {
-        if (attempt % 5 === 0) console.log(`[MoEmail] [${attempt}/${maxRetries}] 查询失败:`, err)
+      } catch {
+        if (attempt % 5 === 0) console.log(`[MoEmail] [${attempt}/${maxRetries}] 查询失败`)
       }
       if (attempt % 5 === 0) console.log(`[MoEmail] [${attempt}/${maxRetries}] 暂无验证码...`)
     }
@@ -202,9 +203,9 @@ export class TempMailPlusService implements TempEmailService {
     this.domain = this.domains[Math.floor(Math.random() * this.domains.length)]
     this.address = `${prefix}@${this.domain}`
     if (this.domains.length > 1) {
-      console.log(`[TempMailPlus] 生成邮箱: ${this.address}  (域名池 ${this.domains.length} 个)`)
+      console.log(`[TempMailPlus] 已生成邮箱 (域名池 ${this.domains.length} 个)`)
     } else {
-      console.log(`[TempMailPlus] 生成邮箱: ${this.address}`)
+      console.log('[TempMailPlus] 已生成邮箱')
     }
     return this.address
   }
@@ -237,22 +238,22 @@ export class TempMailPlusService implements TempEmailService {
           // 验证收件人匹配
           const toField = String(detail.to || '').toLowerCase()
           if (!toField.includes(this.address.toLowerCase())) {
-            console.log(`[TempMailPlus] 收件人不匹配: ${toField} (期望包含: ${this.address})`)
+            console.log('[TempMailPlus] 收件人不匹配')
             continue
           }
 
           // 提取验证码
           const code = this.extractOTP(detail)
           if (code) {
-            console.log(`[TempMailPlus] 验证码: ${code}`)
+            console.log('[TempMailPlus] 已取得验证码')
             await this.deleteMail(mailId)
             return code
           } else {
             console.log(`[TempMailPlus] 邮件 ${mailId} 未提取到验证码`)
           }
         }
-      } catch (err) {
-        console.log(`[TempMailPlus] [${attempt}/${maxRetries}] 查询失败:`, err)
+      } catch {
+        console.log(`[TempMailPlus] [${attempt}/${maxRetries}] 查询失败`)
       }
       if (attempt % 5 === 0) console.log(`[TempMailPlus] [${attempt}/${maxRetries}] 暂无验证码...`)
     }
@@ -285,8 +286,8 @@ export class TempMailPlusService implements TempEmailService {
     try {
       await proxyFetch(url, { method: 'DELETE', headers, body, signal: AbortSignal.timeout(10000) })
       console.log(`[TempMailPlus] 已删除邮件: ${mailId}`)
-    } catch (err) {
-      console.log(`[TempMailPlus] 删除邮件失败:`, err)
+    } catch {
+      console.log('[TempMailPlus] 删除邮件失败')
     }
   }
 
@@ -589,9 +590,9 @@ export class GptMailService implements TempEmailService {
       ? `CF 转发 → ${this.inboxEmail}`
       : this.privatePassword ? '私有域名直收（已解锁）' : '私有域名直收（MX→GPTmail）'
     if (this.domains.length > 1) {
-      console.log(`[GPTmail] 注册邮箱: ${this.address}  (域名池 ${this.domains.length} 个，模式: ${mode})`)
+      console.log(`[GPTmail] 注册邮箱已就绪 (域名池 ${this.domains.length} 个，模式: ${mode})`)
     } else {
-      console.log(`[GPTmail] 注册邮箱: ${this.address}  (模式: ${mode})`)
+      console.log(`[GPTmail] 注册邮箱已就绪 (模式: ${mode})`)
     }
     return this.address
   }
@@ -643,7 +644,7 @@ export class GptMailService implements TempEmailService {
       throw new Error(`GPTmail __BROWSER_AUTH 缺 token 字段: ${JSON.stringify(auth).slice(0, 200)}`)
     }
     this.token = token
-    console.log(`[GPTmail] 已从页面拿到初始 token（email=${auth.email}, exp=${auth.expires_at}）`)
+    console.log('[GPTmail] 已从页面拿到初始 token')
   }
 
   /**
@@ -664,7 +665,7 @@ export class GptMailService implements TempEmailService {
       const err = (resp.error as string) || JSON.stringify(resp).slice(0, 200)
       throw new Error(`GPTmail 私有域名解锁失败: ${err}（密码错误？域名未设为私有？）`)
     }
-    console.log(`[GPTmail] 私有域名 inbox 解锁成功: ${this.inboxEmail}`)
+    console.log('[GPTmail] 私有域名 inbox 解锁成功')
     // token 已被 request() 内部从 auth.token 自动滚动更新
   }
 
@@ -690,7 +691,7 @@ export class GptMailService implements TempEmailService {
       try {
         const mails = await this.fetchMails()
         if (attempt === 1 || attempt % 5 === 0) {
-          console.log(`[GPTmail] [${attempt}/${maxRetries}] 收件箱(${this.inboxEmail}) 邮件数: ${mails.length}`)
+          console.log(`[GPTmail] [${attempt}/${maxRetries}] 收件箱邮件数: ${mails.length}`)
         }
         for (const mail of mails) {
           const id = String(mail.id ?? '')
@@ -721,16 +722,16 @@ export class GptMailService implements TempEmailService {
 
           const code = this.extractOTP(mail)
           if (code) {
-            console.log(`[GPTmail] 提取到验证码: ${code} (from=${mail.from_address ?? ''}, subject=${subject.slice(0, 60)})`)
+            console.log('[GPTmail] 已提取验证码')
             // 不再全量 clear inbox：CF 转发模式下多任务共享同一 inbox，
             // 清空会误删别的任务待取的验证码。本次邮件已记入 checkedIds，
             // 后续实例靠 create() 重新捕获基线跳过，已足够避免重复取码。
             return code
           }
         }
-      } catch (err) {
+      } catch {
         if (attempt % 5 === 0) {
-          console.log(`[GPTmail] [${attempt}/${maxRetries}] 查询失败:`, err instanceof Error ? err.message : err)
+          console.log(`[GPTmail] [${attempt}/${maxRetries}] 查询失败`)
         }
       }
       if (attempt % 5 === 0) console.log(`[GPTmail] [${attempt}/${maxRetries}] 暂无验证码...`)
@@ -950,7 +951,7 @@ class IMAPClient {
         return 0
       }
       if (retry < 2) {
-        console.log(`[IMAP] SELECT INBOX 失败 (${result}), 重试 ${retry + 1}/3...`)
+        console.log(`[IMAP] SELECT INBOX 失败，重试 ${retry + 1}/3...`)
         await sleep((1 + retry) * 1000)
       }
     }
@@ -1024,7 +1025,7 @@ export async function waitForOTP(
   interval: number,
   signal?: AbortSignal
 ): Promise<string> {
-  console.log(`[Outlook IMAP] 等待验证码, 邮箱=${acc.email}, 发送前邮件数=${beforeCount}`)
+  console.log(`[Outlook IMAP] 等待验证码, 发送前邮件数=${beforeCount}`)
   let accessToken = await refreshOutlookToken(acc)
   const maxRetries = Math.floor(timeout / interval)
 
@@ -1048,15 +1049,15 @@ export async function waitForOTP(
           const body = await client.fetchLatestBody(i)
           const code = extractCode(body)
           if (code) {
-            console.log(`[Outlook IMAP] 获取到验证码: ${code}`)
+            console.log('[Outlook IMAP] 已取得验证码')
             return code
           }
         } catch { /* continue */ }
       }
 
       if (attempt % 5 === 0) console.log(`[Outlook IMAP] [${attempt}/${maxRetries}] 新邮件中未找到验证码...`)
-    } catch (err) {
-      if (attempt % 5 === 0) console.log(`[Outlook IMAP] 连接失败:`, err)
+    } catch {
+      if (attempt % 5 === 0) console.log('[Outlook IMAP] 连接失败')
       try { accessToken = await refreshOutlookToken(acc) } catch { /* ignore */ }
     } finally {
       client?.close()
@@ -1085,11 +1086,12 @@ export class ProtonWebviewService implements TempEmailService {
     if (!this.address) {
       throw new Error('Proton 邮箱地址为空')
     }
-    this.log = log || ((m) => console.log(m))
+    const output = log || ((m: string) => console.log(m))
+    this.log = message => output(redactString(message))
   }
 
   async create(): Promise<string> {
-    this.log(`[Proton] 使用邮箱: ${this.address}`)
+    this.log('[Proton] 使用已配置邮箱')
     return this.address
   }
 

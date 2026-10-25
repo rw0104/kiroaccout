@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut, autoUpdater as nativeAutoUpdater } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut, safeStorage, autoUpdater as nativeAutoUpdater } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
 import { join } from 'path'
@@ -34,7 +34,10 @@ import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import { createWindowsKiroInstanceService, KiroInstanceError } from './kiroInstances'
 import { createWindowsKiroRuntime } from './kiroInstanceWindows'
 import { createWindowsKiroInstallationDiscovery } from './kiroInstanceDiscovery'
-import { resolveKiroSettingsPath } from './kiroSettingsPath'
+import { readKiroSettingsDocument, updateKiroSettingsDocument, parseKiroSettingsObject, resolveKiroSettingsTarget, kiroSettingsFailure } from './kiroSettings'
+import { createSteeringFiles, steeringFileFailure } from './steeringFiles'
+import { requireTrustedMainWindow } from './trustedIpc'
+import type { KiroSettingsTarget } from '../shared/kiroSettings'
 import { prepareKiroInstanceAccount, readKiroInstanceAccountUpdate, type InstanceBoundAccount } from './kiroInstanceAccounts'
 import { verifyKiroInstanceIdentity } from './kiroInstanceIdentity'
 import { InstanceAccountOwnership, InstanceOwnershipError, INSTANCE_ACCOUNT_REAUTH_REQUIRED, mergeInstanceOwnedAccounts, mergeInstanceOwnedAccountsForUpdate, mergeInstanceOwnedAccountsForDeletion, type InstanceOwnershipInput } from './kiroInstanceOwnership'
@@ -52,6 +55,8 @@ import { AppUpdateController, UpdatePreparationError, type UpdatePreparationErro
 import { randomUUID } from 'node:crypto'
 import { TokenRefreshService, type AuthRefreshResult } from './authRefresh'
 import { LoginSessionManager } from './loginSessions'
+import { KIRO_LEGACY_IDENTITY } from '../shared/kiroClientCompatibility'
+import { openSecureStore, SecureStoreError } from './secureStore'
 import {
   createTray,
   destroyTray,
@@ -156,7 +161,7 @@ function getNetworkAgent(): Dispatcher | undefined {
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      const agent = safeCreateProxyAgent(proxyUrl)
+      const agent = safeCreateProxyAgent(proxyUrl, { targetCa: kproxyService.getCACertPem() || undefined })
       if (agent) return agent
     }
   }
@@ -734,8 +739,8 @@ function generateInvocationId(): string {
   })
 }
 
-// Kiro 版本和 User-Agent 生成
-const KIRO_VERSION = '0.6.18'
+// Existing account-service compatibility identity; independent of the IDE release.
+const KIRO_VERSION = KIRO_LEGACY_IDENTITY.account
 
 function getKiroUserAgent(machineId?: string): string {
   const suffix = machineId ? `KiroIDE-${KIRO_VERSION}-${machineId}` : `KiroIDE-${KIRO_VERSION}`
@@ -817,7 +822,7 @@ async function ssoDeviceAuth(bearerToken: string, region: string = 'us-east-1'):
     deviceCode = devData.deviceCode
     userCode = devData.userCode
     interval = devData.interval || 1
-    console.log(`[SSO] Device code obtained, user_code: ${userCode}`)
+    console.log('[SSO] Device authorization code obtained')
   } catch (e) {
     return { success: false, error: `设备授权失败: ${e}` }
   }
@@ -1245,7 +1250,7 @@ async function getUserInfo(accessToken: string, idp: string = 'BuilderId', accou
 // 定义自定义协议
 const PROTOCOL_PREFIX = 'kiro'
 
-// electron-store 实例（延迟初始化）
+// OS-protected account/config store, initialized before startup side effects.
 let store: {
   get: (key: string, defaultValue?: unknown) => unknown
   set: (key: string, value: unknown) => void
@@ -1338,36 +1343,8 @@ let lastSavedData: unknown = null
 
 async function initStore(): Promise<void> {
   if (store) return
-  const Store = (await import('electron-store')).default
-  const path = await import('path')
-  
-  const storeInstance = new Store({
-    name: 'kiro-accounts',
-    encryptionKey: 'kiro-account-manager-secret-key'
-  })
-  
-  store = storeInstance as unknown as typeof store
-  
-  // 尝试从备份恢复数据（如果主数据损坏）。备份优先读加密 .enc，兼容旧明文 .json
-  try {
-    const mainData = storeInstance.get('accountData')
-
-    if (!mainData) {
-      try {
-        const { readSecureBackup } = await import('./secureBackup')
-        const backupData = await readSecureBackup(path.dirname(storeInstance.path)) as { accounts?: unknown } | null
-        if (backupData && backupData.accounts) {
-          console.log('[Store] Restoring data from backup...')
-          storeInstance.set('accountData', backupData)
-          console.log('[Store] Data restored from backup successfully')
-        }
-      } catch {
-        // 备份也不存在，忽略
-      }
-    }
-  } catch (error) {
-    console.error('[Store] Error checking backup:', error)
-  }
+  const storeInstance = openSecureStore(app.getPath('userData'), safeStorage)
+  store = storeInstance
 
   // 一次性迁移：清理 BuilderId 占位符 profileArn 等脏数据
   // 详见 migrateAccountDataIfNeeded 注释
@@ -2360,6 +2337,11 @@ function handleProtocolUrl(url: string): void {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(async () => {
+  try { await initStore() } catch (error) {
+    dialog.showErrorBox('账户安全存储不可用', error instanceof SecureStoreError ? error.message : '无法打开账户安全存储。请检查系统钥匙串、文件权限和备份；现有账户文件不会被覆盖。')
+    app.quit()
+    return
+  }
   // 初始化日志系统（尽早拦截，确保所有 console 输出都进入日志存储）
   proxyLogStore.initialize(app.getPath('userData'))
   interceptConsole()
@@ -4946,86 +4928,60 @@ app.whenReady().then(async () => {
   // ============ Kiro 设置管理 IPC ============
 
   // IPC: 获取 Kiro 设置
-  ipcMain.handle('get-kiro-settings', async () => {
+  ipcMain.handle('get-kiro-settings', async (_event, requestedTarget?: KiroSettingsTarget) => {
     try {
+      requireTrustedMainWindow(_event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined)
       const os = await import('os')
       const fs = await import('fs')
       const path = await import('path')
       
-      const homeDir = os.homedir()
-      const kiroSettingsPath = resolveKiroSettingsPath(process.platform, homeDir, process.env)
-      const kiroSteeringPath = path.join(homeDir, '.kiro', 'steering')
+      const selected = await resolveKiroSettingsTarget(requestedTarget, {
+        platform: process.platform, homeDir: os.homedir(), env: process.env,
+        resolveInstance: id => kiroInstanceService.resolveSettingsTarget(id)
+      })
+      const { homeDir, settingsPath: kiroSettingsPath } = selected
+      const target = { type: selected.type, instanceId: selected.instanceId, label: selected.label, settingsPath: kiroSettingsPath }
       const kiroMcpUserPath = path.join(homeDir, '.kiro', 'settings', 'mcp.json')
       
-      let settings = {}
+      const settings = readKiroSettingsDocument(fs.existsSync(kiroSettingsPath) ? fs.readFileSync(kiroSettingsPath, 'utf-8') : '')
       let mcpConfig = { mcpServers: {} }
       let steeringFiles: string[] = []
       
-      // 读取 Kiro settings.json (VS Code 风格 JSON，可能有尾随逗号)
-      if (fs.existsSync(kiroSettingsPath)) {
-        const content = fs.readFileSync(kiroSettingsPath, 'utf-8')
-        // 移除尾随逗号和注释以兼容标准 JSON
-        const cleanedContent = content
-          .replace(/\/\/.*$/gm, '') // 移除单行注释
-          .replace(/\/\*[\s\S]*?\*\//g, '') // 移除多行注释
-          .replace(/,(\s*[}\]])/g, '$1') // 移除尾随逗号
-        const parsed = JSON.parse(cleanedContent)
-        settings = {
-          modelSelection: parsed['kiroAgent.modelSelection'],
-          agentAutonomy: parsed['kiroAgent.agentAutonomy'],
-          enableDebugLogs: parsed['kiroAgent.enableDebugLogs'],
-          enableTabAutocomplete: parsed['kiroAgent.enableTabAutocomplete'],
-          enableCodebaseIndexing: parsed['kiroAgent.enableCodebaseIndexing'],
-          usageSummary: parsed['kiroAgent.usageSummary'],
-          codeReferences: parsed['kiroAgent.codeReferences.referenceTracker'],
-          configureMCP: parsed['kiroAgent.configureMCP'],
-          trustedCommands: parsed['kiroAgent.trustedCommands'] || [],
-          trustedTools: parsed['kiroAgent.trustedTools'] || {},
-          commandDenylist: parsed['kiroAgent.commandDenylist'] || [],
-          ignoreFiles: parsed['kiroAgent.ignoreFiles'] || [],
-          mcpApprovedEnvVars: parsed['kiroAgent.mcpApprovedEnvVars'] || [],
-          notificationsActionRequired: parsed['kiroAgent.notifications.agent.actionRequired'],
-          notificationsFailure: parsed['kiroAgent.notifications.agent.failure'],
-          notificationsSuccess: parsed['kiroAgent.notifications.agent.success'],
-          notificationsBilling: parsed['kiroAgent.notifications.billing']
-        }
-      }
-      
       // 读取 MCP 配置
-      if (fs.existsSync(kiroMcpUserPath)) {
+      if (target.type === 'default' && fs.existsSync(kiroMcpUserPath)) {
         const mcpContent = fs.readFileSync(kiroMcpUserPath, 'utf-8')
-        mcpConfig = JSON.parse(mcpContent)
+        const parsed = parseKiroSettingsObject(mcpContent)
+        mcpConfig = { mcpServers: parsed.mcpServers && typeof parsed.mcpServers === 'object' && !Array.isArray(parsed.mcpServers) ? parsed.mcpServers as Record<string, unknown> : {} }
       }
       
       // 读取 Steering 文件列表
-      if (fs.existsSync(kiroSteeringPath)) {
-        const files = fs.readdirSync(kiroSteeringPath)
-        steeringFiles = files.filter(f => f.endsWith('.md'))
-        console.log('[KiroSettings] Steering path:', kiroSteeringPath)
-        console.log('[KiroSettings] Found steering files:', steeringFiles)
-      } else {
-        console.log('[KiroSettings] Steering path does not exist:', kiroSteeringPath)
-      }
+      if (target.type === 'default') steeringFiles = createSteeringFiles(homeDir).list()
       
-      return { settings, mcpConfig, steeringFiles }
+      return { settings, mcpConfig, steeringFiles, target: { ...target, settingsPath: kiroSettingsPath } }
     } catch (error) {
-      console.error('[KiroSettings] Failed to get settings:', error)
-      return { error: error instanceof Error ? error.message : 'Failed to get settings' }
+      return { error: kiroSettingsFailure(error) }
     }
   })
 
-  // IPC: 获取 Kiro 可用模型列表（使用当前账号调用官方 API）
-  ipcMain.handle('get-kiro-available-models', async () => {
+  // IPC: Model availability follows the selected profile's bound account.
+  ipcMain.handle('get-kiro-available-models', async (_event, requestedTarget?: KiroSettingsTarget) => {
     try {
+      const os = await import('os')
+      const selected = await resolveKiroSettingsTarget(requestedTarget, {
+        platform: process.platform, homeDir: os.homedir(), env: process.env,
+        resolveInstance: id => kiroInstanceService.resolveSettingsTarget(id)
+      })
       if (!store) return { models: [] }
       const accountData = store.get('accountData') as { accounts?: Record<string, any> } | undefined
       if (!accountData?.accounts) return { models: [] }
 
       // 优先使用当前激活账号（isActive），其次使用第一个 active 且有 accessToken 的账号
       const allAccounts = Object.values(accountData.accounts) as any[]
-      const account = allAccounts.find((acc: any) => acc.isActive && acc.credentials?.accessToken)
-        || allAccounts.find((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
-      if (!account) return { models: [] }
+      const account = selected.type === 'instance'
+        ? selected.accountId ? accountData.accounts[selected.accountId] : undefined
+        : allAccounts.find((acc: any) => acc.isActive && acc.credentials?.accessToken)
+          || allAccounts.find((acc: any) => acc.status === 'active' && acc.credentials?.accessToken)
+      if (!account?.credentials?.accessToken) return { models: [], ...(selected.type === 'instance' ? { error: '所选实例没有可用的绑定账户，请在账户管理中重新授权或绑定。' } : {}) }
 
       const proxyAccount = {
         id: account.id,
@@ -5045,54 +5001,26 @@ app.whenReady().then(async () => {
       return {
         models: filterAvailableModels(models).map(toAccountModel)
       }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to fetch models:', error)
-      return { models: [], error: error instanceof Error ? error.message : 'Failed to fetch models' }
+    } catch {
+      return { models: [], error: '无法读取所选账户的模型目录，请检查账户状态后重试。' }
     }
   })
 
   // IPC: 保存 Kiro 设置
-  ipcMain.handle('save-kiro-settings', async (_event, settings: Record<string, unknown>) => {
+  ipcMain.handle('save-kiro-settings', async (_event, settings: Record<string, unknown>, requestedTarget?: KiroSettingsTarget) => {
     try {
       const os = await import('os')
       const fs = await import('fs')
       const path = await import('path')
       
-      const homeDir = os.homedir()
-      const kiroSettingsPath = resolveKiroSettingsPath(process.platform, homeDir, process.env)
-      
-      let existingSettings = {}
-      if (fs.existsSync(kiroSettingsPath)) {
-        const content = fs.readFileSync(kiroSettingsPath, 'utf-8')
-        // 移除尾随逗号和注释以兼容标准 JSON
-        const cleanedContent = content
-          .replace(/\/\/.*$/gm, '') // 移除单行注释
-          .replace(/\/\*[\s\S]*?\*\//g, '') // 移除多行注释
-          .replace(/,(\s*[}\]])/g, '$1') // 移除尾随逗号
-        existingSettings = JSON.parse(cleanedContent)
-      }
-      
-      // 映射设置到 Kiro 的格式
-      const kiroSettings = {
-        ...existingSettings,
-        'kiroAgent.modelSelection': settings.modelSelection,
-        'kiroAgent.agentAutonomy': settings.agentAutonomy,
-        'kiroAgent.enableDebugLogs': settings.enableDebugLogs,
-        'kiroAgent.enableTabAutocomplete': settings.enableTabAutocomplete,
-        'kiroAgent.enableCodebaseIndexing': settings.enableCodebaseIndexing,
-        'kiroAgent.usageSummary': settings.usageSummary,
-        'kiroAgent.codeReferences.referenceTracker': settings.codeReferences,
-        'kiroAgent.configureMCP': settings.configureMCP,
-        'kiroAgent.trustedCommands': settings.trustedCommands,
-        'kiroAgent.trustedTools': settings.trustedTools,
-        'kiroAgent.commandDenylist': settings.commandDenylist,
-        'kiroAgent.ignoreFiles': settings.ignoreFiles,
-        'kiroAgent.mcpApprovedEnvVars': settings.mcpApprovedEnvVars,
-        'kiroAgent.notifications.agent.actionRequired': settings.notificationsActionRequired,
-        'kiroAgent.notifications.agent.failure': settings.notificationsFailure,
-        'kiroAgent.notifications.agent.success': settings.notificationsSuccess,
-        'kiroAgent.notifications.billing': settings.notificationsBilling
-      }
+      const selected = await resolveKiroSettingsTarget(requestedTarget, {
+        platform: process.platform, homeDir: os.homedir(), env: process.env,
+        resolveInstance: id => kiroInstanceService.resolveSettingsTarget(id)
+      })
+      const kiroSettingsPath = selected.settingsPath
+      const content = fs.existsSync(kiroSettingsPath) ? fs.readFileSync(kiroSettingsPath, 'utf-8') : ''
+      const updated = updateKiroSettingsDocument(content, settings)
+      if (updated === content) return { success: true }
       
       // 确保目录存在
       const dir = path.dirname(kiroSettingsPath)
@@ -5100,11 +5028,10 @@ app.whenReady().then(async () => {
         fs.mkdirSync(dir, { recursive: true })
       }
       
-      fs.writeFileSync(kiroSettingsPath, JSON.stringify(kiroSettings, null, 4))
+      fs.writeFileSync(kiroSettingsPath, updated, 'utf-8')
       return { success: true }
     } catch (error) {
-      console.error('[KiroSettings] Failed to save settings:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to save settings' }
+      return { success: false, error: kiroSettingsFailure(error) }
     }
   })
 
@@ -5142,35 +5069,29 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 打开 Kiro Steering 目录
-  ipcMain.handle('open-kiro-steering-folder', async () => {
+  ipcMain.handle('open-kiro-steering-folder', async (_event) => {
     try {
+      requireTrustedMainWindow(_event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined)
       const os = await import('os')
-      const path = await import('path')
-      const fs = await import('fs')
-      const homeDir = os.homedir()
-      const steeringPath = path.join(homeDir, '.kiro', 'steering')
-      
-      // 如果目录不存在，创建它
-      if (!fs.existsSync(steeringPath)) {
-        fs.mkdirSync(steeringPath, { recursive: true })
-      }
-      
-      shell.openPath(steeringPath)
+      const openError = await shell.openPath(createSteeringFiles(os.homedir()).directory())
+      if (openError) return { success: false, error: steeringFileFailure() }
       return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to open steering folder:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to open steering folder' }
+    } catch {
+      return { success: false, error: steeringFileFailure() }
     }
   })
 
   // IPC: 打开 Kiro settings.json 文件
-  ipcMain.handle('open-kiro-settings-file', async () => {
+  ipcMain.handle('open-kiro-settings-file', async (_event, requestedTarget?: KiroSettingsTarget) => {
     try {
       const os = await import('os')
       const path = await import('path')
       const fs = await import('fs')
-      const homeDir = os.homedir()
-      const settingsPath = path.join(homeDir, 'AppData', 'Roaming', 'Kiro', 'User', 'settings.json')
+      const selected = await resolveKiroSettingsTarget(requestedTarget, {
+        platform: process.platform, homeDir: os.homedir(), env: process.env,
+        resolveInstance: id => kiroInstanceService.resolveSettingsTarget(id)
+      })
+      const settingsPath = selected.settingsPath
       
       // 如果文件不存在，创建默认配置
       if (!fs.existsSync(settingsPath)) {
@@ -5178,51 +5099,36 @@ app.whenReady().then(async () => {
         if (!fs.existsSync(dir)) {
           fs.mkdirSync(dir, { recursive: true })
         }
-        const defaultSettings = {
-          'workbench.colorTheme': 'Kiro Light',
-          'kiroAgent.modelSelection': 'claude-haiku-4.5'
-        }
-        fs.writeFileSync(settingsPath, JSON.stringify(defaultSettings, null, 4))
+        fs.writeFileSync(settingsPath, '{}\n', 'utf-8')
       }
       
-      shell.openPath(settingsPath)
+      const openError = await shell.openPath(settingsPath)
+      if (openError) return { success: false, error: '无法打开所选 Kiro 设置文件。' }
       return { success: true }
     } catch (error) {
-      console.error('[KiroSettings] Failed to open settings file:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to open settings file' }
+      return { success: false, error: kiroSettingsFailure(error) }
     }
   })
 
   // IPC: 打开指定的 Steering 文件
   ipcMain.handle('open-kiro-steering-file', async (_event, filename: string) => {
     try {
+      requireTrustedMainWindow(_event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined)
       const os = await import('os')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const filePath = path.join(homeDir, '.kiro', 'steering', filename)
-      
-      shell.openPath(filePath)
+      const openError = await shell.openPath(createSteeringFiles(os.homedir()).path(filename))
+      if (openError) return { success: false, error: steeringFileFailure() }
       return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to open steering file:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to open steering file' }
+    } catch {
+      return { success: false, error: steeringFileFailure() }
     }
   })
 
   // IPC: 创建默认的 rules.md 文件
-  ipcMain.handle('create-kiro-default-rules', async () => {
+  ipcMain.handle('create-kiro-default-rules', async (_event) => {
     try {
+      requireTrustedMainWindow(_event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined)
       const os = await import('os')
-      const fs = await import('fs')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const steeringPath = path.join(homeDir, '.kiro', 'steering')
-      const rulesPath = path.join(steeringPath, 'rules.md')
-      
-      // 确保目录存在
-      if (!fs.existsSync(steeringPath)) {
-        fs.mkdirSync(steeringPath, { recursive: true })
-      }
+      const files = createSteeringFiles(os.homedir())
       
       // 默认规则内容
       const defaultContent = `# Role: 高级软件开发助手
@@ -5279,61 +5185,37 @@ app.whenReady().then(async () => {
 - 如果用户回复'继续' 则请按照最佳实践继续完成任务
 `
       
-      fs.writeFileSync(rulesPath, defaultContent, 'utf-8')
-      console.log('[KiroSettings] Created default rules.md at:', rulesPath)
-      
-      // 打开文件
-      shell.openPath(rulesPath)
+      files.write('rules.md', defaultContent)
+      const openError = await shell.openPath(files.path('rules.md'))
+      if (openError) return { success: false, error: steeringFileFailure() }
       
       return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to create default rules:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to create default rules' }
+    } catch {
+      return { success: false, error: steeringFileFailure() }
     }
   })
 
   // IPC: 读取 Steering 文件内容
   ipcMain.handle('read-kiro-steering-file', async (_event, filename: string) => {
     try {
+      requireTrustedMainWindow(_event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined)
       const os = await import('os')
-      const fs = await import('fs')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const filePath = path.join(homeDir, '.kiro', 'steering', filename)
-      
-      if (!fs.existsSync(filePath)) {
-        return { success: false, error: '文件不存在' }
-      }
-      
-      const content = fs.readFileSync(filePath, 'utf-8')
+      const content = createSteeringFiles(os.homedir()).read(filename)
       return { success: true, content }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to read steering file:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to read file' }
+    } catch {
+      return { success: false, error: steeringFileFailure() }
     }
   })
 
   // IPC: 保存 Steering 文件内容
   ipcMain.handle('save-kiro-steering-file', async (_event, filename: string, content: string) => {
     try {
+      requireTrustedMainWindow(_event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined)
       const os = await import('os')
-      const fs = await import('fs')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const steeringPath = path.join(homeDir, '.kiro', 'steering')
-      const filePath = path.join(steeringPath, filename)
-      
-      // 确保目录存在
-      if (!fs.existsSync(steeringPath)) {
-        fs.mkdirSync(steeringPath, { recursive: true })
-      }
-      
-      fs.writeFileSync(filePath, content, 'utf-8')
-      console.log('[KiroSettings] Saved steering file:', filePath)
+      createSteeringFiles(os.homedir()).write(filename, content)
       return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to save steering file:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to save file' }
+    } catch {
+      return { success: false, error: steeringFileFailure() }
     }
   })
 
@@ -5517,10 +5399,10 @@ app.whenReady().then(async () => {
   // ============ 反代安全 / 可观测 IPC（v1.8 新增） ============
 
   // 获取自签证书信息（PEM、指纹、有效期、SAN）
-  ipcMain.handle('proxy-self-signed-cert-info', () => {
+  ipcMain.handle('proxy-self-signed-cert-info', async () => {
     try {
       if (!proxyServer) return { success: false, error: 'Proxy server not initialized' }
-      const info = proxyServer.getSelfSignedCertInfo()
+      const info = await proxyServer.getSelfSignedCertInfo()
       if (!info) return { success: false, error: 'Failed to get self-signed cert info' }
       return { success: true, ...info }
     } catch (err) {
@@ -5529,10 +5411,10 @@ app.whenReady().then(async () => {
   })
 
   // 重新生成自签证书（用户主动触发）
-  ipcMain.handle('proxy-self-signed-cert-regenerate', () => {
+  ipcMain.handle('proxy-self-signed-cert-regenerate', async () => {
     try {
       if (!proxyServer) return { success: false, error: 'Proxy server not initialized' }
-      const info = proxyServer.regenerateSelfSignedCert()
+      const info = await proxyServer.regenerateSelfSignedCert()
       if (!info) return { success: false, error: 'Failed to regenerate self-signed cert' }
       return { success: true, ...info }
     } catch (err) {
@@ -6427,22 +6309,12 @@ app.whenReady().then(async () => {
   // IPC: 删除 Steering 文件
   ipcMain.handle('delete-kiro-steering-file', async (_event, filename: string) => {
     try {
+      requireTrustedMainWindow(_event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined)
       const os = await import('os')
-      const fs = await import('fs')
-      const path = await import('path')
-      const homeDir = os.homedir()
-      const filePath = path.join(homeDir, '.kiro', 'steering', filename)
-      
-      if (!fs.existsSync(filePath)) {
-        return { success: false, error: '文件不存在' }
-      }
-      
-      fs.unlinkSync(filePath)
-      console.log('[KiroSettings] Deleted steering file:', filePath)
+      createSteeringFiles(os.homedir()).delete(filename)
       return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to delete steering file:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to delete file' }
+    } catch {
+      return { success: false, error: steeringFileFailure() }
     }
   })
 

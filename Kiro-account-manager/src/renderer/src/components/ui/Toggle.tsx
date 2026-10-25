@@ -1,13 +1,16 @@
 import { cn } from '../../lib/utils'
 
 interface ToggleProps {
+  id?: string
+  'aria-label'?: string
+  'aria-describedby'?: string
   checked: boolean
   onChange: (checked: boolean) => void
   disabled?: boolean
   size?: 'sm' | 'md'
 }
 
-export function Toggle({ checked, onChange, disabled = false, size = 'md' }: ToggleProps) {
+export function Toggle({ checked, onChange, disabled = false, size = 'md', id, 'aria-label': ariaLabel, 'aria-describedby': ariaDescribedBy }: ToggleProps) {
   const sizes = {
     sm: { track: 'w-8 h-4', thumb: 'w-3 h-3', translate: 'translate-x-4' },
     md: { track: 'w-11 h-6', thumb: 'w-5 h-5', translate: 'translate-x-5' }
@@ -17,7 +20,10 @@ export function Toggle({ checked, onChange, disabled = false, size = 'md' }: Tog
 
   return (
     <button
+      id={id}
       type="button"
+      aria-label={ariaLabel}
+      aria-describedby={ariaDescribedBy}
       role="switch"
       aria-checked={checked}
       disabled={disabled}

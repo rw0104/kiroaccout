@@ -31,12 +31,19 @@ assert.ok(!entries.some(entry => /(^|\/)(\.env(?:\.[^/]*)?|\.kiro|\.local|\.git|
 assert.ok(!entries.some(entry => /author-avatar|支付宝支付|微信支付|交流群/.test(entry)), 'Old promotional resources must not be packaged')
 assert.ok(!entries.some(entry => /^resources\/tls-client-/.test(entry)), 'TLS libraries must be staged separately for the target platform')
 for (const entry of ['out/main/index.js', 'out/preload/index.js', 'out/renderer/index.html',
-  'node_modules/electron-store/package.json', 'node_modules/undici/package.json',
+  'node_modules/undici/package.json',
+  'node_modules/jsonc-parser/package.json', 'node_modules/jsonc-parser/lib/umd/main.js',
+  'node_modules/@peculiar/x509/package.json', 'node_modules/reflect-metadata/package.json',
   'node_modules/tlsclientwrapper/package.json', 'node_modules/tlsclientwrapper/dist/utils/worker.cjs',
   'node_modules/piscina/package.json', 'node_modules/koffi/package.json']) {
   assert.ok(entries.includes(entry), `Required application entry missing: ${entry}`)
 }
-const koffiPath = `node_modules/koffi/build/koffi/${platform}_${arch}/koffi.node`
+assert.ok(!entries.some(entry => /^node_modules\/(?:node-forge|electron-store)\//.test(entry)), 'Obsolete security-sensitive dependencies must not be packaged')
+const koffiPath = [
+  `node_modules/@koromix/koffi-${platform}-${arch}/${platform}_${arch}/koffi.node`,
+  `node_modules/koffi/build/koffi/${platform}_${arch}/koffi.node`
+].find(entry => entries.includes(entry))
+assert.ok(koffiPath, 'Target Koffi Node-API prebuild is missing')
 const cborPrefix = `node_modules/@cbor-extract/cbor-extract-${platform}-${arch}/`
 const cborPath = entries.find(entry => entry.startsWith(cborPrefix) && /\/node\.napi(?:\.glibc)?\.node$/.test(entry))
 assert.ok(cborPath, 'Target CBOR Node-API prebuild is missing')

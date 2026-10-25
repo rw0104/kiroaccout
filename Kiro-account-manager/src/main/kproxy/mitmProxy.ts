@@ -168,7 +168,7 @@ export class MitmProxy {
 
     if (shouldMitm) {
       this.stats.mitmRequests++
-      this.handleMitmConnect(hostname, port, clientSocket, head)
+      void this.handleMitmConnect(hostname, port, clientSocket, head)
     } else {
       this.stats.bypassRequests++
       this.handleDirectConnect(hostname, port, clientSocket, head)
@@ -223,15 +223,17 @@ export class MitmProxy {
   /**
    * MITM 拦截连接
    */
-  private handleMitmConnect(
+  private async handleMitmConnect(
     hostname: string, 
     port: number, 
     clientSocket: net.Socket, 
     _head: Buffer
-  ): void {
+  ): Promise<void> {
     try {
+      clientSocket.once('error', () => clientSocket.destroy())
       // 为目标域名生成证书
-      const { cert, key } = this.certManager.generateCertForHost(hostname)
+      const { cert, key } = await this.certManager.generateCertForHost(hostname)
+      if (clientSocket.destroyed || !this.server) return
 
       // 创建 TLS 连接选项
       const tlsOptions = {

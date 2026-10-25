@@ -22,6 +22,13 @@ const SENSITIVE_KEYS = [
   'proxyauthorization', 'proxy-authorization'
 ]
 
+const PRIVATE_KEYS = new Set([
+  'otp', 'otpcode', 'verificationcode', 'verifycode', 'confirmationcode',
+  'authorizationcode', 'authcode', 'devicecode', 'usercode', 'securitycode',
+  'email', 'emailaddress', 'mailaddress', 'recipient', 'recipientemail'
+])
+const CODE_LABEL_AT_END = /(?:\botp(?:[_ -]?code)?|\bverification[_ -]?code|\bdevice[_ -]?code|\buser[_ -]?code|验证码|设备授权码|授权码)\s*[:=：]\s*(?:%[sdio])?\s*$/i
+
 /** 白名单：这些键虽然包含敏感子串但本身是安全的计量/统计字段 */
 const SAFE_KEYS = new Set([
   'inputtokens', 'outputtokens', 'cachetokens',
@@ -58,6 +65,17 @@ export function redactString(input: string): string {
   out = out.replace(/("?(?:access_?token|refresh_?token|id_?token|password|api_?key|client_?secret|secret|epin)"?\s*[:=]\s*"?)([^",}\s]+)("?)/gi,
     (_m, prefix, val, suffix) => `${prefix}${maskMiddle(String(val))}${suffix}`)
 
+  // Short-lived credentials must be completely hidden, including serialized fields.
+  out = out.replace(/(["']?(?:otp(?:[_ -]?code)?|verification[_ -]?code|verify[_ -]?code|confirmation[_ -]?code|authorization[_ -]?code|auth[_ -]?code|device[_ -]?code|user[_ -]?code|security[_ -]?code|验证码|设备授权码|授权码)["']?\s*(?:[:=：]\s*|\bis\s+)["']?)([^\s"',;，。)}]+)/gi,
+    (_match, prefix) => `${prefix}***`)
+  out = out.replace(/(["']code["']\s*:\s*["'])([^"']+)(["'])/gi,
+    (_match, prefix, _value, suffix) => `${prefix}***${suffix}`)
+  out = out.replace(/(\bcode["']?\s*[:=]\s*)\d{4,}\b/gi, '$1***')
+  // Email addresses are private even when present in prose or exception text.
+  if (out.includes('@')) {
+    out = out.replace(/(^|[^A-Z0-9.!#$%&'*+/=?^_`{|}~-])[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9](?:[A-Z0-9.-]*[A-Z0-9])?/gi, '$1[email]')
+  }
+
   return out
 }
 
@@ -81,8 +99,17 @@ export function redactValue(value: unknown, maxDepth = 6, seen = new WeakSet<obj
     if (seen.has(value as object)) return '[circular]'
     seen.add(value as object)
     const out: Record<string, unknown> = {}
+    const record = value as Record<string, unknown>
+    const messageHasCode = typeof record.message === 'string' && CODE_LABEL_AT_END.test(record.message)
     for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-      if (isSensitiveKey(k)) {
+      const key = k.toLowerCase().replace(/[_ -]/g, '')
+      if (key === 'data' && messageHasCode && (typeof v === 'string' || typeof v === 'number')) {
+        out[k] = '***'
+      } else if (key === 'data' && messageHasCode && Array.isArray(v) && (typeof v[0] === 'string' || typeof v[0] === 'number')) {
+        out[k] = ['***', ...v.slice(1).map(item => redactValue(item, maxDepth - 1, seen))]
+      } else if (PRIVATE_KEYS.has(key) || (key === 'code' && !(typeof v === 'number' && v >= 100 && v <= 599))) {
+        out[k] = '***'
+      } else if (isSensitiveKey(k)) {
         out[k] = typeof v === 'string' ? maskMiddle(v) : '***'
       } else {
         out[k] = redactValue(v, maxDepth - 1, seen)

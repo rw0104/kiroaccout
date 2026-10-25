@@ -3,6 +3,8 @@
 
 import { ProxyAgent, Agent, type Dispatcher } from 'undici'
 import * as tls from 'tls'
+import { isIP } from 'net'
+import { SocksClient } from 'socks'
 
 let _cachedSystemProxy: string | null = null
 let _systemProxyCacheTime = 0
@@ -131,8 +133,15 @@ export function getSystemProxy(): string | null {
  * URL 无效或协议无法支持时返回 undefined，让调用方回退直连，
  * 而不会让异常向上传播阻塞业务流程。
  */
+export interface ProxyTrustOptions {
+  // Only the explicitly selected K-Proxy dispatcher receives its local CA.
+  // Certificate chains and the original target hostname are always verified.
+  targetCa?: string
+}
+
 export function safeCreateProxyAgent(
-  proxyUrl: string | null | undefined
+  proxyUrl: string | null | undefined,
+  trust: ProxyTrustOptions = {}
 ): Dispatcher | undefined {
   if (!proxyUrl) return undefined
 
@@ -150,7 +159,14 @@ export function safeCreateProxyAgent(
   // http / https 走原生 ProxyAgent
   if (protocol === 'http:' || protocol === 'https:') {
     try {
-      return new ProxyAgent({ uri: proxyUrl, requestTls: { rejectUnauthorized: false } })
+      return new ProxyAgent({
+        uri: proxyUrl,
+        requestTls: {
+          rejectUnauthorized: true,
+          ...(trust.targetCa ? { ca: [...tls.rootCertificates, trust.targetCa] } : {})
+        },
+        proxyTls: { rejectUnauthorized: true }
+      })
     } catch (err) {
       console.warn(`[Proxy] 创建 HTTP ProxyAgent 失败，回退直连: ${proxyUrl}`, err)
       return undefined
@@ -160,7 +176,7 @@ export function safeCreateProxyAgent(
   // SOCKS 走自定义 connect
   if (protocol === 'socks5:' || protocol === 'socks5h:' || protocol === 'socks4:' || protocol === 'socks4a:') {
     try {
-      return createSocksDispatcher(u)
+      return createSocksDispatcher(u, trust)
     } catch (err) {
       console.warn(`[Proxy] 创建 SOCKS Agent 失败，回退直连: ${proxyUrl}`, err)
       return undefined
@@ -175,7 +191,7 @@ export function safeCreateProxyAgent(
  * 通过 undici Agent 的 connect 钩子实现 SOCKS5/4 隧道
  * 流程：socks.createConnection 建立 TCP 隧道 → 如目标是 https 再 TLS 升级 → 把 socket 交给 undici
  */
-function createSocksDispatcher(u: URL): Agent {
+function createSocksDispatcher(u: URL, trust: ProxyTrustOptions): Agent {
   const isSocks5 = u.protocol === 'socks5:' || u.protocol === 'socks5h:'
   const type: 4 | 5 = isSocks5 ? 5 : 4
   const proxyHost = u.hostname
@@ -191,15 +207,6 @@ function createSocksDispatcher(u: URL): Agent {
       const targetHost = options.hostname || options.host || ''
       const targetPort = Number(options.port) || (options.protocol === 'https:' ? 443 : 80)
 
-      // 动态导入 socks 库
-      let SocksClient: typeof import('socks').SocksClient
-      try {
-        SocksClient = require('socks').SocksClient
-      } catch (err) {
-        callback(err as Error, null)
-        return
-      }
-
       void SocksClient.createConnection({
         proxy: { host: proxyHost, port: proxyPort, type, userId, password },
         command: 'connect',
@@ -208,13 +215,23 @@ function createSocksDispatcher(u: URL): Agent {
         .then(({ socket }) => {
           // HTTPS 需要 TLS 升级
           if (options.protocol === 'https:') {
+            let settled = false
+            const finish = (error: Error | null): void => {
+              if (settled) return
+              settled = true
+              if (error) callback(error, null)
+              else callback(null, tlsSocket)
+            }
             const tlsSocket = tls.connect({
               socket,
-              servername: options.servername || targetHost,
-              rejectUnauthorized: options.rejectUnauthorized ?? false
+              servername: isIP(targetHost) ? undefined : targetHost,
+              rejectUnauthorized: true,
+              ...(trust.targetCa ? { ca: [...tls.rootCertificates, trust.targetCa] } : {}),
+              // With an existing SOCKS socket Node cannot infer the original host.
+              checkServerIdentity: (_hostname, cert) => tls.checkServerIdentity(targetHost, cert)
             })
-            tlsSocket.once('secureConnect', () => callback(null, tlsSocket))
-            tlsSocket.once('error', (err) => callback(err, null))
+            tlsSocket.once('secureConnect', () => finish(null))
+            tlsSocket.once('error', finish)
           } else {
             callback(null, socket)
           }

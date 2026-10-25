@@ -9,6 +9,7 @@ import {
   normalizeSubscriptionType,
   normalizeAccountSubscription
 } from '../../src/shared/accountSubscription.ts'
+import { mergeSourceAccountNames } from '../../src/shared/accountSearch.ts'
 
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
@@ -244,6 +245,7 @@ function dialogHarness(component, api, account) {
         return { useTranslation: () => ({ t: () => 'Unknown' }) }
       if (name.includes('shared/accountImport'))
         return { parseAccountImportText: () => ({ ok: false }) }
+      if (name.includes('shared/accountSearch')) return { mergeSourceAccountNames }
       return {}
     }
   })

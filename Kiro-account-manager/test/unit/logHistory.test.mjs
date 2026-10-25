@@ -26,7 +26,8 @@ function fixture({ file = null, fileSize, hold = false, archiveFails = false, re
       writes.push({ path: _path, data, resolve }); return promise
     } }
   }
-  const console = { log() {}, warn() {}, error() {} }
+  const consoleOutput = []
+  const console = Object.fromEntries(['log', 'warn', 'error'].map(level => [level, (...args) => consoleOutput.push({ level, args })]))
   const context = vm.createContext({ exports: {}, Buffer, console, queueMicrotask, crypto: globalThis.crypto,
     setTimeout(callback) { const id = ++timer; timers.set(id, callback); return id }, clearTimeout: id => timers.delete(id),
     require(name) {
@@ -40,9 +41,52 @@ function fixture({ file = null, fileSize, hold = false, archiveFails = false, re
   vm.runInContext(compiled, context)
   const store = context.exports.proxyLogStore
   store.initialize('SYNTHETIC_ONLY')
-  return { store, logger: context.exports.proxyLogger, intercept: context.exports.interceptConsole, console, timers, writes, streams, archived, get reads() { return reads } }
+  return { store, logger: context.exports.proxyLogger, intercept: context.exports.interceptConsole, console, consoleOutput, timers, writes, streams, archived, get reads() { return reads } }
 }
 const entry = (data, index = 0) => ({ timestamp: '2026-10-23T00:00:00.000Z', level: 'INFO', category: 'Synthetic', message: `event ${index}`, data })
+
+test('audit OTP and device-code examples are removed before the original console and historical log readers see them', async () => {
+  const samples = ['验证码: 135790', '提取到验证码: 135790', 'Device code obtained, user_code: SYNTHETIC-CODE']
+  const h = fixture({ file: JSON.stringify(samples.map(message => ({ ...entry({}), message }))) })
+  h.intercept()
+  for (const level of ['log', 'warn', 'error']) {
+    for (const message of samples) h.console[level](message, { otp: '135790', deviceCode: 'SYNTHETIC-CODE', user_code: 'SYNTHETIC-CODE', email: 'synthetic@example.invalid' })
+  }
+  await h.store.flushSaveNow()
+  for (const output of [h.consoleOutput, h.store.getAll(), h.writes]) {
+    assert.equal(/135790|SYNTHETIC-CODE|synthetic@example\.invalid/.test(JSON.stringify(output)), false, 'sensitive values must not reach a log sink')
+  }
+  assert.equal(h.store.count(), 12, 'console interception must not recurse or duplicate entries')
+})
+
+test('redaction masks whole code fields and common code messages while preserving diagnostic counters', () => {
+  const value = redactValue({ code: '123456', verificationCode: 123456, otp: '123456', userCode: 'ABCD-EFGH', device_code: 'DEVICE-VALUE', email: 'synthetic@example.invalid', status: 200, statusCode: 503, inputTokens: 42, attempts: 3 })
+  assert.equal(/123456|ABCD-EFGH|DEVICE-VALUE|synthetic@example\.invalid/.test(JSON.stringify(value)), false, 'codes and email addresses are fully masked')
+  assert.equal(value.status, 200); assert.equal(value.statusCode, 503); assert.equal(value.inputTokens, 42); assert.equal(value.attempts, 3)
+  assert.equal(redactValue({ code: 200 }).code, 200)
+  for (const message of ['OTP: 123456', 'verification code is 123456', '设备授权码：ABCD-EFGH', '验证码: 123456', 'email=synthetic@example.invalid', '{"code":123456}', 'code=123456']) {
+    assert.equal(/123456|ABCD-EFGH|synthetic@example\.invalid/.test(redactString(message)), false, 'common message template must be redacted')
+  }
+  assert.equal(redactString('statusCode=503, code=200, attempts=3'), 'statusCode=503, code=200, attempts=3')
+})
+
+test('separate console format arguments and old structured history receive contextual code redaction', () => {
+  const h = fixture({ file: JSON.stringify([{ ...entry('135790'), message: '验证码:' }]) }); h.intercept()
+  h.console.log('[Synthetic] OTP: %s', '135790', { attempts: 3 })
+  h.console.warn('[Synthetic] user_code:', 'SYNTHETIC-CODE')
+  assert.equal(/135790|SYNTHETIC-CODE/.test(JSON.stringify([h.store.getAll(), h.consoleOutput])), false)
+  assert.equal(h.store.getAll()[1].data[1].attempts, 3)
+})
+
+test('logger console forwarding and a logging observer cannot cause recursive interception', () => {
+  const h = fixture(); h.intercept()
+  h.store.onLog(() => h.console.log('[Observer] nested'))
+  h.console.log('[Synthetic] single entry')
+  assert.equal(h.store.count(), 1)
+  h.logger.info('Synthetic', '验证码: 135790', { userCode: 'SYNTHETIC-CODE' })
+  assert.equal(/135790|SYNTHETIC-CODE/.test(JSON.stringify(h.consoleOutput)), false)
+  assert.ok(h.store.count() <= 3)
+})
 
 test('actual console capture snapshots and redacts data without retaining mutable original objects', () => {
   const h = fixture(); h.intercept()

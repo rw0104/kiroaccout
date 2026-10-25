@@ -187,6 +187,23 @@ export class KiroInstanceService {
     if (record.schemaVersion !== 2) return failInstance('旧版 Windows 用户配置不能用于当前多开，请移除配置后重新创建。')
     return record as KiroInstanceRecord
   }
+  /** Read-only profile lookup for settings IPC; never inspects or mutates processes. */
+  async resolveSettingsTarget(id: string): Promise<{ label: string; homeDir: string; settingsPath: string; accountId?: string }> {
+    this.assertWindows()
+    const record = await this.record(id)
+    await this.verifyPaths(record)
+    await checkInstanceDirectory(this.io, win32.join(record.paths.userData, 'User'), false)
+    const settingsPath = win32.join(record.paths.userData, 'User', 'settings.json')
+    try {
+      const stat = await this.io.lstat(settingsPath)
+      if (stat.isSymbolicLink() || stat.isDirectory() || !equalWindowsPath(canonicalWindowsPath(await this.io.realpath(settingsPath)), settingsPath)) {
+        failInstance('实例设置文件被重定向，已阻止操作。')
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+    }
+    return { label: record.label, homeDir: record.paths.home, settingsPath, ...(record.accountId ? { accountId: record.accountId } : {}) }
+  }
   private async remember(record: KiroInstanceRecord, processes: KiroProcessIdentity[], expectedEpoch?: number): Promise<void> {
     if (expectedEpoch !== undefined && expectedEpoch !== (this.epochs.get(record.id) ?? 0)) return
     if (JSON.stringify(record.lastProcesses) === JSON.stringify(processes)) return

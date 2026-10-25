@@ -111,6 +111,37 @@ test('two profiles share one executable but get disjoint configuration and crede
   assert.equal(h.records.length, 2)
 })
 
+test('settings profile resolution validates registered roots without launching, inspecting processes or changing records', async () => {
+  const h = harness(), record = await h.create()
+  const initialRecords = structuredClone(h.records)
+  const writes = h.files.writes.length
+  h.runtime.inspectProcesses = async () => { throw new Error('settings lookup must not inspect processes') }
+  assert.deepEqual(await h.service.resolveSettingsTarget(record.id), {
+    label: record.label, homeDir: record.paths.home,
+    settingsPath: win32.join(record.paths.userData, 'User', 'settings.json')
+  })
+  assert.deepEqual(h.records, initialRecords)
+  assert.equal(h.files.writes.length, writes)
+  assert.equal(h.launchCount, 0)
+  await assert.rejects(h.service.resolveSettingsTarget('00000000-0000-4000-8000-000000000099'), /不存在/)
+})
+
+test('settings profile resolution rejects redirected User directories, files and tampered registry paths', async () => {
+  for (const kind of ['directory-link', 'file-link', 'file-redirect', 'registry']) {
+    const h = harness(), record = await h.create()
+    const user = win32.join(record.paths.userData, 'User')
+    const settings = win32.join(user, 'settings.json')
+    if (kind === 'directory-link') h.files.entries.set(key(user), { directory: true, symbolic: true })
+    if (kind === 'file-link') h.files.entries.set(key(settings), { directory: false, symbolic: true })
+    if (kind === 'file-redirect') h.files.entries.set(key(settings), { directory: false, target: 'C:\\Synthetic\\outside\\settings.json' })
+    if (kind === 'registry') h.setRecords([{ ...record, paths: { ...record.paths, userData: 'C:\\Synthetic\\outside' } }])
+    const writes = h.files.writes.length
+    await assert.rejects(h.service.resolveSettingsTarget(record.id), KiroInstanceError)
+    assert.equal(h.files.writes.length, writes)
+    assert.equal(h.launchCount, 0)
+  }
+})
+
 test('explicit account bindings persist through service recreation and remain unique under concurrent creates', async () => {
   const h = harness()
   const inputs = { label: 'Bound synthetic account', executablePath, accountId: 'synthetic-account-one' }

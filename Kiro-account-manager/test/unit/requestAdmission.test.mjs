@@ -77,7 +77,7 @@ function harness(waitMs = 30000) {
   const text = readFileSync(new URL('../../src/main/proxy/proxyServer.ts', import.meta.url), 'utf8')
   const source = ts.createSourceFile('server.ts', text, ts.ScriptTarget.Latest, true)
   const declaration = source.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === 'ProxyServer')
-  const methods = ['handleRequest', 'readBody', 'getAbortError', 'isAbortError', 'stop', 'updateConfig', 'sendError', 'isAnthropicPath', 'getAnthropicErrorType', 'sanitizeErrorMessage']
+  const methods = ['handleRequest', 'handleAdminApi', 'readBody', 'getAbortError', 'isAbortError', 'stop', 'updateConfig', 'sendError', 'isAnthropicPath', 'getAnthropicErrorType', 'sanitizeErrorMessage']
   const members = declaration.members.filter(node => methods.includes(node.name?.getText(source))).map(node => node.getText(source)).join('\n')
   const context = vm.createContext({ Buffer, AbortController, RequestAdmission, RequestAdmissionError, requiresRequestAdmission,
     console: { log() {}, error() {} }, proxyLogger: { info() {}, warn() {} }, setTimeout, clearTimeout, clearInterval,
@@ -100,7 +100,6 @@ function harness(waitMs = 30000) {
   server.handleClaudeMessages = server.handleOpenAIChat
   server.handleModels = async res => { res.writeHead(200); res.end('models') }
   server.handleHealth = res => { res.writeHead(200); res.end('healthy') }
-  server.handleAdminApi = async (_req, res) => { res.writeHead(200); res.end('admin') }
   server.clearModelCache = () => {}; server.server = { close(callback) { setImmediate(callback) } }; server.fallbackServer = null
   server.isRunning = () => true
   server.sockets = new Set(); server.cleanupTimer = null
@@ -144,7 +143,7 @@ test('queue cancellation, parser errors and stop release actual handler permits 
   assert.equal(waiting.req.listenerCount('data'), 0)
 })
 
-test('queue full and wait timeout return formatted 503 and Retry-After; health, models and admin bypass the queue', { timeout: 3000 }, async () => {
+test('queue pressure preserves health/models access and rejects HTTP admin without waiting', { timeout: 3000 }, async () => {
   const { request, server, entered } = harness(20)
   const first = request('first')
   const pending = Array.from({ length: 4 }, (_, i) => request(`queued-${i}`))
@@ -157,7 +156,8 @@ test('queue full and wait timeout return formatted 503 and Retry-After; health, 
   assert.equal(rejected.res.headers['retry-after'], '1')
   assert.equal(JSON.parse(rejected.res.output).type, 'error')
   assert.equal(rejected.req.listenerCount('data'), 0)
-  assert.ok([health, models, admin].every(item => item.res.status === 200))
+  assert.ok([health, models].every(item => item.res.status === 200))
+  assert.equal(admin.res.status, 403)
   await Promise.all(pending.map(item => item.pending))
   assert.ok(pending.every(item => item.res.status === 503 && item.res.headers['retry-after'] === '1'))
   assert.deepEqual(entered, ['first'])

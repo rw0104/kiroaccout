@@ -14,6 +14,7 @@
 // WARN: 标注「Proton DOM 依赖点」的选择器随 Proton 改版可能失效，届时只需更新本文件。
 
 import { BrowserWindow, session, type Session } from 'electron'
+import { redactString } from '../utils/redact'
 
 const PARTITION = 'persist:proton'
 // 真实 Chrome UA，去掉 Electron 标识，降低被 Proton 风控/拒绝的概率
@@ -47,7 +48,7 @@ function resolveSettingsProxy(explicit?: string): string {
 function applyProxy(sess: Session, proxy?: string): Promise<void> {
   const resolved = resolveSettingsProxy(proxy)
   if (resolved) {
-    console.log(`[Proton] 走设置代理: ${resolved.replace(/:[^:@/]+@/, ':***@')}`)
+    console.log('[Proton] 使用设置代理')
     return sess.setProxy({ proxyRules: resolved })
   }
   // 设置里未配代理 → 跟随系统代理（Proton 在受限网络下通常需要代理才能访问）
@@ -333,7 +334,8 @@ export function waitProtonOtp(address: string, opts: WaitProtonOtpOptions): Prom
 }
 
 async function runWaitProtonOtp(address: string, opts: WaitProtonOtpOptions): Promise<string> {
-  const log = opts.log ?? ((): void => {})
+  const output = opts.log ?? ((): void => {})
+  const log = (message: string): void => output(redactString(message))
   const w = await ensureWindow(false, opts.proxy)
 
   if (!(await checkLoggedIn(w))) {
@@ -363,17 +365,17 @@ async function runWaitProtonOtp(address: string, opts: WaitProtonOtpOptions): Pr
       const res = (await w.webContents.executeJavaScript(script, true)) as ScanResult
       if (res && res.code && res.from === 'body') {
         // 收件人精确匹配当前注册地址（或收件人读不到时正文去点匹配）+ 读到 6 位码 → 当前邮件的验证码
-        log(`[Proton] 验证码: ${res.code} (${res.matched ? '收件人精确匹配' : '正文去点兜底匹配'})`)
+        log(`[Proton] 已取得验证码 (${res.matched ? '收件人精确匹配' : '正文去点兜底匹配'})`)
         return res.code
       } else if (res && res.from === 'wrong-recipient') {
-        if (attempt % 8 === 0) log(`[Proton] 最新邮件收件人非当前地址，等待当前验证码... ${res.snippet || ''}`)
+        if (attempt % 8 === 0) log('[Proton] 最新邮件收件人非当前地址，等待当前验证码...')
       } else if (res && res.from === 'body-nocode') {
-        if (attempt % 8 === 0) log(`[Proton] ${res.matched ? '已打开当前邮件但未提取到码' : '暂无匹配邮件'}: ${res.snippet || ''}`)
+        if (attempt % 8 === 0) log(`[Proton] ${res.matched ? '已打开当前邮件但未提取到码' : '暂无匹配邮件'}`)
       } else if (res && res.from === 'error') {
-        if (attempt % 10 === 0) log(`[Proton] 取码脚本异常: ${res.err}`)
+        if (attempt % 10 === 0) log('[Proton] 取码脚本异常')
       }
-    } catch (err) {
-      if (attempt % 10 === 0) log(`[Proton] [${attempt}/${maxRetries}] 读取失败: ${err}`)
+    } catch {
+      if (attempt % 10 === 0) log(`[Proton] [${attempt}/${maxRetries}] 读取失败`)
     }
 
     if (attempt % 10 === 0) log(`[Proton] [${attempt}/${maxRetries}] 暂无验证码...`)

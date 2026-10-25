@@ -158,7 +158,7 @@ export class Registrar {
       if (this.cfg.strictProxy) {
         throw new Error(`[ProxyChain] 启用失败，严格代理模式已中止: ${msg}`)
       }
-      this.log(`[ProxyChain] 启用失败，回退为直接使用目标代理: ${msg}`)
+      this.log('[ProxyChain] 启用失败，回退为直接使用目标代理')
     }
   }
 
@@ -194,8 +194,8 @@ export class Registrar {
           return // 成功，退出
         }
         this.log(`[IP] 出口 IP 检测失败: HTTP ${resp.status}`)
-      } catch (err) {
-        this.log(`[IP] 出口 IP 检测失败: ${err instanceof Error ? err.message : String(err)}`)
+      } catch {
+        this.log('[IP] 出口 IP 检测失败')
       }
 
       // 失败后尝试换 session 重建代理链
@@ -272,7 +272,7 @@ export class Registrar {
       // 配合 sendRequest 的 3 次重试，单步最坏 ~75s（旧值 60s 会到 ~180s，是批量卡 1-5 分钟主因）
       timeoutSeconds: 25,
       followRedirects: true,
-      insecureSkipVerify: true,
+      insecureSkipVerify: false,
       // 多线程隔离：固定 sessionId 隔离 DLL 层面共享的 TLS session cache
       // 整个 Registrar 生命周期内用同一个 ID，避免 rebuildTlsClient 产生僵尸 session
       sessionId: this.tlsSessionId,
@@ -345,8 +345,8 @@ export class Registrar {
       try {
         fs.copyFileSync(resourcePath, finalPath)
         return { existingPath: finalPath, downloadDir: tlsClientDir }
-      } catch (err) {
-        this.log('[TLS] Failed to copy from resources: ' + (err as Error).message)
+      } catch {
+        this.log('[TLS] Failed to copy from resources')
       }
     }
 
@@ -357,8 +357,8 @@ export class Registrar {
       try {
         fs.copyFileSync(tmpPath, finalPath)
         return { existingPath: finalPath, downloadDir: tlsClientDir }
-      } catch (err) {
-        this.log('[TLS] Migration failed, will use tmpdir as fallback: ' + (err as Error).message)
+      } catch {
+        this.log('[TLS] Migration failed, will use tmpdir as fallback')
         return { existingPath: tmpPath, downloadDir: tlsClientDir }
       }
     }
@@ -549,8 +549,8 @@ export class Registrar {
               await this.refreshProxySession()
               await this.rebuildTlsClient()
               sessionRefreshed = true
-            } catch (e) {
-              this.log(`[Net] 换 session 失败，回退普通重建: ${e instanceof Error ? e.message : String(e)}`)
+            } catch {
+              this.log('[Net] 换 session 失败，回退普通重建')
               await this.rebuildTlsClient()
             }
           } else {
@@ -564,7 +564,7 @@ export class Registrar {
       } catch (err: unknown) {
         lastErr = err
         if (attempt < maxAttempts && this.isRecoverableTlsClientError(err)) {
-          this.log(`[TLS] ${method} 可恢复错误：${err instanceof Error ? err.message : String(err)}，重建 TLS 退避重试 ${attempt}/${maxAttempts - 1}`)
+          this.log(`[TLS] ${method} 可恢复错误，重建 TLS 退避重试 ${attempt}/${maxAttempts - 1}`)
           await this.rebuildTlsClient()
           await this.abortableSleep(this.netBackoffMs(attempt))
           continue
@@ -648,7 +648,7 @@ export class Registrar {
             } catch { /* 换 session 失败则继续普通重试 */ }
           }
           const wait = 1500 * i + Math.floor(Math.random() * 800)
-          this.log(`[${name}] 第 ${i}/${attempts} 次失败：${(err as Error).message}，${wait}ms 后重试`)
+          this.log(`[${name}] 第 ${i}/${attempts} 次失败，${wait}ms 后重试`)
           await this.abortableSleep(wait)
         }
       }
@@ -826,7 +826,7 @@ export class Registrar {
     const data = this.parseBody(resp.body)
     this.deviceCode = (data.deviceCode as string) || ''
     this.userCode = (data.userCode as string) || ''
-    this.log(`user_code=${this.userCode}`)
+    this.log('设备授权码已就绪')
   }
 
   private async step3Email(): Promise<void> {
@@ -843,7 +843,7 @@ export class Registrar {
         : accounts[Math.floor(Math.random() * accounts.length)]
       this.email = acc.email
       this.emitStep('email-created')
-      this.log(`email=${this.email}`)
+      this.log('注册邮箱已就绪')
       return
     }
 
@@ -858,7 +858,7 @@ export class Registrar {
       this.email = await this.emailSvc.create()
       if (!this.email) throw new Error('生成邮箱地址失败')
       this.emitStep('email-created')
-      this.log(`email=${this.email}`)
+      this.log('注册邮箱已就绪')
       return
     }
 
@@ -871,7 +871,7 @@ export class Registrar {
       this.email = await this.emailSvc.create()
       if (!this.email) throw new Error('Proton 邮箱地址为空')
       this.emitStep('email-created')
-      this.log(`email=${this.email}`)
+      this.log('注册邮箱已就绪')
       return
     }
 
@@ -899,7 +899,7 @@ export class Registrar {
       this.email = await this.emailSvc.create()
       if (!this.email) throw new Error('生成 GPTmail 注册邮箱失败')
       this.emitStep('email-created')
-      this.log(`email=${this.email}`)
+      this.log('注册邮箱已就绪')
       return
     }
 
@@ -909,7 +909,7 @@ export class Registrar {
     this.email = await this.emailSvc.create()
     if (!this.email) throw new Error('创建临时邮箱失败')
     this.emitStep('email-created')
-    this.log(`email=${this.email}`)
+    this.log('注册邮箱已就绪')
   }
 
   private async step4Portal(): Promise<void> {
@@ -980,7 +980,7 @@ export class Registrar {
 
   private async step6SubmitEmail(): Promise<'signup' | 'login'> {
     this.emitStep('submit-email')
-    this.log(`[6] 提交邮箱 ${this.email}`)
+    this.log('[6] 提交邮箱')
     const api = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/api/execute`
     const ref = `${this.cfg.signinBase}/platform/${this.cfg.directoryId}/login?workflowStateHandle=${this.workflowHandle}`
     const fp = this.genFP('signin', 'PageSubmit', this.email.length, this.email)
@@ -1141,8 +1141,8 @@ export class Registrar {
         try {
           this.outlookMailCount = await getInboxCount(acc)
           this.log(`发送前邮件数: ${this.outlookMailCount}`)
-        } catch (err) {
-          this.log(`获取邮件数量失败: ${err}, 默认为0`)
+        } catch {
+          this.log('获取邮件数量失败，默认为0')
         }
       }
     }
@@ -1536,7 +1536,7 @@ export class Registrar {
       }
     }
 
-    this.log(`验活成功! 邮箱=${emailAddr} 订阅=${sub} Credit=${totalUsed}/${totalLimit}`)
+    this.log(`验活成功! 订阅=${sub} Credit=${totalUsed}/${totalLimit}`)
     return { alive: true, email: emailAddr, subscription: sub, credit_used: totalUsed, credit_limit: totalLimit }
   }
 
@@ -1633,7 +1633,7 @@ export class Registrar {
         } catch (err) {
           const errMsg = (err as Error).message
           if (ssoAttempt < SSO_MAX_RETRIES) {
-            this.log(`[SSO] 后期步骤失败，内部重试 (${ssoAttempt + 1}/${SSO_MAX_RETRIES}): ${errMsg}`)
+            this.log(`[SSO] 后期步骤失败，内部重试 (${ssoAttempt + 1}/${SSO_MAX_RETRIES})`)
             await this.abortableSleep(3000 + Math.floor(Math.random() * 2000))
           } else {
             // 最终失败：账号已创建但拿不到 Token
@@ -1759,7 +1759,7 @@ export class Registrar {
         } catch (err) {
           const errMsg = (err as Error).message
           if (ssoAttempt < SSO_MAX_RETRIES) {
-            this.log(`[SSO] 后期步骤失败，内部重试 (${ssoAttempt + 1}/${SSO_MAX_RETRIES}): ${errMsg}`)
+            this.log(`[SSO] 后期步骤失败，内部重试 (${ssoAttempt + 1}/${SSO_MAX_RETRIES})`)
             await this.abortableSleep(3000 + Math.floor(Math.random() * 2000))
           } else {
             return { status: 'failed', email: this.email, error: `[SSOToken] ${errMsg} (账号已创建，可手动导入刷新)` }
