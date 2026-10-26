@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import test from 'node:test'
@@ -27,11 +26,14 @@ const INSTANCE_A = '11111111-1111-4111-8111-111111111111'
 const INSTANCE_B = '22222222-2222-4222-8222-222222222222'
 const DELETED_INSTANCE = '33333333-3333-4333-8333-333333333333'
 const IPC_MAIN_DIR = fileURLToPath(new URL('../../out/main/', import.meta.url))
+const FIXTURE_ROOT = fileURLToPath(new URL('../../../.local/isolated/kiro-permissions-service-tests/', import.meta.url))
 
 function createTempWorkspace() {
-  // macOS /var and Windows runner TEMP aliases are not canonical paths. Resolve
-  // the fixture location rather than relaxing the production redirection checks.
-  const root = realpathSync(mkdtempSync(join(realpathSync(tmpdir()), 'kiro-permissions-test-')))
+  // Keep synthetic state in the repository and use the native implementation
+  // that matches fs.promises.realpath, including Windows short-name expansion.
+  // The JavaScript realpathSync implementation can retain RUNNER~1 segments.
+  mkdirSync(FIXTURE_ROOT, { recursive: true })
+  const root = realpathSync.native(mkdtempSync(join(realpathSync.native(FIXTURE_ROOT), 'case-')))
   const defaultHome = join(root, 'default-home')
   const instanceAHome = join(root, 'instances', INSTANCE_A, 'home')
   const instanceBHome = join(root, 'instances', INSTANCE_B, 'home')
@@ -51,6 +53,26 @@ function createTempWorkspace() {
     }
   }
 }
+
+test('repository fixture paths match the service native realpath implementation', async context => {
+  const ws = createTempWorkspace()
+  try {
+    const asyncPath = await defaultPermissionsFileSystem.realpath(ws.root)
+    const syncPath = realpathSync(ws.root)
+    const nativePath = realpathSync.native(ws.root)
+    context.diagnostic(JSON.stringify({
+      syncMatchesAsync: syncPath === asyncPath,
+      nativeMatchesAsync: nativePath === asyncPath
+    }))
+    assert.equal(nativePath, asyncPath)
+    assert.equal(ws.root, asyncPath)
+    for (const path of [ws.defaultHome, ws.instanceAHome, ws.instanceBHome, ws.backupRoot]) {
+      assert.equal(await defaultPermissionsFileSystem.realpath(path), path)
+    }
+  } finally {
+    ws.cleanup()
+  }
+})
 
 function createServiceHarness(ws, overrides = {}) {
   const instances = new Map([
