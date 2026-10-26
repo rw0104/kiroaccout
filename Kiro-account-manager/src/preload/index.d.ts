@@ -5,6 +5,13 @@ import type { AppUpdateState, UpdateActionResult } from '../main/appUpdater'
 import type { LoginResult, SocialLoginCallback } from '../main/loginSessions'
 import type { KiroInstancesApi } from '../shared/kiroInstances'
 import type { KiroSettingsTarget, KiroSettingsReadResult } from '../shared/kiroSettings'
+import type {
+  KiroPermissionsExportResult,
+  KiroPermissionsRestoreResult,
+  KiroPermissionsRevision,
+  KiroPermissionsStateResult,
+  KiroPermissionsWriteResult
+} from '../shared/kiroPermissions'
 import type { AccountAddOnCredit } from '../shared/accountUsage'
 import { ElectronAPI } from '@electron-toolkit/preload'
 
@@ -514,6 +521,18 @@ interface KiroApi {
 
   // 打开 Kiro settings.json 文件
   openKiroSettingsFile: (target?: KiroSettingsTarget) => Promise<{ success: boolean; error?: string }>
+
+  // 获取 Kiro 工具自动批准权限状态
+  getKiroPermissions: (target?: KiroSettingsTarget) => Promise<KiroPermissionsStateResult>
+
+  // 应用 Kiro 工具自动批准配置
+  applyKiroAutoApproval: (target: KiroSettingsTarget | undefined, expectedRevision: KiroPermissionsRevision) => Promise<KiroPermissionsWriteResult>
+
+  // 恢复 Kiro 工具自动批准前的原配置
+  restoreKiroAutoApproval: (target: KiroSettingsTarget | undefined, expectedRevision: KiroPermissionsRevision) => Promise<KiroPermissionsRestoreResult>
+
+  // 导出 Kiro 工具自动批准配置模板
+  exportKiroAutoApprovalTemplate: () => Promise<KiroPermissionsExportResult>
 
   // 打开指定的 Steering 文件
   openKiroSteeringFile: (filename: string) => Promise<{ success: boolean; error?: string }>

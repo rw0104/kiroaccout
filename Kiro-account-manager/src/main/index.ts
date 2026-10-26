@@ -38,6 +38,9 @@ import { readKiroSettingsDocument, updateKiroSettingsDocument, parseKiroSettings
 import { createSteeringFiles, steeringFileFailure } from './steeringFiles'
 import { requireTrustedMainWindow } from './trustedIpc'
 import type { KiroSettingsTarget } from '../shared/kiroSettings'
+import { KiroPermissionsService, kiroPermissionsFailure } from './kiroPermissionsService'
+import type { KiroPermissionsRevision } from '../shared/kiroPermissions'
+import * as os from 'node:os'
 import { prepareKiroInstanceAccount, readKiroInstanceAccountUpdate, type InstanceBoundAccount } from './kiroInstanceAccounts'
 import { verifyKiroInstanceIdentity } from './kiroInstanceIdentity'
 import { InstanceAccountOwnership, InstanceOwnershipError, INSTANCE_ACCOUNT_REAUTH_REQUIRED, mergeInstanceOwnedAccounts, mergeInstanceOwnedAccountsForUpdate, mergeInstanceOwnedAccountsForDeletion, type InstanceOwnershipInput } from './kiroInstanceOwnership'
@@ -2490,6 +2493,66 @@ app.whenReady().then(async () => {
     chooseExecutable: async () => {
       const result = await dialog.showOpenDialog({ title: '选择多个实例共用的官方 Kiro.exe', properties: ['openFile'], filters: [{ name: 'Kiro', extensions: ['exe'] }] })
       return result.canceled ? null : result.filePaths[0] || null
+    }
+  })
+  const kiroPermissionsService = new KiroPermissionsService({
+    platform: process.platform,
+    homeDir: os.homedir(),
+    env: process.env,
+    backupRoot: join(app.getPath('userData'), 'kiro-permissions-backups'),
+    resolveInstance: id => kiroInstanceService.resolveSettingsTarget(id),
+    inspectVersion: async target => {
+      try {
+        if (target.type === 'instance' && target.instanceId) {
+          await initStore()
+          const records = store?.get('kiroInstances')
+          const record = Array.isArray(records)
+            ? records.find(row => row?.schemaVersion === 2 && row.id === target.instanceId && typeof row.executablePath === 'string')
+            : undefined
+          if (!record?.executablePath) return undefined
+          const info = await kiroInstanceRuntime.inspectInstallation(record.executablePath)
+          return info.version
+        }
+        if (process.platform === 'win32') {
+          const discovery = await kiroInstallationDiscovery.discover()
+          // Discovery already ranks verified running, registry and common-path installations.
+          return discovery.candidates[0]?.version
+        }
+        const productCandidates = process.platform === 'darwin'
+          ? [
+              '/Applications/Kiro.app/Contents/Resources/app/product.json',
+              join(os.homedir(), 'Applications/Kiro.app/Contents/Resources/app/product.json')
+            ]
+          : [
+              '/usr/share/kiro/resources/app/product.json',
+              '/opt/Kiro/resources/app/product.json',
+              '/opt/kiro/resources/app/product.json'
+            ]
+        const fsPromises = await import('fs/promises')
+        for (const candidate of productCandidates) {
+          try {
+            const stat = await fsPromises.lstat(candidate)
+            if (stat.isSymbolicLink() || !stat.isFile()) continue
+            const raw = await fsPromises.readFile(candidate, 'utf-8')
+            const parsed = JSON.parse(raw) as { version?: unknown }
+            if (typeof parsed.version === 'string' && parsed.version.trim()) return parsed.version.trim()
+          } catch {
+            // Ignore missing or unreadable candidate
+          }
+        }
+        return undefined
+      } catch {
+        return undefined
+      }
+    },
+    chooseExportPath: async () => {
+      if (!mainWindow || mainWindow.isDestroyed()) return null
+      const result = await dialog.showSaveDialog(mainWindow, {
+        title: '导出工具自动批准配置模板',
+        defaultPath: 'permissions.yaml',
+        filters: [{ name: 'YAML Files', extensions: ['yaml', 'yml'] }]
+      })
+      return result.canceled ? null : (result.filePath ?? null)
     }
   })
 
@@ -5131,6 +5194,46 @@ app.whenReady().then(async () => {
       return { success: true }
     } catch (error) {
       return { success: false, error: kiroSettingsFailure(error) }
+    }
+  })
+
+  // IPC: 获取 Kiro 工具自动批准权限状态
+  ipcMain.handle('get-kiro-permissions', async (_event, requestedTarget?: KiroSettingsTarget) => {
+    try {
+      requireTrustedMainWindow(_event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined)
+      return await kiroPermissionsService.getState(requestedTarget)
+    } catch (error) {
+      return kiroPermissionsFailure(error)
+    }
+  })
+
+  // IPC: 应用 Kiro 工具自动批准配置
+  ipcMain.handle('apply-kiro-auto-approval', async (_event, requestedTarget: KiroSettingsTarget | undefined, expectedRevision: KiroPermissionsRevision) => {
+    try {
+      requireTrustedMainWindow(_event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined)
+      return await kiroPermissionsService.applyAutoApproval(requestedTarget, expectedRevision)
+    } catch (error) {
+      return kiroPermissionsFailure(error)
+    }
+  })
+
+  // IPC: 恢复 Kiro 工具自动批准前的原配置
+  ipcMain.handle('restore-kiro-auto-approval', async (_event, requestedTarget: KiroSettingsTarget | undefined, expectedRevision: KiroPermissionsRevision) => {
+    try {
+      requireTrustedMainWindow(_event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined)
+      return await kiroPermissionsService.restoreBeforeAutoApproval(requestedTarget, expectedRevision)
+    } catch (error) {
+      return kiroPermissionsFailure(error)
+    }
+  })
+
+  // IPC: 导出 Kiro 工具自动批准配置模板
+  ipcMain.handle('export-kiro-auto-approval-template', async (_event) => {
+    try {
+      requireTrustedMainWindow(_event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined)
+      return await kiroPermissionsService.exportTemplate()
+    } catch (error) {
+      return kiroPermissionsFailure(error)
     }
   })
 

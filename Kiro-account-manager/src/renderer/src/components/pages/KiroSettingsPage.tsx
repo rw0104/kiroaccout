@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, Button, Toggle, Select } from '../ui'
 import { useTranslation } from '@/hooks/useTranslation'
-import { SteeringEditor, McpServerEditor } from '../kiro'
+import { SteeringEditor, McpServerEditor, KiroPermissionsSection } from '../kiro'
 import type { KiroMemoryMode, KiroSettingsTarget, KiroSettingsTargetInfo } from '../../../../shared/kiroSettings'
+import type { KiroPermissionsState } from '../../../../shared/kiroPermissions'
 import type { KiroManagedInstanceView } from '../../../../shared/kiroInstances'
 import { 
   FileText, 
@@ -128,6 +129,7 @@ export function KiroSettingsPage() {
   const requestRef = useRef(0)
   const modelRequestRef = useRef(0)
   const resourceRequestRef = useRef(0)
+  const permissionsRequestRef = useRef(0)
   const savingRef = useRef(false)
   const [loaded, setLoaded] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -141,6 +143,12 @@ export function KiroSettingsPage() {
   const [error, setError] = useState<string | null>(null)
   const [availableModels, setAvailableModels] = useState<Array<{ id: string; name: string; description: string }>>([])
   const [loadingModels, setLoadingModels] = useState(false)
+  const [permissionsState, setPermissionsState] = useState<KiroPermissionsState | null>(null)
+  const [permissionsLoading, setPermissionsLoading] = useState(false)
+  const [permissionsExporting, setPermissionsExporting] = useState(false)
+  const [permissionsError, setPermissionsError] = useState<string | null>(null)
+  const [permissionsNotice, setPermissionsNotice] = useState<string | null>(null)
+  const [permissionsDetailsOpen, setPermissionsDetailsOpen] = useState(false)
   
   const [expandedSections, setExpandedSections] = useState({
     agent: true,
@@ -182,12 +190,13 @@ export function KiroSettingsPage() {
     }).catch(() => {
       if (active) setInstanceError(isEn ? 'Could not load managed instances. Default IDE settings remain available.' : '无法加载受管实例，仍可管理默认 IDE 设置。')
     })
-    return () => { active = false; requestRef.current++; modelRequestRef.current++; resourceRequestRef.current++ }
+    return () => { active = false; requestRef.current++; modelRequestRef.current++; resourceRequestRef.current++; permissionsRequestRef.current++ }
   }, [])
 
   useEffect(() => {
     void loadKiroSettings()
     void loadAvailableModels()
+    void loadKiroPermissions()
   }, [targetValue])
 
   const changeTarget = (value: string): void => {
@@ -199,6 +208,7 @@ export function KiroSettingsPage() {
     requestRef.current++
     modelRequestRef.current++
     resourceRequestRef.current++
+    permissionsRequestRef.current++
     targetRef.current = nextTarget
     setTargetValue(value)
     setLoaded(false)
@@ -213,6 +223,11 @@ export function KiroSettingsPage() {
     setEditingMcp(null)
     setMcpConfig({ mcpServers: {} })
     setSteeringFiles([])
+    setPermissionsState(null)
+    setPermissionsLoading(true)
+    setPermissionsError(null)
+    setPermissionsNotice(null)
+    setPermissionsDetailsOpen(false)
   }
 
   const loadAvailableModels = async () => {
@@ -271,6 +286,162 @@ export function KiroSettingsPage() {
     } finally {
       if (requestId === requestRef.current) setLoading(false)
     }
+  }
+
+  const loadKiroPermissions = async (duringPermissionWrite = false) => {
+    if (savingRef.current && !duringPermissionWrite) return
+    const requestId = ++permissionsRequestRef.current
+    const target = { ...targetRef.current }
+    if (typeof window.api.getKiroPermissions !== 'function') {
+      setPermissionsLoading(false)
+      return
+    }
+    setPermissionsLoading(true)
+    setPermissionsError(null)
+    try {
+      const result = await window.api.getKiroPermissions(target)
+      if (requestId !== permissionsRequestRef.current) return
+      if (!result.success || !result.state) {
+        setPermissionsState(null)
+        setPermissionsError(result.error || (isEn ? 'Failed to load permissions configuration' : '加载权限配置失败'))
+        return
+      }
+      setPermissionsState(result.state)
+    } catch {
+      if (requestId === permissionsRequestRef.current) {
+        setPermissionsState(null)
+        setPermissionsError(isEn ? 'Failed to load permissions configuration' : '加载权限配置失败')
+      }
+    } finally {
+      if (requestId === permissionsRequestRef.current) setPermissionsLoading(false)
+    }
+  }
+
+  const applyAutoApproval = async () => {
+    if (
+      savingRef.current ||
+      permissionsLoading ||
+      !permissionsState ||
+      !permissionsState.compatibility.writable ||
+      permissionsState.contentStatus === 'invalid' ||
+      permissionsState.restore.status === 'pending_verification' ||
+      permissionsState.restore.status === 'corrupted' ||
+      permissionsState.presence.missingRules.length === 0 ||
+      typeof window.api.applyKiroAutoApproval !== 'function'
+    ) {
+      return
+    }
+    const target = { ...targetRef.current }
+    const expectedRevision = permissionsState.revision
+    const generation = permissionsRequestRef.current
+    savingRef.current = true
+    setSaving(true)
+    setPermissionsError(null)
+    setPermissionsNotice(null)
+    try {
+      const result = await window.api.applyKiroAutoApproval(target, expectedRevision)
+      if (generation !== permissionsRequestRef.current) return
+      if (!result.success) {
+        if (result.state) setPermissionsState(result.state)
+        setPermissionsError(result.error || (isEn ? 'Failed to apply auto-approval configuration' : '应用工具自动批准配置失败'))
+        if (result.code === 'REVISION_CONFLICT' || result.code === 'RESTORE_CONFLICT') {
+          // Keep the write lock until this operation's refresh has finished.
+          await loadKiroPermissions(true)
+        }
+        return
+      }
+      if (result.state) setPermissionsState(result.state)
+      setPermissionsNotice(
+        isEn
+          ? 'Permissions written to the selected client. Start a new Kiro session to verify.'
+          : '已写入所选客户端的权限配置。建议在 Kiro 中新建会话验证生效情况。'
+      )
+    } catch {
+      if (generation === permissionsRequestRef.current) {
+        setPermissionsError(isEn ? 'Failed to apply auto-approval configuration' : '应用工具自动批准配置失败')
+      }
+    } finally {
+      savingRef.current = false
+      setSaving(false)
+    }
+  }
+
+  const restoreAutoApproval = async () => {
+    if (
+      savingRef.current ||
+      permissionsLoading ||
+      !permissionsState ||
+      !permissionsState.compatibility.writable ||
+      !permissionsState.restore.canRestore ||
+      permissionsState.restore.status !== 'available' ||
+      typeof window.api.restoreKiroAutoApproval !== 'function'
+    ) {
+      return
+    }
+    const target = { ...targetRef.current }
+    const expectedRevision = permissionsState.revision
+    const generation = permissionsRequestRef.current
+    savingRef.current = true
+    setSaving(true)
+    setPermissionsError(null)
+    setPermissionsNotice(null)
+    try {
+      const result = await window.api.restoreKiroAutoApproval(target, expectedRevision)
+      if (generation !== permissionsRequestRef.current) return
+      if (!result.success) {
+        if (result.state) setPermissionsState(result.state)
+        setPermissionsError(result.error || (isEn ? 'Failed to restore previous configuration' : '恢复原配置失败'))
+        if (result.code === 'REVISION_CONFLICT' || result.code === 'RESTORE_CONFLICT') {
+          await loadKiroPermissions(true)
+        }
+        return
+      }
+      if (result.state) setPermissionsState(result.state)
+      setPermissionsNotice(
+        isEn
+          ? 'Restored the selected client permissions configuration. Start a new Kiro session to verify.'
+          : '已恢复所选客户端的原权限配置。建议在 Kiro 中新建会话验证生效情况。'
+      )
+    } catch {
+      if (generation === permissionsRequestRef.current) {
+        setPermissionsError(isEn ? 'Failed to restore previous configuration' : '恢复原配置失败')
+      }
+    } finally {
+      savingRef.current = false
+      setSaving(false)
+    }
+  }
+
+  const exportAutoApproval = async () => {
+    if (savingRef.current || permissionsExporting || typeof window.api.exportKiroAutoApprovalTemplate !== 'function') return
+    const generation = permissionsRequestRef.current
+    setPermissionsExporting(true)
+    setPermissionsError(null)
+    setPermissionsNotice(null)
+    try {
+      const result = await window.api.exportKiroAutoApprovalTemplate()
+      if (generation !== permissionsRequestRef.current || result.canceled) return
+      if (!result.success) {
+        setPermissionsError(result.error || (isEn ? 'Failed to export configuration template' : '导出配置模板失败'))
+        return
+      }
+      setPermissionsNotice(
+        isEn
+          ? 'Auto-approval configuration template exported.'
+          : '已导出工具自动批准配置模板。'
+      )
+    } catch {
+      if (generation === permissionsRequestRef.current) {
+        setPermissionsError(isEn ? 'Failed to export configuration template' : '导出配置模板失败')
+      }
+    } finally {
+      setPermissionsExporting(false)
+    }
+  }
+
+  const refreshSelectedTarget = () => {
+    void loadKiroSettings()
+    void loadKiroPermissions()
   }
 
   const saveSettings = async () => {
@@ -482,7 +653,7 @@ export function KiroSettingsPage() {
             </div>
           </div>
           <div className="flex gap-2">
-            <Button variant="outline" size="sm" onClick={loadKiroSettings} disabled={saving} className="bg-background/50 backdrop-blur-sm">
+            <Button variant="outline" size="sm" onClick={refreshSelectedTarget} disabled={saving} className="bg-background/50 backdrop-blur-sm">
               <RefreshCw className="h-4 w-4 mr-2" />
               {isEn ? 'Refresh' : '刷新'}
             </Button>
@@ -532,7 +703,7 @@ export function KiroSettingsPage() {
       )}
       {saved && !dirty && <p role="status" className="text-sm text-muted-foreground">{isEn ? 'Settings saved to the selected IDE profile.' : '设置已保存至所选 IDE 配置。'}</p>}
 
-      <fieldset disabled={loading || saving || !loaded} className="space-y-6 disabled:opacity-60">
+      <div className="space-y-6">
       {/* Agent 设置 */}
       <Card className="hover-lift">
         <CardHeader className="pb-2 cursor-pointer hover:bg-muted/30 transition-colors rounded-t-lg" onClick={() => toggleSection('agent')}>
@@ -548,6 +719,7 @@ export function KiroSettingsPage() {
         </CardHeader>
         {expandedSections.agent && (
           <CardContent className="space-y-4">
+            <fieldset disabled={loading || saving || !loaded} className="space-y-4 disabled:opacity-60">
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div className="flex-1 min-w-[220px]">
                 <label htmlFor="kiro-memory" className="font-medium">{isEn ? 'Memory' : '记忆'}</label>
@@ -600,6 +772,26 @@ export function KiroSettingsPage() {
               />
             </div>
 
+            </fieldset>
+
+            {KiroPermissionsSection && (
+              <KiroPermissionsSection
+                state={permissionsState}
+                loading={permissionsLoading}
+                busy={saving}
+                exporting={permissionsExporting}
+                error={permissionsError}
+                notice={permissionsNotice}
+                isEn={isEn}
+                detailsOpen={permissionsDetailsOpen}
+                onToggleDetails={() => setPermissionsDetailsOpen(prev => !prev)}
+                onApply={applyAutoApproval}
+                onRestore={restoreAutoApproval}
+                onExport={exportAutoApproval}
+              />
+            )}
+
+            <fieldset disabled={loading || saving || !loaded} className="space-y-4 disabled:opacity-60">
             {/* Model Selection */}
             <div className="flex items-center justify-between border-t pt-4">
               <div className="flex-1 mr-4">
@@ -743,10 +935,12 @@ export function KiroSettingsPage() {
                 </div>
               </div>
             </div>
+            </fieldset>
           </CardContent>
         )}
       </Card>
 
+      <fieldset disabled={loading || saving || !loaded} className="space-y-6 disabled:opacity-60">
       {isDefaultTarget && <>
       {/* MCP 设置 */}
       <Card className="hover-lift">
@@ -1057,6 +1251,7 @@ export function KiroSettingsPage() {
         )}
       </Card>
       </fieldset>
+      </div>
 
       {/* Steering 文件编辑器 */}
       {isDefaultTarget && editingFile && (

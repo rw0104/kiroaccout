@@ -5,6 +5,13 @@ import type { AppUpdateState, UpdateActionResult } from '../main/appUpdater'
 import type { LoginResult, SocialLoginCallback } from '../main/loginSessions'
 import { KIRO_INSTANCE_CHANNELS, type KiroInstancesApi } from '../shared/kiroInstances'
 import type { KiroSettingsTarget, KiroSettingsReadResult } from '../shared/kiroSettings'
+import type {
+  KiroPermissionsExportResult,
+  KiroPermissionsRestoreResult,
+  KiroPermissionsRevision,
+  KiroPermissionsStateResult,
+  KiroPermissionsWriteResult
+} from '../shared/kiroPermissions'
 import { contextBridge, ipcRenderer } from 'electron'
 import { electronAPI } from '@electron-toolkit/preload'
 
@@ -456,6 +463,26 @@ const api = {
   // 打开 Kiro settings.json 文件
   openKiroSettingsFile: (target?: KiroSettingsTarget): Promise<{ success: boolean; error?: string }> => {
     return ipcRenderer.invoke('open-kiro-settings-file', target)
+  },
+
+  // 获取 Kiro 工具自动批准权限状态
+  getKiroPermissions: (target?: KiroSettingsTarget): Promise<KiroPermissionsStateResult> => {
+    return ipcRenderer.invoke('get-kiro-permissions', target)
+  },
+
+  // 应用 Kiro 工具自动批准配置
+  applyKiroAutoApproval: (target: KiroSettingsTarget | undefined, expectedRevision: KiroPermissionsRevision): Promise<KiroPermissionsWriteResult> => {
+    return ipcRenderer.invoke('apply-kiro-auto-approval', target, expectedRevision)
+  },
+
+  // 恢复 Kiro 工具自动批准前的原配置
+  restoreKiroAutoApproval: (target: KiroSettingsTarget | undefined, expectedRevision: KiroPermissionsRevision): Promise<KiroPermissionsRestoreResult> => {
+    return ipcRenderer.invoke('restore-kiro-auto-approval', target, expectedRevision)
+  },
+
+  // 导出 Kiro 工具自动批准配置模板
+  exportKiroAutoApprovalTemplate: (): Promise<KiroPermissionsExportResult> => {
+    return ipcRenderer.invoke('export-kiro-auto-approval-template')
   },
 
   // 打开指定的 Steering 文件
