@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, win32 } from 'node:path'
+import { join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import test from 'node:test'
 import vm from 'node:vm'
 import ts from 'typescript'
@@ -25,9 +26,12 @@ import { requireTrustedMainWindow } from '../../src/main/trustedIpc.ts'
 const INSTANCE_A = '11111111-1111-4111-8111-111111111111'
 const INSTANCE_B = '22222222-2222-4222-8222-222222222222'
 const DELETED_INSTANCE = '33333333-3333-4333-8333-333333333333'
+const IPC_MAIN_DIR = fileURLToPath(new URL('../../out/main/', import.meta.url))
 
 function createTempWorkspace() {
-  const root = mkdtempSync(join(tmpdir(), 'kiro-permissions-test-'))
+  // macOS /var and Windows runner TEMP aliases are not canonical paths. Resolve
+  // the fixture location rather than relaxing the production redirection checks.
+  const root = realpathSync(mkdtempSync(join(realpathSync(tmpdir()), 'kiro-permissions-test-')))
   const defaultHome = join(root, 'default-home')
   const instanceAHome = join(root, 'instances', INSTANCE_A, 'home')
   const instanceBHome = join(root, 'instances', INSTANCE_B, 'home')
@@ -73,6 +77,7 @@ function createServiceHarness(ws, overrides = {}) {
     platform: overrides.platform ?? process.platform,
     homeDir: ws.defaultHome,
     backupRoot: ws.backupRoot,
+    env: overrides.env ?? {},
     resolveInstance: async id => {
       const found = instances.get(id)
       if (!found) {
@@ -247,7 +252,7 @@ test('YAML validation rejects malformed syntax, duplicate keys, multi-doc, ancho
   }
 })
 
-test('service lifecycle: missing file apply & restore, existing file apply & restore, and multi-instance isolation', async () => {
+test('default service lifecycle creates, restores and preserves existing permissions on every platform', async () => {
   const ws = createTempWorkspace()
   try {
     const { service } = createServiceHarness(ws)
@@ -257,7 +262,7 @@ test('service lifecycle: missing file apply & restore, existing file apply & res
 
     // Initial state on default client (file does not exist)
     const initDefault = await service.getState({ type: 'default' })
-    assert.equal(initDefault.success, true)
+    assert.equal(initDefault.success, true, JSON.stringify(initDefault))
     assert.equal(initDefault.state.contentStatus, 'unconfigured')
     assert.equal(initDefault.state.revision.exists, false)
     assert.deepEqual(initDefault.state.presence.missingRules, ['all', 'fs_write'])
@@ -266,7 +271,7 @@ test('service lifecycle: missing file apply & restore, existing file apply & res
 
     // Apply on default client creates file
     const appliedDefault = await service.applyAutoApproval({ type: 'default' }, initDefault.state.revision)
-    assert.equal(appliedDefault.success, true)
+    assert.equal(appliedDefault.success, true, JSON.stringify(appliedDefault))
     assert.equal(appliedDefault.changed, true)
     assert.deepEqual(appliedDefault.addedRules, ['all', 'fs_write'])
     assert.equal(appliedDefault.state.contentStatus, 'configured')
@@ -282,20 +287,45 @@ test('service lifecycle: missing file apply & restore, existing file apply & res
       { type: 'default' },
       appliedDefault.state.revision
     )
-    assert.equal(restoredDefault.success, true)
+    assert.equal(restoredDefault.success, true, JSON.stringify(restoredDefault))
     assert.equal(restoredDefault.restored, true)
     assert.equal(existsSync(defaultPermPath), false)
     assert.equal(restoredDefault.state.contentStatus, 'unconfigured')
     assert.equal(restoredDefault.state.restore.canRestore, false)
     assert.equal(restoredDefault.state.restore.status, 'none')
 
+    const customYaml = '# default comment\nrules:\n  - capability: shell\n    effect: ask\n'
+    writeFileSync(defaultPermPath, customYaml, 'utf8')
+    const existing = await service.getState({ type: 'default' })
+    assert.equal(existing.success, true, JSON.stringify(existing))
+    const updated = await service.applyAutoApproval({ type: 'default' }, existing.state.revision)
+    assert.equal(updated.success, true, JSON.stringify(updated))
+    assert.equal(updated.state.restrictions.askCount, 1)
+    assert.equal(updated.state.restore.originalExisted, true)
+    const restoredExisting = await service.restoreBeforeAutoApproval({ type: 'default' }, updated.state.revision)
+    assert.equal(restoredExisting.success, true, JSON.stringify(restoredExisting))
+    assert.equal(readFileSync(defaultPermPath, 'utf8'), customYaml)
+    assert.equal(existsSync(instanceAPermPath), false)
+    assert.equal(existsSync(instanceBPermPath), false)
+  } finally {
+    ws.cleanup()
+  }
+})
+
+test('Windows instance lifecycle preserves its own rules without changing default or sibling profiles', { skip: process.platform !== 'win32' }, async () => {
+  const ws = createTempWorkspace()
+  try {
+    const { service } = createServiceHarness(ws)
+    const defaultPermPath = join(ws.defaultHome, '.kiro', 'settings', 'permissions.yaml')
+    const instanceAPermPath = join(ws.instanceAHome, '.kiro', 'settings', 'permissions.yaml')
+    const instanceBPermPath = join(ws.instanceBHome, '.kiro', 'settings', 'permissions.yaml')
     // Pre-populate Instance A with custom permissions.yaml
     mkdirSync(join(ws.instanceAHome, '.kiro', 'settings'), { recursive: true })
     const customYamlA = '# instance A comment\nrules:\n  - capability: shell\n    effect: ask\n'
     writeFileSync(instanceAPermPath, customYamlA, 'utf8')
 
     const initA = await service.getState({ type: 'instance', instanceId: INSTANCE_A })
-    assert.equal(initA.success, true)
+    assert.equal(initA.success, true, JSON.stringify(initA))
     assert.equal(initA.state.contentStatus, 'unconfigured')
     assert.equal(initA.state.restrictions.askCount, 1)
 
@@ -304,7 +334,7 @@ test('service lifecycle: missing file apply & restore, existing file apply & res
       { type: 'instance', instanceId: INSTANCE_A },
       initA.state.revision
     )
-    assert.equal(appliedA.success, true)
+    assert.equal(appliedA.success, true, JSON.stringify(appliedA))
     assert.equal(appliedA.changed, true)
     assert.equal(appliedA.state.contentStatus, 'configured')
     assert.equal(appliedA.state.restrictions.hasRestrictiveRules, true)
@@ -318,9 +348,30 @@ test('service lifecycle: missing file apply & restore, existing file apply & res
       { type: 'instance', instanceId: INSTANCE_A },
       appliedA.state.revision
     )
-    assert.equal(restoredA.success, true)
+    assert.equal(restoredA.success, true, JSON.stringify(restoredA))
     assert.equal(readFileSync(instanceAPermPath, 'utf8'), customYamlA)
     assert.equal(restoredA.state.restore.canRestore, false)
+  } finally {
+    ws.cleanup()
+  }
+})
+
+test('non-Windows instance targets are rejected for read, apply and restore without writing profiles', { skip: process.platform === 'win32' }, async () => {
+  const ws = createTempWorkspace()
+  try {
+    const { service } = createServiceHarness(ws)
+    const target = { type: 'instance', instanceId: INSTANCE_A }
+    const revision = { exists: false, sha256: null }
+    for (const result of [
+      await service.getState(target),
+      await service.applyAutoApproval(target, revision),
+      await service.restoreBeforeAutoApproval(target, revision)
+    ]) {
+      assert.equal(result.success, false, JSON.stringify(result))
+      assert.equal(result.code, 'INVALID_TARGET')
+    }
+    assert.equal(existsSync(join(ws.defaultHome, '.kiro', 'settings')), false)
+    assert.equal(existsSync(join(ws.instanceAHome, '.kiro', 'settings')), false)
   } finally {
     ws.cleanup()
   }
@@ -351,13 +402,13 @@ test('invalid targets, deleted instances, symlinks, hardlinks and unsupported cl
     // 2. Unsupported client version disables apply/restore while allowing getState and exportTemplate
     setVersion('2.0.0')
     const stateV2 = await service.getState({ type: 'default' })
-    assert.equal(stateV2.success, true)
+    assert.equal(stateV2.success, true, JSON.stringify(stateV2))
     assert.equal(stateV2.state.compatibility.status, 'unverified')
     assert.equal(stateV2.state.compatibility.writable, false)
 
     setVersion('0.9.0')
     const stateV0 = await service.getState({ type: 'default' })
-    assert.equal(stateV0.success, true)
+    assert.equal(stateV0.success, true, JSON.stringify(stateV0))
     assert.equal(stateV0.state.compatibility.status, 'unsupported')
     assert.equal(stateV0.state.compatibility.writable, false)
 
@@ -368,7 +419,7 @@ test('invalid targets, deleted instances, symlinks, hardlinks and unsupported cl
 
     setVersion(undefined)
     const stateUnknown = await service.getState({ type: 'default' })
-    assert.equal(stateUnknown.success, true)
+    assert.equal(stateUnknown.success, true, JSON.stringify(stateUnknown))
     assert.equal(stateUnknown.state.compatibility.writable, false)
     const applyUnknown = await service.applyAutoApproval(
       { type: 'default' },
@@ -437,7 +488,7 @@ test('concurrent writes, revision checks, external modification conflicts and cr
     const { service } = createServiceHarness(ws)
 
     const initial = await service.getState({ type: 'default' })
-    assert.equal(initial.success, true)
+    assert.equal(initial.success, true, JSON.stringify(initial))
 
     // 1. Concurrent apply calls with the same initial revision: first succeeds, second fails with REVISION_CONFLICT
     const [firstApply, secondApply] = await Promise.all([
@@ -454,7 +505,7 @@ test('concurrent writes, revision checks, external modification conflicts and cr
     writeFileSync(defaultPermPath, externallyEdited, 'utf8')
 
     const afterExternalState = await service.getState({ type: 'default' })
-    assert.equal(afterExternalState.success, true)
+    assert.equal(afterExternalState.success, true, JSON.stringify(afterExternalState))
     assert.equal(afterExternalState.state.contentStatus, 'configured')
     assert.equal(afterExternalState.state.restore.canRestore, false)
     assert.equal(afterExternalState.state.restore.status, 'external_modified')
@@ -472,14 +523,14 @@ test('concurrent writes, revision checks, external modification conflicts and cr
       { type: 'default' },
       afterExternalState.state.revision
     )
-    assert.equal(noopApply.success, true)
+    assert.equal(noopApply.success, true, JSON.stringify(noopApply))
     assert.equal(noopApply.changed, false)
     assert.equal(noopApply.state.restore.status, 'external_modified')
 
     // 3. External modification when missing rules appear also refuses to silently overwrite previous snapshot baseline
     writeFileSync(defaultPermPath, 'rules: []\n', 'utf8')
     const afterRuleRemovedState = await service.getState({ type: 'default' })
-    assert.equal(afterRuleRemovedState.success, true)
+    assert.equal(afterRuleRemovedState.success, true, JSON.stringify(afterRuleRemovedState))
     assert.equal(afterRuleRemovedState.state.restore.status, 'external_modified')
     const protectBaselineApply = await service.applyAutoApproval(
       { type: 'default' },
@@ -488,26 +539,30 @@ test('concurrent writes, revision checks, external modification conflicts and cr
     assert.equal(protectBaselineApply.success, false)
     assert.equal(protectBaselineApply.code, 'RESTORE_CONFLICT')
 
-    // 3b. Pre-commit external modification conflict during apply (tested on Instance A)
-    const instanceAPermPath = join(ws.instanceAHome, '.kiro', 'settings', 'permissions.yaml')
-    mkdirSync(join(ws.instanceAHome, '.kiro', 'settings'), { recursive: true })
-    writeFileSync(instanceAPermPath, 'rules: []\n', 'utf8')
-    const beforeHookState = await service.getState({ type: 'instance', instanceId: INSTANCE_A })
-    assert.equal(beforeHookState.success, true)
+    // 3b. Pre-commit conflict uses an independent default profile on every OS.
+    const raceWorkspace = createTempWorkspace()
+    try {
+      const racePermPath = join(raceWorkspace.defaultHome, '.kiro', 'settings', 'permissions.yaml')
+      mkdirSync(join(raceWorkspace.defaultHome, '.kiro', 'settings'), { recursive: true })
+      writeFileSync(racePermPath, 'rules: []\n', 'utf8')
+      const raceService = createServiceHarness(raceWorkspace, {
+        beforeCommitHook: async ({ permissionsPath }) => {
+          writeFileSync(permissionsPath, '# concurrent external edit\nrules: []\n', 'utf8')
+        }
+      }).service
+      const beforeHookState = await raceService.getState({ type: 'default' })
+      assert.equal(beforeHookState.success, true, JSON.stringify(beforeHookState))
 
-    const raceService = createServiceHarness(ws, {
-      beforeCommitHook: async ({ permissionsPath }) => {
-        writeFileSync(permissionsPath, '# concurrent external edit\nrules: []\n', 'utf8')
-      }
-    }).service
-
-    const raceApply = await raceService.applyAutoApproval(
-      { type: 'instance', instanceId: INSTANCE_A },
-      beforeHookState.state.revision
-    )
-    assert.equal(raceApply.success, false)
-    assert.equal(raceApply.code, 'REVISION_CONFLICT')
-    assert.equal(readFileSync(instanceAPermPath, 'utf8'), '# concurrent external edit\nrules: []\n')
+      const raceApply = await raceService.applyAutoApproval(
+        { type: 'default' },
+        beforeHookState.state.revision
+      )
+      assert.equal(raceApply.success, false, JSON.stringify(raceApply))
+      assert.equal(raceApply.code, 'REVISION_CONFLICT')
+      assert.equal(readFileSync(racePermPath, 'utf8'), '# concurrent external edit\nrules: []\n')
+    } finally {
+      raceWorkspace.cleanup()
+    }
 
     // 4. Crash recovery reconciliation: stage = 'prepared' with third-party hash -> pending_verification
     const latestPath = join(ws.backupRoot, 'default', 'latest.json')
@@ -524,7 +579,7 @@ test('concurrent writes, revision checks, external modification conflicts and cr
     writeFileSync(manifestPath, JSON.stringify(interruptedManifest, null, 2), 'utf8')
 
     const conflictState = await service.getState({ type: 'default' })
-    assert.equal(conflictState.success, true)
+    assert.equal(conflictState.success, true, JSON.stringify(conflictState))
     assert.equal(conflictState.state.restore.status, 'pending_verification')
     assert.equal(conflictState.state.restore.canRestore, false)
     assert.ok(conflictState.state.restore.backupDir)
@@ -550,7 +605,7 @@ test('concurrent writes, revision checks, external modification conflicts and cr
     writeFileSync(manifestPath, JSON.stringify(completedOnDiskManifest, null, 2), 'utf8')
 
     const reconciledApplied = await service.getState({ type: 'default' })
-    assert.equal(reconciledApplied.success, true)
+    assert.equal(reconciledApplied.success, true, JSON.stringify(reconciledApplied))
     assert.equal(reconciledApplied.state.restore.status, 'available')
     assert.equal(reconciledApplied.state.restore.canRestore, true)
 
@@ -560,9 +615,34 @@ test('concurrent writes, revision checks, external modification conflicts and cr
       chooseExportPath: async () => exportTarget
     }).service
     const exportRes = await exportService.exportTemplate()
-    assert.equal(exportRes.success, true)
+    assert.equal(exportRes.success, true, JSON.stringify(exportRes))
     assert.equal(readFileSync(exportTarget, 'utf8'), KIRO_AUTO_APPROVAL_TEMPLATE_YAML)
     assert.ok(KIRO_AUTO_APPROVAL_TEMPLATE_VERSION)
+  } finally {
+    ws.cleanup()
+  }
+})
+
+test('Windows instance pre-commit races preserve the external edit and isolate sibling profiles', { skip: process.platform !== 'win32' }, async () => {
+  const ws = createTempWorkspace()
+  try {
+    const instancePermPath = join(ws.instanceAHome, '.kiro', 'settings', 'permissions.yaml')
+    mkdirSync(join(ws.instanceAHome, '.kiro', 'settings'), { recursive: true })
+    writeFileSync(instancePermPath, 'rules: []\n', 'utf8')
+    const { service } = createServiceHarness(ws, {
+      beforeCommitHook: async ({ permissionsPath }) => {
+        writeFileSync(permissionsPath, '# external instance edit\nrules: []\n', 'utf8')
+      }
+    })
+    const target = { type: 'instance', instanceId: INSTANCE_A }
+    const state = await service.getState(target)
+    assert.equal(state.success, true, JSON.stringify(state))
+    const result = await service.applyAutoApproval(target, state.state.revision)
+    assert.equal(result.success, false, JSON.stringify(result))
+    assert.equal(result.code, 'REVISION_CONFLICT')
+    assert.equal(readFileSync(instancePermPath, 'utf8'), '# external instance edit\nrules: []\n')
+    assert.equal(existsSync(join(ws.defaultHome, '.kiro', 'settings')), false)
+    assert.equal(existsSync(join(ws.instanceBHome, '.kiro', 'settings')), false)
   } finally {
     ws.cleanup()
   }
@@ -605,8 +685,8 @@ function extractPermissionsIpcHandlers(deps) {
     ipcMain: { handle: (name, fn) => handlers.set(name, fn) },
     requireTrustedMainWindow,
     mainWindow: deps.mainWindow,
-    __dirname: 'D:\\app\\out\\main',
-    join: win32.join,
+    __dirname: IPC_MAIN_DIR,
+    join,
     is: { dev: false },
     process: { env: {} },
     kiroPermissionsService: deps.service,
@@ -620,7 +700,7 @@ test('actual permissions IPC handlers in src/main/index.ts enforce requireTruste
   const ws = createTempWorkspace()
   try {
     const { service } = createServiceHarness(ws)
-    const trustedMainFrame = { routingId: 10, url: 'file:///D:/app/out/renderer/index.html' }
+    const trustedMainFrame = { routingId: 10, url: pathToFileURL(join(IPC_MAIN_DIR, '../renderer/index.html')).href }
     const mainWindow = {
       isDestroyed: () => false,
       webContents: { id: 1, mainFrame: trustedMainFrame }
@@ -644,7 +724,7 @@ test('actual permissions IPC handlers in src/main/index.ts enforce requireTruste
       senderFrame: trustedMainFrame
     }
     const getRes = await handlers.get('get-kiro-permissions')(trustedEvent, { type: 'default' })
-    assert.equal(getRes.success, true)
+    assert.equal(getRes.success, true, JSON.stringify(getRes))
 
     const badTargetRes = await handlers.get('apply-kiro-auto-approval')(
       trustedEvent,
