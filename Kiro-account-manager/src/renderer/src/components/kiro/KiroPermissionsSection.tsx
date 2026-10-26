@@ -1,5 +1,5 @@
 import { Button } from '../ui'
-import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Download, RotateCcw, ShieldCheck } from 'lucide-react'
+import { AlertCircle, CheckCircle2, ChevronDown, ChevronUp, Download, RefreshCw, RotateCcw, ShieldCheck } from 'lucide-react'
 import type { KiroPermissionsState } from '../../../../shared/kiroPermissions'
 
 export interface KiroPermissionsSectionProps {
@@ -15,6 +15,7 @@ export interface KiroPermissionsSectionProps {
   onApply: () => void
   onRestore: () => void
   onExport: () => void
+  onRetry: () => void
 }
 
 export function KiroPermissionsSection({
@@ -29,16 +30,26 @@ export function KiroPermissionsSection({
   onToggleDetails,
   onApply,
   onRestore,
-  onExport
+  onExport,
+  onRetry
 }: KiroPermissionsSectionProps) {
   const getContentStatusLabel = (
     current: KiroPermissionsState | null
   ): { label: string; detail: string; tone: 'neutral' | 'success' | 'warning' | 'danger' } => {
-    if (!current) {
+    if (loading) {
       return {
         label: isEn ? 'Loading...' : '加载中…',
         detail: isEn ? 'Inspecting selected client permissions configuration' : '正在检查所选客户端的权限配置',
         tone: 'neutral'
+      }
+    }
+    if (!current) {
+      return {
+        label: error ? (isEn ? 'Unable to load' : '读取失败') : (isEn ? 'Not checked' : '尚未检查'),
+        detail: isEn
+          ? 'The permissions configuration has not been read. Retry to check the selected client.'
+          : '尚未读取到权限配置，请重试检查所选客户端。',
+        tone: error ? 'danger' : 'neutral'
       }
     }
     if (!current.compatibility.writable) {
@@ -300,7 +311,18 @@ export function KiroPermissionsSection({
           className="flex items-center gap-2 p-2.5 rounded-lg bg-destructive/10 text-destructive text-xs"
         >
           <AlertCircle className="h-4 w-4 shrink-0" />
-          <span>{error}</span>
+          <span className="flex-1">{error}</span>
+          <Button
+            id="kiro-permissions-retry"
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={loading || busy}
+            onClick={onRetry}
+          >
+            <RefreshCw className="h-3.5 w-3.5 mr-1.5" />
+            {isEn ? 'Retry' : '重试'}
+          </Button>
         </div>
       )}
 

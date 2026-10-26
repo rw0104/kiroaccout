@@ -788,6 +788,7 @@ export function KiroSettingsPage() {
                 onApply={applyAutoApproval}
                 onRestore={restoreAutoApproval}
                 onExport={exportAutoApproval}
+                onRetry={() => permissionsLoading ? undefined : loadKiroPermissions()}
               />
             )}
 

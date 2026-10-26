@@ -652,9 +652,14 @@ export class KiroPermissionsService {
     originalBytes?: Buffer
     operationDir?: string
   }> {
+    // The manager creates this directory on the first write. A status read must
+    // treat an absent backup directory as no snapshot, while still validating
+    // its existing parent and rejecting links, redirected paths and I/O errors.
+    const backupRoot = normalizePathFor(this.deps.platform, this.deps.backupRoot)
+    const backupOps = pathOpsFor(this.deps.platform, backupRoot)
     const backupSub = await this.verifySubdirectories(
-      this.deps.backupRoot,
-      [resolved.targetKey],
+      backupOps.dirname(backupRoot),
+      [backupOps.basename(backupRoot), resolved.targetKey],
       false
     )
 
