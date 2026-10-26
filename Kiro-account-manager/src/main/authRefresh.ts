@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { resolveOidcRegistrationExpiry } from '../shared/oidcRegistration'
 
 export interface AuthRefreshResult {
   success: boolean
@@ -91,8 +92,10 @@ export class TokenRefreshService {
     if (input.kind === 'IdC' && (!nonempty(input.clientId) || !nonempty(input.clientSecret) || !/^[a-z]{2}(?:-[a-z]+){1,3}-\d+$/.test(region))) {
       return failure('invalid-input', 'OIDC 客户端凭证或区域无效，请重新登录')
     }
-    if (input.kind === 'IdC' && input.clientSecretExpiresAt !== undefined &&
-        (typeof input.clientSecretExpiresAt !== 'number' || !Number.isFinite(input.clientSecretExpiresAt) || input.clientSecretExpiresAt * 1000 <= this.now() + 900000)) {
+    const registrationExpiry = input.kind === 'IdC' ? resolveOidcRegistrationExpiry(input) : undefined
+    if (input.kind === 'IdC' &&
+        (input.clientSecretExpiresAt !== undefined && registrationExpiry === undefined ||
+          registrationExpiry !== undefined && registrationExpiry * 1000 <= this.now() + 900000)) {
       return failure('invalid-input', 'OIDC 客户端注册已到期或即将到期，请重新登录')
     }
     input = { ...input, region }

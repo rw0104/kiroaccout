@@ -9,6 +9,29 @@ const dependencies = (fetch: (url: string, init: RequestInit, proxyUrl?: string)
   fetch, socialEndpoint: 'https://auth.example.invalid', socialUserAgent: () => 'SYNTHETIC_AGENT'
 })
 
+test('legacy registration recovery preserves server validation and rejects an actually expired embedded deadline', async () => {
+  const now = 1_800_000_000_000
+  const secret = (deadline: number) => [
+    { alg: 'HS256' },
+    { serialized: JSON.stringify({ clientId: { value: credential.clientId }, expirationTimestamp: deadline + 0.180562 }) }
+  ].map(value => Buffer.from(JSON.stringify(value)).toString('base64url')).join('.') + '.U1lOVEhFVElD'
+  const payloads: Record<string, unknown>[] = []
+  const service = new TokenRefreshService({ ...dependencies(async (_url, init) => {
+    payloads.push(JSON.parse(String(init.body)))
+    return response({ error: 'invalid_client' }, 401)
+  }), now: () => now })
+  const clientSecret = secret(now / 1000 + 86400)
+  const rejected = await service.refresh({ ...credential, clientSecret })
+  assert.equal(rejected.success, false)
+  assert.equal(rejected.errorCode, 'http', 'decoding metadata is never authentication')
+  assert.equal(payloads[0].clientSecret, clientSecret)
+  assert.equal(payloads[0].grantType, 'refresh_token')
+  assert.equal(Object.hasOwn(payloads[0], 'clientSecretExpiresAt'), false)
+  const expired = await service.refresh({ ...credential, clientSecret: secret(now / 1000 - 1) })
+  assert.equal(expired.errorCode, 'invalid-input')
+  assert.equal(payloads.length, 1)
+})
+
 test('refresh rejects incomplete successful payloads rather than overwriting valid credentials', async () => {
   for (const data of [{}, { accessToken: '', expiresIn: 3600 }, { accessToken: 'SYNTHETIC_ACCESS' },
     { accessToken: 'SYNTHETIC_ACCESS', expiresIn: -1 }, { ...good, expiresIn: Infinity }, { ...good, refreshToken: '' }]) {

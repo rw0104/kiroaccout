@@ -41,7 +41,7 @@ nsis:
   oneClick: false           # 关闭一键安装，显示安装向导
   allowToChangeInstallationDirectory: true  # 允许选择安装位置
   perMachine: false
-  runAfterFinish: false     # 安装完不自动启动
+  runAfterFinish: true      # 手动安装完成页默认勾选运行应用
   installerIcon: resources/kiro-high-resolution-logo-transparent.ico
   uninstallerIcon: resources/kiro-high-resolution-logo-transparent.ico
 mac:

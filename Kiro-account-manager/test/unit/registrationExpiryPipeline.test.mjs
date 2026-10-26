@@ -10,6 +10,7 @@ import {
   normalizeAccountSubscription
 } from '../../src/shared/accountSubscription.ts'
 import { mergeSourceAccountNames } from '../../src/shared/accountSearch.ts'
+import { resolveOidcRegistrationExpiry } from '../../src/shared/oidcRegistration.ts'
 
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
@@ -87,6 +88,7 @@ function mainHarness(registrationExpiry = expiry) {
     normalizeSubscriptionType,
     parseAccountUsage,
     CLIENT_REGISTRATION_EXPIRY_BUFFER_MS: 900000,
+    resolveOidcRegistrationExpiry,
     console: { log() {}, error() {} },
     setTimeout(run) {
       queueMicrotask(run)

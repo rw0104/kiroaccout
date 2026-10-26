@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import { normalizeCredentialRecord } from '../../src/shared/accountImport.ts'
+import * as registrationRecovery from '../../src/shared/oidcRegistration.ts'
 
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
@@ -24,6 +25,24 @@ const code = ts.transpileModule(source, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
 }).outputText
 
+const legacySecret = (clientId = base.clientId, deadline = expires / 1000 + 0.180562) =>
+  [
+    { alg: 'RS256', typ: 'JWT' },
+    { serialized: JSON.stringify({ clientId: { value: clientId }, expirationTimestamp: deadline }) }
+  ].map(value => Buffer.from(JSON.stringify(value)).toString('base64url')).join('.') + '.U1lOVEhFVElD'
+
+const mainSource = readFileSync(new URL('../../src/main/index.ts', import.meta.url), 'utf8')
+const mainTree = ts.createSourceFile('index.ts', mainSource, ts.ScriptTarget.Latest, true)
+let switchHandler
+function findSwitch(node) {
+  if (ts.isCallExpression(node) && node.arguments[0]?.text === 'switch-account') {
+    switchHandler = node.arguments[1].getText(mainTree)
+  }
+  ts.forEachChild(node, findSwitch)
+}
+findSwitch(mainTree)
+assert.ok(switchHandler)
+
 // Execute the complete module with filesystem and home replaced before evaluation.
 // No production paths, cache reads, writes, listeners or Electron are reachable.
 function harness({ registrationFailure = false } = {}) {
@@ -33,12 +52,14 @@ function harness({ registrationFailure = false } = {}) {
   vm.runInNewContext(code, {
     exports,
     Buffer,
+    Error,
     Date: class extends Date {
       static now() {
         return now
       }
     },
     require(name) {
+      if (name === '../shared/oidcRegistration') return registrationRecovery
       if (name === 'fs/promises')
         return {
           async mkdir(path, options) {
@@ -67,6 +88,68 @@ function harness({ registrationFailure = false } = {}) {
   })
   return { ...exports, calls, files }
 }
+
+function switching({ refreshFailure = false } = {}) {
+  const h = harness(), refreshes = []
+  const context = vm.createContext({
+    ...h,
+    Error,
+    Date: class extends Date { static now() { return now } },
+    console: { log() {}, warn() {}, error() {} },
+    instanceAccountOwnership: { assertAvailable() {} },
+    refreshTokenByMethod: async (...args) => {
+      refreshes.push(args)
+      return refreshFailure
+        ? { success: false, error: 'HTTP 401: 客户端注册已失效，请重新登录' }
+        : { success: true, accessToken: 'SYNTHETIC_ACCESS_2', refreshToken: 'SYNTHETIC_REFRESH_2', expiresIn: 3600 }
+    },
+    switchHandoffs: { issue: () => 'SYNTHETIC_HANDOFF' },
+    proactiveRenewalEnabled: false,
+    lastSwitchedAccountId: undefined,
+    lastWrittenTokenSignature: undefined
+  })
+  vm.runInContext(ts.transpileModule(`globalThis.switchAccount = ${switchHandler}`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 }
+  }).outputText, context)
+  return { ...h, refreshes, run: credentials => context.switchAccount(undefined, credentials) }
+}
+
+test('legacy IdC account switches through the real IPC using the matching secret registration deadline', async () => {
+  const h = switching()
+  const result = await h.run({ ...base, accountId: 'synthetic-account', clientSecret: legacySecret(), clientSecretExpiresAt: undefined })
+  assert.equal(result.success, true, result.error)
+  assert.equal(h.refreshes.length, 1)
+  assert.equal(h.refreshes[0][2], legacySecret(), 'the original secret must be verified upstream')
+  const token = [...h.files.values()].find(value => value.accessToken)
+  const registration = [...h.files.values()].find(value => value.clientId)
+  assert.equal(registration.expiresAt, new Date(expires).toISOString())
+  assert.equal(token.refreshToken, 'SYNTHETIC_REFRESH_2')
+  assert.equal(result.refreshedCredentials.refreshToken, token.refreshToken)
+  assert.equal(result.preparedExpiresAt, now + 3600000)
+})
+
+test('decoded registration metadata never bypasses the real switch refresh or publishes rejected credentials', async () => {
+  const h = switching({ refreshFailure: true })
+  const result = await h.run({ ...base, clientSecret: legacySecret(), clientSecretExpiresAt: undefined })
+  assert.equal(result.success, false)
+  assert.equal(h.refreshes.length, 1)
+  assert.match(result.error, /HTTP 401/)
+  assert.equal(h.files.size, 0)
+  assert.deepEqual(h.calls, [])
+})
+
+test('legacy recovery cannot borrow another client deadline or replace a known expired deadline', async () => {
+  for (const extra of [
+    { clientSecret: legacySecret('another-client'), clientSecretExpiresAt: undefined },
+    { clientSecret: legacySecret(), clientSecretExpiresAt: now / 1000 - 1 },
+    { clientSecret: legacySecret(base.clientId, (now + 900000) / 1000), clientSecretExpiresAt: undefined }
+  ]) {
+    const h = switching()
+    assert.equal((await h.run({ ...base, ...extra })).success, false)
+    assert.equal(h.refreshes.length, 0)
+    assert.equal(h.files.size, 0)
+  }
+})
 
 test('actual IDE cache writer stores the genuine OIDC registration expiry with UTC Z and writes registration before token', async () => {
   const h = harness()

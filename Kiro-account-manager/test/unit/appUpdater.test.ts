@@ -28,7 +28,7 @@ class Engine extends EventEmitter {
   async checkForUpdates() { this.checks++; return this.check() }
   async downloadUpdate() { this.downloads++; return this.download() }
   quitAndInstall(silent?: boolean, restart?: boolean) {
-    assert.equal(silent, false); assert.equal(restart, true)
+    assert.equal(silent, true); assert.equal(restart, true)
     this.installs++; this.install()
   }
 }

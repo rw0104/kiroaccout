@@ -18,6 +18,7 @@ import * as fsSync from 'fs'
 import * as path from 'path'
 import * as os from 'os'
 import * as crypto from 'crypto'
+import { resolveOidcRegistrationExpiry } from '../shared/oidcRegistration'
 
 export const KIRO_SSO_CACHE_DIR = path.join(os.homedir(), '.aws', 'sso', 'cache')
 export const KIRO_AUTH_TOKEN_PATH = path.join(KIRO_SSO_CACHE_DIR, 'kiro-auth-token.json')
@@ -101,7 +102,7 @@ export interface WriteKiroAuthTokenInput {
   /** IdC 必填：会一起写客户端注册文件 */
   clientId?: string
   clientSecret?: string
-  /** Actual OIDC registration deadline in Unix seconds; never synthesized. */
+  /** OIDC deadline in Unix seconds; old records can recover it from the matching client secret. */
   clientSecretExpiresAt?: number
   profileArn?: string
 }
@@ -133,22 +134,21 @@ export function validateKiroClientRegistration(
   now = Date.now()
 ): KiroClientRegistration | undefined {
   if (input.authMethod === 'social') return undefined
-  const rawExpiry = input.clientSecretExpiresAt
-  const milliseconds =
-    typeof rawExpiry === 'number' && Number.isFinite(rawExpiry)
-      ? Math.floor(rawExpiry >= 1e12 ? rawExpiry / 1000 : rawExpiry) * 1000
-      : NaN
+  const seconds = resolveOidcRegistrationExpiry(input)
+  const milliseconds = seconds === undefined ? NaN : seconds * 1000
   const expiry = new Date(milliseconds)
   if (
     input.authMethod !== 'IdC' ||
     !input.clientId?.trim() ||
-    !input.clientSecret?.trim() ||
-    !Number.isFinite(expiry.getTime()) ||
-    milliseconds <= now + CLIENT_REGISTRATION_EXPIRY_BUFFER_MS
+    !input.clientSecret?.trim()
   ) {
-    throw new Error(
-      'OIDC 客户端登记缺失、已过期或即将到期，请重新授权后切换；未改写 Kiro 登录缓存。'
-    )
+    throw new Error('OIDC 客户端凭证不完整，请重新授权后切换；未改写 Kiro 登录缓存。')
+  }
+  if (!Number.isFinite(expiry.getTime())) {
+    throw new Error('此账户缺少可恢复的 OIDC 登记有效期，请重新授权后切换；未改写 Kiro 登录缓存。')
+  }
+  if (milliseconds <= now + CLIENT_REGISTRATION_EXPIRY_BUFFER_MS) {
+    throw new Error('OIDC 客户端登记已过期或将在 15 分钟内到期，请重新授权后切换；未改写 Kiro 登录缓存。')
   }
   return {
     clientId: input.clientId,

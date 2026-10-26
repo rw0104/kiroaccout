@@ -227,7 +227,8 @@ export class AppUpdateController {
         this.installationPrepared = true
         this.deps.beforeInstall()
         this.invokingInstall = true
-        try { this.deps.updater.quitAndInstall(false, true) }
+        // Assisted NSIS installers only honor --force-run when also launched silently.
+        try { this.deps.updater.quitAndInstall(true, true) }
         finally { this.invokingInstall = false }
         return { success: this.state.status !== 'error', state: this.getState(), error: this.state.error }
       } catch {
