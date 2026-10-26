@@ -56,7 +56,8 @@ import { randomUUID } from 'node:crypto'
 import { TokenRefreshService, type AuthRefreshResult } from './authRefresh'
 import { LoginSessionManager } from './loginSessions'
 import { KIRO_LEGACY_IDENTITY } from '../shared/kiroClientCompatibility'
-import { openSecureStore, SecureStoreError } from './secureStore'
+import { SecureStoreError } from './secureStore'
+import { openSecureStoreForStartup, SecureStoreRecoveryCancelled } from './secureStoreRecovery'
 import {
   createTray,
   destroyTray,
@@ -1340,27 +1341,48 @@ function persistInstanceAccountCredentials(accountId: string, credentials: Insta
 
 // 最后保存的数据（用于崩溃恢复）
 let lastSavedData: unknown = null
+let storeInitialization: Promise<void> | null = null
 
 async function initStore(): Promise<void> {
+  if (storeInitialization) return storeInitialization
   if (store) return
-  const storeInstance = openSecureStore(app.getPath('userData'), safeStorage)
-  store = storeInstance
+  storeInitialization = (async () => {
+    const directory = app.getPath('userData')
+    const storeInstance = await openSecureStoreForStartup(directory, safeStorage, {
+      choose: async (conflict) => {
+        const { response } = await dialog.showMessageBox({
+          type: 'warning',
+          title: '账户迁移需要恢复',
+          message: '发现迁移后新增或变化的旧版账户资料',
+          detail: `现有安全账户库可以读取。请先退出其他版本的账号管理器。\n\n旧版文件：\n${conflict.files.map(file => `${file.name}（${file.bytes} 字节）`).join('\n')}\n\n选择继续后，将加密备份新旧账户资料，并使用现有安全库启动。旧文件中的新增账户或更新凭证不会自动合并，原文件会保留供后续核对。\n\n恢复备份：${conflict.archiveName}\n请保留整个账户数据目录及密钥文件。`,
+          buttons: ['备份并使用现有安全库', '打开数据目录', '暂不继续'],
+          defaultId: 2,
+          cancelId: 2,
+          noLink: true
+        })
+        return response === 0 ? 'continue' : response === 1 ? 'open-directory' : 'cancel'
+      },
+      openDirectory: (location) => shell.openPath(location)
+    })
+    store = storeInstance
 
-  // 一次性迁移：清理 BuilderId 占位符 profileArn 等脏数据
-  // 详见 migrateAccountDataIfNeeded 注释
-  try {
-    migrateAccountDataIfNeeded()
-  } catch (error) {
-    console.error('[Store] Account data migration failed:', error)
-  }
+    // 一次性迁移：清理 BuilderId 占位符 profileArn 等脏数据
+    // 详见 migrateAccountDataIfNeeded 注释
+    try {
+      migrateAccountDataIfNeeded()
+    } catch (error) {
+      console.error('[Store] Account data migration failed:', error)
+    }
 
-  // 加载主动续期开关状态（默认关闭）
-  try {
-    proactiveRenewalEnabled = !!storeInstance.get('proactiveRenewalEnabled', false)
-    console.log(`[ProactiveRenewal] Loaded from settings: ${proactiveRenewalEnabled ? 'enabled' : 'disabled'}`)
-  } catch (e) {
-    console.warn('[ProactiveRenewal] Failed to load setting:', e)
-  }
+    // 加载主动续期开关状态（默认关闭）
+    try {
+      proactiveRenewalEnabled = !!storeInstance.get('proactiveRenewalEnabled', false)
+      console.log(`[ProactiveRenewal] Loaded from settings: ${proactiveRenewalEnabled ? 'enabled' : 'disabled'}`)
+    } catch (e) {
+      console.warn('[ProactiveRenewal] Failed to load setting:', e)
+    }
+  })()
+  try { await storeInitialization } finally { storeInitialization = null }
 }
 
 // ============ Kiro IDE Auth Token 反向同步 ============
@@ -2338,7 +2360,9 @@ function handleProtocolUrl(url: string): void {
 // Some APIs can only be used after this event occurs.
 app.whenReady().then(async () => {
   try { await initStore() } catch (error) {
-    dialog.showErrorBox('账户安全存储不可用', error instanceof SecureStoreError ? error.message : '无法打开账户安全存储。请检查系统钥匙串、文件权限和备份；现有账户文件不会被覆盖。')
+    if (!(error instanceof SecureStoreRecoveryCancelled)) {
+      dialog.showErrorBox('账户安全存储不可用', error instanceof SecureStoreError ? error.message : '无法打开账户安全存储。请检查系统钥匙串、文件权限和备份；现有账户文件不会被覆盖。')
+    }
     app.quit()
     return
   }

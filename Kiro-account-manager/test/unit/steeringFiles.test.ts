@@ -66,7 +66,9 @@ test('descriptor identity changes fail before any truncation or read', t => {
   h.files.write('rules.md', 'CANARY')
   const io = { ...fs, fstatSync: ((fd: number) => {
     const stat = fs.fstatSync(fd)
-    stat.ino += 1
+    // Windows file IDs can exceed Number.MAX_SAFE_INTEGER, making +1 a no-op.
+    // Substitute a different identity explicitly so the injected race is real.
+    stat.ino = stat.ino === 0 ? 1 : 0
     return stat
   }) as typeof fs.fstatSync }
   const guarded = createSteeringFiles(h.home, io)

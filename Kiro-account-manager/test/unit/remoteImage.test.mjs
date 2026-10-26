@@ -89,14 +89,24 @@ test('length headers, chunked streams and decompressed bodies enforce the 10MB l
   const hugeLength = await fixture(t, (_req, res) => { res.writeHead(200, { 'content-type': 'image/png', 'content-length': 11 * 1024 * 1024 }); res.flushHeaders() })
   await assert.rejects(hugeLength.download()('http://public.invalid/a'), /10MB/i)
   let closed = false
+  const closedEvent = Promise.withResolvers()
   const stream = await fixture(t, (_req, res) => {
     res.writeHead(200, { 'content-type': 'image/png' })
     const timer = setInterval(() => res.write(Buffer.alloc(256 * 1024)), 1)
-    res.on('close', () => { closed = true; clearInterval(timer) })
+    res.once('close', () => { closed = true; clearInterval(timer); closedEvent.resolve() })
   })
   await assert.rejects(stream.download()('http://public.invalid/a'), /10MB/i)
-  // Socket shutdown propagates asynchronously to the local fixture.
-  await new Promise(resolve => setTimeout(resolve, 20))
+  // Wait for cancellation to reach the server through the local proxy. The
+  // deadline still fails a leaked connection without assuming scheduler timing.
+  let closeDeadline
+  try {
+    await Promise.race([
+      closedEvent.promise,
+      new Promise((_resolve, reject) => {
+        closeDeadline = setTimeout(() => reject(new Error('Image upstream did not close after the 10MB rejection')), 5000)
+      })
+    ])
+  } finally { clearTimeout(closeDeadline) }
   assert.equal(closed, true)
   const compressed = gzipSync(Buffer.alloc(11 * 1024 * 1024))
   const bomb = await fixture(t, (_req, res) => { res.writeHead(200, { 'content-type': 'image/png', 'content-encoding': 'gzip', 'content-length': compressed.length }); res.end(compressed) })
