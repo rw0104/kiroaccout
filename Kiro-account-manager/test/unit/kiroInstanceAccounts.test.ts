@@ -39,6 +39,86 @@ async function fixture(t: { after(action: () => Promise<void>): void }, account 
 const options = { skip: process.platform !== 'win32' }
 const denied = async (action: Promise<unknown>) => assert.rejects(action, error => error instanceof KiroInstanceError && !/SYNTHETIC_(?:REFRESH|SECRET|SIGNATURE)/.test(error.message))
 
+test('1.4.51 instance seed writes the selected Builder reconnect descriptor inside its dedicated home', options, async t => {
+  const account = social()
+  account.credentials = { ...account.credentials, provider: 'BuilderId', authMethod: 'IdC',
+    clientId: 'SYNTHETIC_CLIENT', clientSecret: 'SYNTHETIC_SECRET', clientSecretExpiresAt: now / 1000 + 86400 }
+  const ctx = await fixture(t, account)
+  const result = await prepareKiroInstanceAccount(ctx.input)
+  assert.deepEqual(JSON.parse(await fs.readFile(win32.join(ctx.cache, 'kiro-connection.json'), 'utf8')), { authMethod: 'IdC', provider: 'BuilderId' })
+  assert.equal(result.reconnectReady, true)
+})
+
+test('1.4.51 existing Social binding clears stale reconnect state without touching sibling state', options, async t => {
+  const selected = await fixture(t, social('synthetic-selected'))
+  const sibling = await fixture(t, social('synthetic-sibling'))
+  await prepareKiroInstanceAccount(selected.input)
+  await prepareKiroInstanceAccount(sibling.input)
+  const stale = { authMethod: 'IdC', provider: 'Enterprise', startUrl: 'https://stale.awsapps.com/start', region: 'us-east-1' }
+  const connection = win32.join(selected.cache, 'kiro-connection.json')
+  const siblingConnection = win32.join(sibling.cache, 'kiro-connection.json')
+  await fs.writeFile(connection, JSON.stringify(stale))
+  await fs.writeFile(siblingConnection, JSON.stringify(stale))
+  const token = await selected.token()
+  const result = await prepareKiroInstanceAccount(selected.input)
+  assert.equal(result.source, 'instance')
+  await assert.rejects(fs.access(connection))
+  assert.deepEqual(await selected.token(), token)
+  assert.deepEqual(JSON.parse(await fs.readFile(siblingConnection, 'utf8')), stale)
+})
+
+test('1.4.51 instance reconnect state is untouched until the cached account identity is verified', options, async t => {
+  const ctx = await fixture(t)
+  await prepareKiroInstanceAccount(ctx.input)
+  const connection = win32.join(ctx.cache, 'kiro-connection.json')
+  const stale = { authMethod: 'IdC', provider: 'Enterprise', startUrl: 'https://stale.awsapps.com/start', region: 'us-east-1' }
+  await fs.writeFile(connection, JSON.stringify(stale))
+  await ctx.writeToken({ ...await ctx.token(), accessToken: jwt('different-account', 2) })
+  await denied(prepareKiroInstanceAccount(ctx.input))
+  assert.deepEqual(JSON.parse(await fs.readFile(connection, 'utf8')), stale)
+})
+
+test('1.4.51 instance rejects unsafe reconnect targets before publishing a new login token', options, async t => {
+  const ctx = await fixture(t)
+  await fs.mkdir(win32.join(ctx.cache, 'kiro-connection.json'))
+  await denied(prepareKiroInstanceAccount(ctx.input))
+  await assert.rejects(fs.access(ctx.tokenPath))
+})
+
+test('1.4.51 retained Enterprise binding uses the verified instance region for its reconnect hint', options, async t => {
+  const account = social()
+  account.credentials = { ...account.credentials, provider: 'Enterprise', authMethod: 'IdC',
+    startUrl: 'https://selected.awsapps.com/start', region: 'us-east-1',
+    profileArn: 'arn:aws:codewhisperer:us-east-1:123456789012:profile/synthetic',
+    clientId: 'SYNTHETIC_CLIENT', clientSecret: 'SYNTHETIC_SECRET', clientSecretExpiresAt: now / 1000 + 86400 }
+  const ctx = await fixture(t, account)
+  await prepareKiroInstanceAccount(ctx.input)
+  await ctx.writeToken({ ...await ctx.token(), region: 'eu-central-1' })
+  const result = await prepareKiroInstanceAccount(ctx.input)
+  assert.equal(result.source, 'instance')
+  assert.equal(result.reconnectReady, true)
+  assert.deepEqual(JSON.parse(await fs.readFile(win32.join(ctx.cache, 'kiro-connection.json'), 'utf8')), {
+    authMethod: 'IdC', provider: 'Enterprise', startUrl: 'https://selected.awsapps.com/start', region: 'eu-central-1'
+  })
+})
+
+test('1.4.51 Enterprise instance without issuer metadata removes stale hints instead of borrowing the personal default', options, async t => {
+  const account = social()
+  account.credentials = { ...account.credentials, provider: 'Enterprise', authMethod: 'IdC', region: 'us-east-1',
+    profileArn: 'arn:aws:codewhisperer:us-east-1:123456789012:profile/synthetic',
+    clientId: 'SYNTHETIC_CLIENT', clientSecret: 'SYNTHETIC_SECRET', clientSecretExpiresAt: now / 1000 + 86400 }
+  const ctx = await fixture(t, account)
+  const connection = win32.join(ctx.cache, 'kiro-connection.json')
+  await fs.writeFile(connection, JSON.stringify({ authMethod: 'IdC', provider: 'Enterprise', startUrl: 'https://stale.awsapps.com/start', region: 'us-east-1' }))
+  const result = await prepareKiroInstanceAccount(ctx.input)
+  assert.equal(result.reconnectReady, false)
+  await assert.rejects(fs.access(connection))
+  assert.equal((await ctx.token()).provider, 'Enterprise')
+  const retained = await prepareKiroInstanceAccount(ctx.input)
+  assert.equal(retained.reconnectReady, false)
+  await assert.rejects(fs.access(connection))
+})
+
 test('selected Social account seeds only its marked instance and stores no extra raw credentials in binding metadata', options, async t => {
   const ctx = await fixture(t)
   const original = structuredClone(ctx.account)

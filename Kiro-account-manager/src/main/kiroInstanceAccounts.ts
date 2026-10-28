@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { win32 } from 'node:path'
 import type { KiroInstanceRecord } from '../shared/kiroInstances'
 import { resolveIdentity } from '../shared/authIdentity'
+import { createKiroConnectionDescriptor, KIRO_CONNECTION_FILE_NAME, type KiroReconnectState } from '../shared/kiroConnection'
 import { canonicalWindowsPath, equalWindowsPath, instanceFileSystem, KiroInstanceError, makeInstancePaths, verifyInstanceDirectories } from './kiroInstancePaths'
 
 export interface InstanceAccountCredentials {
@@ -108,7 +109,7 @@ async function readJson(path: string): Promise<Record<string, unknown> | null> {
   if (!object(value)) return fail()
   return value
 }
-async function atomicJson(input: InstanceAccountInput, path: string, value: unknown): Promise<void> {
+async function atomicJson(input: InstanceAccountInput, path: string, value: unknown, noReplace = false): Promise<void> {
   await verifiedPaths(input)
   await checkedFile(path)
   const temporary = win32.join(win32.dirname(path), `.kiro-write-${randomUUID()}.tmp`)
@@ -119,10 +120,36 @@ async function atomicJson(input: InstanceAccountInput, path: string, value: unkn
     await handle.close()
     await verifiedPaths(input)
     await checkedFile(path)
-    await fs.rename(temporary, path)
+    if (noReplace) await fs.link(temporary, path)
+    else await fs.rename(temporary, path)
     // Windows treats mode as advisory; never claim this is an OS-user security boundary.
     await fs.chmod(path, 0o600).catch(() => {})
   } finally { await handle.close().catch(() => {}); await fs.unlink(temporary).catch(() => {}) }
+}
+
+async function clearInstanceConnection(input: InstanceAccountInput, cache: string): Promise<void> {
+  await verifiedPaths(input)
+  const target = win32.join(cache, KIRO_CONNECTION_FILE_NAME)
+  if (await checkedFile(target)) await fs.unlink(target)
+}
+
+async function writeInstanceConnection(input: InstanceAccountInput, cache: string, credentials: InstanceAccountCredentials): Promise<KiroReconnectState> {
+  const connection = createKiroConnectionDescriptor(credentials)
+  if (!connection) return { reconnectReady: false }
+  try {
+    const paths = await verifiedPaths(input)
+    const token = await readJson(paths.token)
+    if (!token || token.accessToken !== credentials.accessToken || token.refreshToken !== credentials.refreshToken ||
+      token.expiresAt !== new Date(credentials.expiresAt).toISOString() || token.authMethod !== credentials.authMethod || token.provider !== credentials.provider ||
+      credentials.authMethod === 'IdC' && token.region !== credentials.region) throw new Error('Instance credential handoff superseded')
+    await atomicJson(input, win32.join(cache, KIRO_CONNECTION_FILE_NAME), connection, true)
+    return { reconnectReady: true }
+  } catch {
+    // The token has already committed; a missing hint is safe and must not make
+    // the host discard a successfully prepared or rotated credential generation.
+    console.warn('[kiroInstanceAccounts] 实例凭证已准备，重连配置暂不可用；需要时请重新登录。')
+    return { reconnectReady: false, connectionWarning: 'reconnect-unavailable' }
+  }
 }
 function bindingFrom(value: Record<string, unknown>, input: InstanceAccountInput): Binding {
   const identity = selectedIdentity(input.account)
@@ -225,7 +252,7 @@ export async function readKiroInstanceAccountUpdate(input: InstanceAccountInput)
 }
 
 /** Seed/retain a bound account; only its official client may refresh expired access tokens. */
-export async function prepareKiroInstanceAccount(input: InstanceAccountInput): Promise<InstanceAccountUpdate & { source: 'manager' | 'instance' }> {
+export async function prepareKiroInstanceAccount(input: InstanceAccountInput): Promise<InstanceAccountUpdate & KiroReconnectState & { source: 'manager' | 'instance' }> {
   try {
     return await locked(input.record.paths.root, async () => {
       const paths = await verifiedPaths(input)
@@ -244,7 +271,12 @@ export async function prepareKiroInstanceAccount(input: InstanceAccountInput): P
         } else if (bindingValue) bindingFrom(bindingValue, input)
       }
       const previous = input.resetPending ? null : await readUpdate(input)
-      if (previous) return { ...previous, source: 'instance' }
+      if (previous) {
+        await clearInstanceConnection(input, paths.cache)
+        return { ...previous, source: 'instance', ...await writeInstanceConnection(input, paths.cache, {
+          ...previous.credentials, startUrl: input.account.credentials.startUrl
+        }) }
+      }
       const identity = selectedIdentity(input.account)
       const credentials = input.account.credentials
       if (!nonempty(credentials.accessToken) || !nonempty(credentials.refreshToken) || !Number.isFinite(credentials.expiresAt) || !Number.isFinite(new Date(credentials.expiresAt).getTime())) return fail('所选账户凭证不完整或到期时间无效，请先修复账户资料。')
@@ -257,16 +289,22 @@ export async function prepareKiroInstanceAccount(input: InstanceAccountInput): P
         ...(nonempty(input.account.userId) ? { userIdFingerprint: fingerprint(input.account.userId) } : {}) }
       let startUrl = credentials.startUrl
       let clientSecretExpiresAt = credentials.clientSecretExpiresAt
+      let clientRegistration: { path: string; data: { clientId: string; clientSecret: string; expiresAt: string } } | undefined
       if (identity.authMethod === 'IdC') {
         const reg = registration(input.account, now)
         const region = credentials.region || 'us-east-1'
         if (!/^[a-z]{2}(?:-[a-z]+){1,3}-\d+$/.test(region)) return fail('账户区域无效，请检查账户资料。')
         token.clientIdHash = reg.hash; token.region = region; binding.clientIdHash = reg.hash; startUrl = reg.startUrl; clientSecretExpiresAt = reg.expiresAt
-        await atomicJson(input, win32.join(paths.cache, `${reg.hash}.json`), reg.data)
+        clientRegistration = { path: win32.join(paths.cache, `${reg.hash}.json`), data: reg.data }
       }
+      await clearInstanceConnection(input, paths.cache)
+      if (clientRegistration) await atomicJson(input, clientRegistration.path, clientRegistration.data)
       await atomicJson(input, paths.binding, binding)
       await atomicJson(input, paths.token, token)
-      return { source: 'manager', credentials: { ...credentials, provider: identity.provider, authMethod: identity.authMethod, profileArn, ...(startUrl ? { startUrl } : {}), ...(clientSecretExpiresAt !== undefined ? { clientSecretExpiresAt } : {}) } }
+      return { source: 'manager', ...await writeInstanceConnection(input, paths.cache, {
+        ...credentials, provider: identity.provider, authMethod: identity.authMethod,
+        ...(identity.authMethod === 'IdC' && identity.provider !== 'Enterprise' ? { region: token.region as string } : {})
+      }), credentials: { ...credentials, provider: identity.provider, authMethod: identity.authMethod, profileArn, ...(startUrl ? { startUrl } : {}), ...(clientSecretExpiresAt !== undefined ? { clientSecretExpiresAt } : {}) } }
     })
   } catch (error) { if (error instanceof KiroInstanceError) throw error; return fail() }
 }

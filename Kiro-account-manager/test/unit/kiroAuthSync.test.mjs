@@ -5,6 +5,7 @@ import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import { normalizeCredentialRecord } from '../../src/shared/accountImport.ts'
 import * as registrationRecovery from '../../src/shared/oidcRegistration.ts'
+import * as connectionRules from '../../src/shared/kiroConnection.ts'
 
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
@@ -45,7 +46,7 @@ assert.ok(switchHandler)
 
 // Execute the complete module with filesystem and home replaced before evaluation.
 // No production paths, cache reads, writes, listeners or Electron are reachable.
-function harness({ registrationFailure = false } = {}) {
+function harness({ registrationFailure = false, connectionDeleteFailure = false, connectionWriteFailure = false, tokenFailure = false, externalHandoff = false, clock = () => now } = {}) {
   const calls = [],
     files = new Map(),
     exports = {}
@@ -55,7 +56,7 @@ function harness({ registrationFailure = false } = {}) {
     Error,
     Date: class extends Date {
       static now() {
-        return now
+        return clock()
       }
     },
     require(name) {
@@ -67,9 +68,35 @@ function harness({ registrationFailure = false } = {}) {
           },
           async writeFile(path, content, options) {
             calls.push(['write', path, options])
+            if (tokenFailure && path.endsWith('kiro-auth-token.json')) throw new Error('SYNTHETIC_TOKEN_DISK_FAILURE')
+            if (connectionWriteFailure && /kiro-connection/.test(path)) throw new Error('SYNTHETIC_CONNECTION_DISK_FAILURE')
             if (registrationFailure && !path.endsWith('kiro-auth-token.json'))
               throw new Error('SYNTHETIC_DISK_FAILURE')
             files.set(path, JSON.parse(content))
+            if (externalHandoff && path.endsWith('kiro-auth-token.json')) {
+              files.set(path, { provider: 'Enterprise', accessToken: 'SYNTHETIC_EXTERNAL_ACCESS', refreshToken: 'SYNTHETIC_EXTERNAL_REFRESH' })
+              files.set(path.replace('kiro-auth-token.json', 'kiro-connection.json'), { authMethod: 'IdC', provider: 'Enterprise', startUrl: 'https://external.awsapps.com/start', region: 'us-west-2' })
+            }
+          },
+          async readFile(path) {
+            if (!files.has(path)) throw Object.assign(new Error('Synthetic absent file'), { code: 'ENOENT' })
+            return JSON.stringify(files.get(path), null, 2)
+          },
+          async unlink(path) {
+            calls.push(['unlink', path])
+            if (connectionDeleteFailure && path.endsWith('kiro-connection.json')) throw Object.assign(new Error('SYNTHETIC_CONNECTION_DELETE_FAILURE'), { code: 'EACCES' })
+            if (!files.delete(path)) throw Object.assign(new Error('Synthetic absent file'), { code: 'ENOENT' })
+          },
+          async rename(from, to) {
+            calls.push(['rename', from, to])
+            if (!files.has(from)) throw Object.assign(new Error('Synthetic absent file'), { code: 'ENOENT' })
+            files.set(to, files.get(from))
+            files.delete(from)
+          },
+          async link(from, to) {
+            if (files.has(to)) throw Object.assign(new Error('Synthetic existing file'), { code: 'EEXIST' })
+            if (!files.has(from)) throw Object.assign(new Error('Synthetic absent file'), { code: 'ENOENT' })
+            files.set(to, files.get(from))
           },
           async chmod(path, mode) {
             calls.push(['chmod', path, mode])
@@ -82,12 +109,14 @@ function harness({ registrationFailure = false } = {}) {
           }
         }
       if (name === 'os') return { homedir: () => 'SYNTHETIC_HOME' }
+      if (name === '../shared/kiroConnection') return connectionRules
       if (['path', 'crypto'].includes(name)) return require(name)
       throw new Error(`Unexpected module: ${name}`)
     }
   })
   return { ...exports, calls, files }
 }
+
 
 function switching({ refreshFailure = false } = {}) {
   const h = harness(), refreshes = []
@@ -233,4 +262,110 @@ test('a registration write failure never publishes the new token and social logi
   assert.equal(result.clientRegPath, undefined)
   assert.equal(social.files.size, 1)
   assert.equal(social.files.get(result.tokenPath).clientIdHash, undefined)
+})
+
+// eslint-disable-next-line @typescript-eslint/explicit-function-return-type -- This JavaScript test helper cannot use a TypeScript return annotation.
+const connectionPath = h => h.KIRO_AUTH_TOKEN_PATH.replace('kiro-auth-token.json', 'kiro-connection.json')
+const oldConnection = { authMethod: 'IdC', provider: 'Enterprise', startUrl: 'https://old-org.awsapps.com/start', region: 'us-east-1' }
+
+test('1.4.51 Social handoff removes the previous organization reconnect target', async () => {
+  const h = harness()
+  h.files.set(connectionPath(h), oldConnection)
+  const result = await h.writeKiroAuthTokenFile({ ...base, authMethod: 'social', provider: 'Google' })
+  assert.equal(h.files.has(connectionPath(h)), false)
+  assert.equal(h.files.get(result.tokenPath).provider, 'Google')
+})
+
+test('1.4.51 handoff writes only the selected official Builder, Internal or Enterprise reconnect schema', async () => {
+  for (const [extra, expected] of [
+    [{ provider: 'BuilderId' }, { authMethod: 'IdC', provider: 'BuilderId' }],
+    [{ provider: 'Internal' }, { authMethod: 'IdC', provider: 'Internal' }],
+    [{ provider: 'Enterprise', startUrl: 'https://new-org.awsapps.com/start', region: 'eu-central-1' }, { authMethod: 'IdC', provider: 'Enterprise', startUrl: 'https://new-org.awsapps.com/start', region: 'eu-central-1' }]
+  ]) {
+    const h = harness()
+    h.files.set(connectionPath(h), oldConnection)
+    const result = await h.writeKiroAuthTokenFile({ ...base, ...extra })
+    assert.deepEqual(h.files.get(connectionPath(h)), expected)
+    assert.equal(result.reconnectReady, true)
+    assert.doesNotMatch(JSON.stringify(h.files.get(connectionPath(h))), /SYNTHETIC_(?:ACCESS|REFRESH|CLIENT|SECRET)/)
+  }
+})
+
+test('incomplete Enterprise reconnect metadata clears stale state without inventing a personal issuer', async () => {
+  const h = harness()
+  h.files.set(connectionPath(h), oldConnection)
+  const result = await h.writeKiroAuthTokenFile({ ...base, provider: 'Enterprise' })
+  assert.equal(h.files.has(connectionPath(h)), false)
+  assert.equal(result.reconnectReady, false)
+  assert.equal(h.files.get(result.tokenPath).provider, 'Enterprise')
+})
+
+test('failure to clear the old reconnect target rejects before publishing another account token', async () => {
+  const h = harness({ connectionDeleteFailure: true })
+  h.files.set(connectionPath(h), oldConnection)
+  await assert.rejects(h.writeKiroAuthTokenFile({ ...base, authMethod: 'social', provider: 'Google' }))
+  assert.equal(h.files.has(h.KIRO_AUTH_TOKEN_PATH), false)
+  assert.deepEqual(h.files.get(connectionPath(h)), oldConnection)
+})
+
+test('failed token publication leaves no new reconnect target paired with the old token', async () => {
+  const h = harness({ tokenFailure: true })
+  h.files.set(connectionPath(h), oldConnection)
+  h.files.set(h.KIRO_AUTH_TOKEN_PATH, { provider: 'Enterprise', accessToken: 'SYNTHETIC_OLD_ACCESS' })
+  await assert.rejects(h.writeKiroAuthTokenFile(base))
+  assert.equal(h.files.has(connectionPath(h)), false)
+  assert.equal(h.files.get(h.KIRO_AUTH_TOKEN_PATH).accessToken, 'SYNTHETIC_OLD_ACCESS')
+})
+
+test('a reconnect descriptor write failure preserves committed credentials and degrades to no reconnect target', async () => {
+  const h = harness({ connectionWriteFailure: true })
+  h.files.set(connectionPath(h), oldConnection)
+  const result = await h.writeKiroAuthTokenFile(base)
+  assert.equal(h.files.has(connectionPath(h)), false)
+  assert.equal(result.reconnectReady, false)
+  assert.equal(result.connectionWarning, 'reconnect-unavailable')
+  assert.equal(h.files.get(result.tokenPath).accessToken, base.accessToken)
+})
+
+test('overlapping account handoffs publish one matching final token and reconnect state', async () => {
+  const h = harness()
+  h.files.set(connectionPath(h), oldConnection)
+  await Promise.all([
+    h.writeKiroAuthTokenFile({ ...base, provider: 'Enterprise', startUrl: 'https://new.awsapps.com/start', region: 'eu-central-1' }),
+    h.writeKiroAuthTokenFile({ ...base, authMethod: 'social', provider: 'Google' })
+  ])
+  assert.equal(h.files.get(h.KIRO_AUTH_TOKEN_PATH).provider, 'Google')
+  assert.equal(h.files.has(connectionPath(h)), false)
+  assert.equal([...h.files.keys()].some(path => path.endsWith('.tmp')), false)
+})
+
+test('reconnect hints reject incomplete or unsafe issuer data without inventing an enterprise connection', () => {
+  const build = connectionRules.createKiroConnectionDescriptor
+  assert.deepEqual(build({ authMethod: 'IdC', provider: 'Enterprise', startUrl: 'https://example.invalid', region: 'us-east-1' }), {
+    authMethod: 'IdC', provider: 'Enterprise', startUrl: 'https://example.invalid/', region: 'us-east-1'
+  })
+  for (const extra of [
+    { startUrl: undefined }, { region: undefined }, { region: 'us-east-1\n' },
+    { startUrl: 'http://example.invalid' }, { startUrl: 'https://user:password@example.invalid' },
+    { startUrl: 'https://example.invalid/#secret' }, { startUrl: 'https://example.invalid/\n' }, { startUrl: 'https://example.invalid/\u0085' },
+    { startUrl: 'https://example.invalid/' + 'a'.repeat(2048) }
+  ]) assert.equal(build({ authMethod: 'IdC', provider: 'Enterprise', startUrl: 'https://example.invalid', region: 'us-east-1', ...extra }), undefined)
+  assert.equal(build({ authMethod: 'social', provider: 'Enterprise', startUrl: 'https://example.invalid', region: 'us-east-1' }), undefined)
+})
+
+test('an official client handoff after token publication preserves its newer credentials and reconnect descriptor', async () => {
+  const h = harness({ externalHandoff: true })
+  const result = await h.writeKiroAuthTokenFile(base)
+  assert.equal(result.reconnectReady, false)
+  assert.equal(h.files.get(result.tokenPath).accessToken, 'SYNTHETIC_EXTERNAL_ACCESS')
+  assert.deepEqual(h.files.get(connectionPath(h)), { authMethod: 'IdC', provider: 'Enterprise', startUrl: 'https://external.awsapps.com/start', region: 'us-west-2' })
+})
+
+test('queued handoffs recheck the real registration deadline before touching the cache', async () => {
+  let currentTime = now
+  const h = harness({ clock: () => currentTime })
+  const pending = h.writeKiroAuthTokenFile(base)
+  currentTime = expires - 900000
+  await assert.rejects(pending, /重新授权/)
+  assert.deepEqual(h.calls, [])
 })

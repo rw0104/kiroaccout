@@ -19,9 +19,12 @@ import * as path from 'path'
 import * as os from 'os'
 import * as crypto from 'crypto'
 import { resolveOidcRegistrationExpiry } from '../shared/oidcRegistration'
+import { createKiroConnectionDescriptor, KIRO_CONNECTION_FILE_NAME, type KiroReconnectState } from '../shared/kiroConnection'
 
 export const KIRO_SSO_CACHE_DIR = path.join(os.homedir(), '.aws', 'sso', 'cache')
 export const KIRO_AUTH_TOKEN_PATH = path.join(KIRO_SSO_CACHE_DIR, 'kiro-auth-token.json')
+export const KIRO_CONNECTION_PATH = path.join(KIRO_SSO_CACHE_DIR, KIRO_CONNECTION_FILE_NAME)
+let cacheWriteQueue: Promise<void> = Promise.resolve()
 
 const KIRO_DEFAULT_START_URL = 'https://view.awsapps.com/start'
 const CLIENT_REGISTRATION_EXPIRY_BUFFER_MS = 900_000
@@ -107,9 +110,10 @@ export interface WriteKiroAuthTokenInput {
   profileArn?: string
 }
 
-export interface WriteKiroAuthTokenResult {
+export interface WriteKiroAuthTokenResult extends KiroReconnectState {
   tokenPath: string
   clientRegPath?: string
+  connectionPath?: string
 }
 
 function computeClientIdHash(startUrl?: string): string {
@@ -168,8 +172,21 @@ export async function writeKiroAuthTokenFile(
 ): Promise<WriteKiroAuthTokenResult> {
   // Validate the complete registration before creating the cache directory or
   // publishing a token. The official IDE rejects registration inside 15 minutes.
-  const registration = validateKiroClientRegistration(input)
+  const prepared = { ...input }
+  validateKiroClientRegistration(prepared)
+  const task = cacheWriteQueue.then(() =>
+    writePreparedKiroAuthTokenFile(prepared, validateKiroClientRegistration(prepared))
+  )
+  cacheWriteQueue = task.then(() => undefined, () => undefined)
+  return task
+}
+
+async function writePreparedKiroAuthTokenFile(
+  input: WriteKiroAuthTokenInput,
+  registration: KiroClientRegistration | undefined
+): Promise<WriteKiroAuthTokenResult> {
   const clientIdHash = computeClientIdHash(input.startUrl)
+  const connection = createKiroConnectionDescriptor(input)
 
   const tokenData: Record<string, unknown> =
     input.authMethod === 'social'
@@ -193,6 +210,13 @@ export async function writeKiroAuthTokenFile(
         }
 
   await fs.mkdir(KIRO_SSO_CACHE_DIR, { recursive: true })
+  // Remove the previous account's reconnect hint before publishing credentials.
+  // Absence is supported by Kiro; failure to remove stale state must stop handoff.
+  try {
+    await fs.unlink(KIRO_CONNECTION_PATH)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error
+  }
   let clientRegPath: string | undefined
   // Registration must be available before the IDE can observe the new token.
   if (registration) {
@@ -214,7 +238,31 @@ export async function writeKiroAuthTokenFile(
     /* ignore */
   }
 
-  return { tokenPath: KIRO_AUTH_TOKEN_PATH, clientRegPath }
+  let reconnectReady = false
+  let connectionWarning: KiroReconnectState['connectionWarning']
+  if (connection) {
+    const temporary = path.join(KIRO_SSO_CACHE_DIR, `.kiro-connection-${crypto.randomUUID()}.tmp`)
+    try {
+      await fs.writeFile(temporary, JSON.stringify(connection, null, 2), { mode: 0o600, flag: 'wx' })
+      // An official client can publish another generation after our token write.
+      // Never overwrite its reconnect hint or attach our hint to that generation.
+      if (await fs.readFile(KIRO_AUTH_TOKEN_PATH, 'utf8') !== JSON.stringify(tokenData, null, 2)) {
+        throw new Error('Kiro credential handoff superseded')
+      }
+      await fs.link(temporary, KIRO_CONNECTION_PATH)
+      reconnectReady = true
+    } catch {
+      // Credentials have committed. Returning failure here would discard rotated
+      // credentials in callers; the safe fallback is a missing reconnect hint.
+      connectionWarning = 'reconnect-unavailable'
+      console.warn('[kiroAuthSync] 已保存登录凭证，重连配置暂不可用；需要时请重新登录。')
+    } finally {
+      await fs.unlink(temporary).catch(() => {})
+    }
+  }
+  return { tokenPath: KIRO_AUTH_TOKEN_PATH, clientRegPath, reconnectReady,
+    ...(reconnectReady ? { connectionPath: KIRO_CONNECTION_PATH } : {}),
+    ...(connectionWarning ? { connectionWarning } : {}) }
 }
 
 export async function readKiroAuthTokenFile(): Promise<KiroAuthTokenFile | null> {
