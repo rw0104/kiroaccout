@@ -52,6 +52,10 @@ import { normalizeSubscriptionType } from '../shared/accountSubscription'
 import { requestControlPlane, ControlPlaneError } from './kiroControlPlane'
 import { SwitchHandoffStore } from './switchHandoff'
 import { inspectKiroCliRegistration, KiroCliRegistrationError, resolveKiroCliDatabasePath, writeKiroCliRegisteredToken } from './kiroCliStorage'
+import { ClientAccessProjectionService, type ManagerAccessSnapshot, type ClientAccessProjectionBinding } from './clientAccessProjection'
+import { ClientSwitchService } from './clientSwitch'
+import { ClientRuntimeRegistry, type ClientRuntimeConfig } from './clientRuntimes'
+import { registerClientSwitchIpc } from './ipc/clientSwitch'
 import { trackWindowVisibility } from './windowVisibility'
 import { filterAvailableModels, toAccountModel } from '../shared/modelCatalog'
 import { KiroModelPreferencesService, ModelPreferencesError, type ModelPreferenceAccount } from './kiroModelPreferences'
@@ -1270,6 +1274,94 @@ const instanceAccountOwnership = new InstanceAccountOwnership({
   accounts: () => (store?.get('accountData') as { accounts?: Record<string, unknown> } | undefined)?.accounts || {}
 })
 
+let clientAccessProjection: ClientAccessProjectionService | undefined
+let clientProjectionTimer: ReturnType<typeof setInterval> | undefined
+
+/** Read the current generation only. This boundary never returns refresh credentials. */
+function getClientProjectionAccess(accountId: string): ManagerAccessSnapshot | undefined {
+  const data = store?.get('accountData') as { accounts?: Record<string, { id: string; userId?: string; idp?: string; profileArn?: string; status?: string; credentials?: Record<string, unknown> }> } | undefined
+  if (!data?.accounts || !Object.hasOwn(data.accounts, accountId)) return undefined
+  const account = data.accounts[accountId]
+  const credentials = account.credentials
+  if (account.id !== accountId || !credentials || account.status === 'banned') return undefined
+  if (typeof account.userId !== 'string' || !account.userId.trim()) return undefined
+  if (account.profileArn && credentials.profileArn && account.profileArn !== credentials.profileArn) return undefined
+  try { instanceAccountOwnership.assertAvailable({ accountId }) } catch { return undefined }
+  const identity = resolveIdentity({ provider: credentials.provider, idp: account.idp,
+    hasClientCredentials: !!(credentials.clientId && credentials.clientSecret) })
+  if (!identity.ok || typeof credentials.accessToken !== 'string' || typeof credentials.expiresAt !== 'number') return undefined
+  const profileArn = typeof credentials.profileArn === 'string' ? credentials.profileArn : account.profileArn
+  return {
+    principalId: account.userId,
+    ...(account.status === 'error' ? { temporarilyUnavailable: true } : {}),
+    accessToken: credentials.accessToken, expiresAt: credentials.expiresAt,
+    provider: identity.provider, authMethod: identity.authMethod,
+    ...(profileArn ? { profileArn } : {}),
+    ...(typeof credentials.region === 'string' ? { region: credentials.region } : {}),
+    ...(identity.provider === 'Enterprise' && typeof credentials.startUrl === 'string' ? { startUrl: credentials.startUrl } : {})
+  }
+}
+
+function setupClientSwitching(): void {
+  const bindings = (): ClientAccessProjectionBinding[] => {
+    const saved = store?.get('clientAccessBindings')
+    return Array.isArray(saved) ? saved as ClientAccessProjectionBinding[] : []
+  }
+  const runtimes = new ClientRuntimeRegistry({
+    helperPath: join(__dirname, '../../resources/client-switch/crew-access.py').replace(/app\.asar([/\\])/, 'app.asar.unpacked$1'),
+    readConfig: target => {
+      const config = store?.get('clientSwitchRuntimes') as Record<string, ClientRuntimeConfig> | undefined
+      return config && Object.hasOwn(config, target) ? config[target] : undefined
+    },
+    writeConfig: (target, config) => {
+      if (!store) throw new Error('Account store unavailable')
+      const previous = store.get('clientSwitchRuntimes')
+      store.set('clientSwitchRuntimes', { ...(previous && typeof previous === 'object' ? previous : {}), [target]: config })
+    }
+  })
+  const projection = new ClientAccessProjectionService({
+    account: getClientProjectionAccess,
+    adapter: id => runtimes.adapter(id),
+    readBindings: bindings,
+    writeBinding: (binding, expected) => {
+      if (!store) return false
+      const records = bindings()
+      if (records.find(item => item.authDomainId === binding.authDomainId)?.revision !== expected) return false
+      store.set('clientAccessBindings', [...records.filter(item => item.authDomainId !== binding.authDomainId), binding])
+      return true
+    }
+  })
+  clientAccessProjection = projection
+  const service = new ClientSwitchService({
+    account: getClientProjectionAccess, runtime: target => runtimes.get(target), projection, bindings,
+    platformSupported: () => process.platform === 'win32',
+    beginOperation: accountId => instanceAccountOwnership.beginOperation({ accountId })
+  })
+  registerClientSwitchIpc({
+    ipc: ipcMain,
+    trusted: event => requireTrustedMainWindow(event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined),
+    service,
+    chooseExecutable: async target => {
+      if (process.platform !== 'win32') return { success: false, message: '此版本的 CLI/Crew 连接目前仅支持 Windows。' }
+      if (!mainWindow) return { success: false, message: '主窗口不可用。' }
+      const selected = await dialog.showOpenDialog(mainWindow, { title: target === 'crew' ? '选择 KiroCrew.exe' : '选择 kiro-cli.exe',
+        properties: ['openFile'], filters: [{ name: 'Official Kiro client', extensions: process.platform === 'win32' ? ['exe'] : ['*'] }] })
+      if (selected.canceled || selected.filePaths.length !== 1) return { success: false, canceled: true }
+      try { await runtimes.configure(target, selected.filePaths[0]); return { success: true } }
+      catch { return { success: false, message: '请选择已验证版本的官方客户端（CLI 3.1.0 / Crew 0.12.0）；此安装未通过兼容性检查。' } }
+    }
+  })
+  const tick = async (): Promise<void> => {
+    // Hydrate and revalidate adapters before resuming persisted projection bindings.
+    const selected = new Set(bindings().filter(binding => binding.status === 'active').map(binding => binding.runtimeId.startsWith('crew:') ? 'crew' as const : 'cli' as const))
+    await Promise.all([...selected].map(target => runtimes.get(target).catch(() => undefined)))
+    await projection.tick()
+  }
+  clientProjectionTimer = setInterval(() => { void tick().catch(() => {}) }, 15_000)
+  clientProjectionTimer.unref?.()
+  void tick().catch(() => {})
+}
+
 const modelPreferences = new KiroModelPreferencesService({
   account: id => {
     const data = store?.get('accountData') as {
@@ -2394,6 +2486,7 @@ app.whenReady().then(async () => {
   // 初始化日志系统（尽早拦截，确保所有 console 输出都进入日志存储）
   proxyLogStore.initialize(app.getPath('userData'))
   interceptConsole()
+  setupClientSwitching()
 
   // 启动 Kiro IDE token 文件监听（反向同步：IDE 自己 refresh 后把新 token 同步回反代 store）
   // 见 syncIdeTokenChangeToStore 注释
@@ -4804,7 +4897,15 @@ app.whenReady().then(async () => {
 
     let preparedExpiresAt: number | undefined
     let refreshedCredentials: { accessToken: string; refreshToken: string; expiresIn: number } | undefined
+    const assertCliProjectionAvailable = (): void => {
+      const bindings = store?.get('clientAccessBindings')
+      if (Array.isArray(bindings) && bindings.some(binding => binding?.status === 'active' &&
+          typeof binding.runtimeId === 'string' && binding.runtimeId.startsWith('cli:'))) {
+        throw new Error('CLI_ACCESS_PROJECTION_ACTIVE')
+      }
+    }
     try {
+      assertCliProjectionAvailable()
       instanceAccountOwnership.assertAvailable(credentials)
       const {
         refreshToken,
@@ -4825,6 +4926,7 @@ app.whenReady().then(async () => {
       // Only reuse a CLI-created registration for the exact same OIDC client.
       const registration = isSocial ? undefined : await inspectKiroCliRegistration(dbPath, registrationIdentity)
       const assertPreparedCurrent = (): void => {
+        assertCliProjectionAvailable()
         if (!credentials.reusePreparedCredentials) return
         const saved = store?.get('accountData') as { accounts?: Record<string, { credentials?: { accessToken?: string; refreshToken?: string } }> } | undefined
         const current = credentials.accountId ? saved?.accounts?.[credentials.accountId]?.credentials : undefined
@@ -4909,6 +5011,7 @@ app.whenReady().then(async () => {
           encoding: 'utf-8'
         })
       } catch (sqlite3Error) {
+        if (sqlite3Error instanceof Error && sqlite3Error.message === 'CLI_ACCESS_PROJECTION_ACTIVE') throw sqlite3Error
         // sqlite3 命令不存在，尝试用 Node.js 22+ 的内置 SQLite
         console.log('[Switch CLI] sqlite3 command not available, trying Node.js built-in SQLite...')
         try {
@@ -4922,7 +5025,8 @@ app.whenReady().then(async () => {
           } finally {
             db.close()
           }
-        } catch {
+        } catch (fallbackError) {
+          if (fallbackError instanceof Error && fallbackError.message === 'CLI_ACCESS_PROJECTION_ACTIVE') throw fallbackError
           throw new Error(`SQLite 操作失败: sqlite3 命令不可用 (${(sqlite3Error as Error).message})，且 Node.js 内置 SQLite 不支持。请确保系统安装了 sqlite3 命令行工具。`)
         }
       }
@@ -4932,7 +5036,9 @@ app.whenReady().then(async () => {
       return { success: true, dbPath, refreshedCredentials, preparedExpiresAt }
     } catch (error) {
       console.error('[Switch CLI] Credential handoff failed')
-      return { success: false, error: error instanceof KiroCliRegistrationError ? error.message : 'CLI 凭证写入失败，请检查本机 CLI 安装和数据库状态',
+      return { success: false, error: error instanceof Error && error.message === 'CLI_ACCESS_PROJECTION_ACTIVE'
+        ? 'CLI 正在同步短期访问凭证，请先在客户端选择窗口停止同步，再使用旧 CLI/两者切号。'
+        : error instanceof KiroCliRegistrationError ? error.message : 'CLI 凭证写入失败，请检查本机 CLI 安装和数据库状态',
         refreshedCredentials: credentials.reusePreparedCredentials ? undefined : refreshedCredentials,
         preparedExpiresAt: credentials.reusePreparedCredentials ? undefined : preparedExpiresAt }
     }
@@ -6646,6 +6752,8 @@ app.on('before-quit', (event) => {
 // 应用退出前保存数据；不修改官方 IDE 的 URI 协议归属
 app.on('will-quit', async (event) => {
   // 防止重复处理
+  if (clientProjectionTimer) clearInterval(clientProjectionTimer)
+  clientAccessProjection?.close()
   if (isQuitting) return
   
   // 停止主进程池 token 刷新调度器

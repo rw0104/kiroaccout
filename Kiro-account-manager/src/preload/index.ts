@@ -1,4 +1,5 @@
 import type { AccountModelInfo } from '../shared/modelCatalog'
+import type { ClientSwitchApi } from '../shared/clientSwitch'
 import type { ModelPreferencesResult, ModelPreferencesWrite } from '../shared/modelPreferences'
 import type { LogPage } from '../shared/logHistory'
 import type { WindowVisibilityState } from '../shared/windowVisibility'
@@ -18,6 +19,14 @@ import { electronAPI } from '@electron-toolkit/preload'
 
 // Custom APIs for renderer
 const api = {
+  clientSwitch: {
+    inspect: accountId => ipcRenderer.invoke('client-switch:inspect', accountId),
+    execute: request => ipcRenderer.invoke('client-switch:execute', request),
+    disconnect: request => ipcRenderer.invoke('client-switch:disconnect', request),
+    authorize: request => ipcRenderer.invoke('client-switch:authorize', request),
+    chooseExecutable: target => ipcRenderer.invoke('client-switch:choose-executable', target),
+    cancelAuthorization: operationId => ipcRenderer.invoke('client-switch:cancel-authorization', operationId)
+  } satisfies ClientSwitchApi,
   getWindowVisibility: (): Promise<WindowVisibilityState> => ipcRenderer.invoke('window-get-visibility'),
   onWindowVisibilityChanged: (callback: (state: WindowVisibilityState) => void): (() => void) => {
     const handler = (_event: Electron.IpcRendererEvent, state: WindowVisibilityState): void => callback(state)

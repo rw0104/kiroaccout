@@ -20,26 +20,42 @@ function visit(node) {
 }
 visit(tree)
 
+// Follow the real startup through the watcher, so adding another earlier side effect
+// cannot silently push the watcher outside this security gate's exercised prefix.
+function startupPrefix() {
+  const statements = startup.body.statements
+  const callIndex = name => statements.findIndex(node => ts.isExpressionStatement(node) &&
+    ts.isCallExpression(node.expression) && node.expression.expression.getText(tree) === name)
+  const watcherIndex = callIndex('startKiroAuthTokenWatcher')
+  const clientIndex = callIndex('setupClientSwitching')
+  assert.ok(clientIndex >= 0, 'client switching startup must remain covered')
+  assert.ok(watcherIndex > clientIndex, 'projection setup and watcher must both follow protected storage')
+  return statements.slice(0, watcherIndex + 1).map(node => node.getText(tree)).join('\n')
+}
+
 test('actual startup initializes protected storage before any watcher or persisted logging, and stops on failure', async () => {
-  const prefix = startup.body.statements.slice(0, 4).map(node => node.getText(tree)).join('\n')
+  const prefix = startupPrefix()
   for (const mode of ['success', 'failure', 'cancel']) {
     const calls = []
+    let storageReady = false
     const context = vm.createContext({
       initStore: async () => {
         calls.push('storage')
         if (mode === 'failure') throw new secureStore.SecureStoreError('SYNTHETIC_UNAVAILABLE')
         if (mode === 'cancel') throw new SecureStoreRecoveryCancelled()
+        storageReady = true
       },
       SecureStoreError: secureStore.SecureStoreError,
       SecureStoreRecoveryCancelled,
       dialog: { showErrorBox: () => calls.push('error-dialog') },
       app: { quit: () => calls.push('quit'), getPath: () => 'synthetic' },
       proxyLogStore: { initialize: () => calls.push('logging') },
-      interceptConsole: () => calls.push('intercept'), startKiroAuthTokenWatcher: () => calls.push('watcher')
+      interceptConsole: () => calls.push('intercept'), startKiroAuthTokenWatcher: () => calls.push('watcher'),
+      setupClientSwitching: () => { assert.equal(storageReady, true); calls.push('client-switching') }
     })
     vm.runInContext(ts.transpileModule(`globalThis.start = async () => {${prefix}}`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, context)
     await context.start()
-    assert.deepEqual(calls, mode === 'failure' ? ['storage', 'error-dialog', 'quit'] : mode === 'cancel' ? ['storage', 'quit'] : ['storage', 'logging', 'intercept', 'watcher'])
+    assert.deepEqual(calls, mode === 'failure' ? ['storage', 'error-dialog', 'quit'] : mode === 'cancel' ? ['storage', 'quit'] : ['storage', 'logging', 'intercept', 'client-switching', 'watcher'])
   }
 })
 
@@ -124,10 +140,11 @@ function startupHarness({ directory, safeStorage, choose, openDirectory = async 
     proxyLogStore: { initialize: () => calls.push('logging') },
     interceptConsole: () => calls.push('intercept'),
     startKiroAuthTokenWatcher: () => calls.push('watcher'),
+    setupClientSwitching: () => { assert.notEqual(context.storage(), null); calls.push('client-switching') },
     afterStartup: () => calls.push('remaining-startup'),
     console: { log() {}, warn() {}, error() {} }
   })
-  const prefix = startup.body.statements.slice(0, 4).map(node => node.getText(tree)).join('\n')
+  const prefix = startupPrefix()
   const compiled = ts.transpileModule(`
     let store = null, storeInitialization = null, proactiveRenewalEnabled = false;
     ${initializer.getText(tree)}
@@ -152,7 +169,7 @@ test('real initStore and startup await one shared recovery choice before assigni
   assert.doesNotMatch(JSON.stringify(h.prompts[0]), /SYNTHETIC_REFRESH_ONLY/)
   pending.resolve(0)
   await Promise.all([start, secondInitializer])
-  assert.deepEqual(h.calls, ['prompt', 'account-migration', 'logging', 'intercept', 'watcher', 'remaining-startup'])
+  assert.deepEqual(h.calls, ['prompt', 'account-migration', 'logging', 'intercept', 'client-switching', 'watcher', 'remaining-startup'])
   assert.deepEqual(h.context.storage().get('accountData'), syntheticAccounts)
   assert.equal(recoveryArchives(state.directory).length, 1)
   for (const [name, bytes] of Object.entries(before)) {
@@ -211,7 +228,7 @@ test('changing a legacy source while the real recovery dialog is open requires a
     return 0
   } })
   await h.context.start()
-  assert.deepEqual(h.calls, ['prompt', 'prompt', 'account-migration', 'logging', 'intercept', 'watcher', 'remaining-startup'])
+  assert.deepEqual(h.calls, ['prompt', 'prompt', 'account-migration', 'logging', 'intercept', 'client-switching', 'watcher', 'remaining-startup'])
   assert.equal(recoveryArchives(state.directory).length, 1)
   assert.notEqual(h.prompts[0].detail, h.prompts[1].detail)
   assert.equal(fs.readFileSync(path.join(state.directory, 'kiro-accounts.json'), 'utf8'), 'SYNTHETIC_CHANGED_DURING_CHOICE')

@@ -22,6 +22,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { AddOnCredits } from './AddOnCredits'
+import { ClientSwitchDialog } from './ClientSwitchDialog'
 import {
   toRgba,
   generateRowGlowStyle,
@@ -84,6 +85,7 @@ function AccountListRowComponent({
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [isClearingSuspended, setIsClearingSuspended] = useState(false)
   const [emailCopied, setEmailCopied] = useState(false)
+  const [showClientSwitchDialog, setShowClientSwitchDialog] = useState(false)
 
   // 封禁判定
   const isUnauthorized = isBannedError(account.lastError)
@@ -137,11 +139,10 @@ function AccountListRowComponent({
   }, [account.isActive, isUnauthorized, tagColors])
 
   // === Handlers ===
-  const handleSwitch = useCallback(async (e: React.MouseEvent) => {
+  const handleSwitch = useCallback((e: React.MouseEvent) => {
     e.stopPropagation()
-    const result = await useAccountsStore.getState().switchAccountToTarget(account.id)
-    if (!result.success) alert(isEn ? `Switch failed: ${result.error || ''}` : `切换失败：${result.error || ''}`)
-  }, [account.id, isEn])
+    setShowClientSwitchDialog(true)
+  }, [])
 
   const handleRefresh = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation()
@@ -228,8 +229,8 @@ function AccountListRowComponent({
         {isSelected && <Check className="h-3 w-3" />}
       </div>
 
-      {/* === 邮箱列（固定 280px） === */}
-      <div className="w-[280px] flex-shrink-0 flex flex-col gap-1 min-w-0">
+      {/* === 邮箱列（优先 280px，窄内容区域为操作按钮留出空间） === */}
+      <div className="w-[280px] min-w-[120px] shrink flex flex-col gap-1">
         {/* 上行：邮箱/昵称 + 副邮箱 */}
         <div className="flex items-center gap-2 min-w-0">
           <h3
@@ -388,7 +389,7 @@ function AccountListRowComponent({
       <div className="flex-1 min-w-0" />
 
       {/* === Credits 区（中右） === */}
-      <div className="flex-shrink-0 w-40 flex flex-col gap-0.5 px-2">
+      <div className="w-40 min-w-[96px] shrink flex flex-col gap-0.5 px-2">
         <div className="flex items-center justify-between text-[10px]">
           <span className="text-muted-foreground">{isEn ? 'Usage' : '使用量'}</span>
           <span className={cn(
@@ -433,7 +434,7 @@ function AccountListRowComponent({
       </div>
 
       {/* === 时间信息区 === */}
-      <div className="flex-shrink-0 hidden lg:flex flex-col leading-tight gap-0.5 text-[10px] text-muted-foreground w-28">
+      <div className="hidden lg:flex shrink flex-col leading-tight gap-0.5 text-[10px] text-muted-foreground w-28 min-w-[60px]">
         <div className="flex items-center gap-1" title={isEn ? 'Subscription days left' : '订阅剩余天数'}>
           <Clock className="h-3 w-3" />
           <span className={isExpiringSoon ? 'text-warning font-medium' : ''}>
@@ -455,7 +456,7 @@ function AccountListRowComponent({
       </div>
 
       {/* === 操作区（hover 显示） === */}
-      <div className="flex-shrink-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity duration-200 border-l border-border/40 pl-2 ml-1">
+      <div className="flex-shrink-0 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-200 border-l border-border/40 pl-2 ml-1">
         {isUnauthorized && (
           <>
             <Button
@@ -481,17 +482,17 @@ function AccountListRowComponent({
           </>
         )}
 
-        {!account.isActive && !isUnauthorized && (
-          <Button
-            size="icon"
-            variant="ghost"
-            className="h-7 w-7 hover:bg-primary/10 hover:text-primary"
-            onClick={handleSwitch}
-            title={isEn ? 'Switch to this account' : '切换到该账号'}
-          >
-            <Power className="h-3.5 w-3.5" />
-          </Button>
-        )}
+        <Button
+          size="icon"
+          variant="ghost"
+          className="h-7 w-7 hover:bg-primary/10 hover:text-primary"
+          onClick={handleSwitch}
+          disabled={isAccountOperationPending}
+          title={isEn ? 'Choose a client to switch' : '选择切换客户端'}
+          aria-label={isEn ? 'Choose a client to switch' : '选择切换客户端'}
+        >
+          <Power className="h-3.5 w-3.5" />
+        </Button>
 
         <Button
           size="icon"
@@ -550,6 +551,18 @@ function AccountListRowComponent({
       {/* 封禁角标（与卡片同款） */}
       {account.isActive && isUnauthorized && (
         <div className="banned-badge" title={isEn ? 'Banned' : '已封禁'} />
+      )}
+      {showClientSwitchDialog && (
+        <ClientSwitchDialog
+          key={account.id}
+          accountId={account.id}
+          accountLabel={displayName || account.userId || (isEn ? 'Unknown' : '未知')}
+          isCurrentAccount={account.isActive}
+          isEn={isEn}
+          api={window.api.clientSwitch}
+          onSwitchIde={() => useAccountsStore.getState().switchAccountToTarget(account.id, 'ide')}
+          onClose={() => setShowClientSwitchDialog(false)}
+        />
       )}
     </div>
   )

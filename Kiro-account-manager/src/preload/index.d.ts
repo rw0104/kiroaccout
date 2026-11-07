@@ -1,4 +1,5 @@
 import type { AccountModelInfo } from '../shared/modelCatalog'
+import type { ClientSwitchApi } from '../shared/clientSwitch'
 import type { ModelPreferencesResult, ModelPreferencesWrite } from '../shared/modelPreferences'
 import type { LogPage } from '../shared/logHistory'
 import type { WindowVisibilityState } from '../shared/windowVisibility'
@@ -159,6 +160,7 @@ interface StatusResult {
 }
 
 interface KiroApi {
+  clientSwitch: ClientSwitchApi
   getWindowVisibility: () => Promise<WindowVisibilityState>
   onWindowVisibilityChanged: (callback: (state: WindowVisibilityState) => void) => () => void
   openExternal: (url: string, usePrivateMode?: boolean) => void

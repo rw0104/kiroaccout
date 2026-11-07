@@ -573,7 +573,7 @@ export function SettingsPage() {
           <div className="flex items-center justify-between pt-2 border-t">
             <div>
               <p className="font-medium">{isEn ? 'Switch Target' : '切号目标'}</p>
-              <p className="text-sm text-muted-foreground">{isEn ? 'Which client to switch account credentials to' : '切换账号凭证写入的客户端'}</p>
+              <p className="text-sm text-muted-foreground">{isEn ? 'For automatic and legacy switches; manual account actions use the client picker.' : '用于自动及旧快捷切号；账户卡手动操作以客户端选择窗口为准。'}</p>
             </div>
             <select
               className="h-9 px-3 rounded-lg border bg-background text-sm focus:outline-none focus:ring-1 focus:ring-primary focus:border-primary"

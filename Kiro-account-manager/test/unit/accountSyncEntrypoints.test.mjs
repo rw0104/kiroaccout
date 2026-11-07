@@ -61,23 +61,24 @@ test('real usage transport wrapper preserves new fields through both configured 
   assert.equal(parseAccountUsage(invalid).addOnCredits[0].status, 'inactive')
 })
 
-function cliHarness({ refreshFails = false, diskFails = false, onMkdir, inspectRegistration = inspectKiroCliRegistration, writeRegistration = writeKiroCliRegisteredToken } = {}) {
+function cliHarness({ refreshFails = false, diskFails = false, onMkdir, onRefresh, projectionBindings = [], inspectRegistration = inspectKiroCliRegistration, writeRegistration = writeKiroCliRegisteredToken } = {}) {
   const callback = find(node => ts.isCallExpression(node) && node.arguments[0]?.text === 'switch-account-cli').arguments[1].getText(tree)
   const sql = []
   let directories = 0
   let refreshes = 0
   const handoffs = new SwitchHandoffStore()
   let savedCredentials
+  let bindings = projectionBindings
   const context = vm.createContext({
     Date, console: { log() {}, warn() {}, error() {} },
     instanceAccountOwnership: { assertAvailable() {} },
     switchHandoffs: handoffs,
-    store: { get: () => ({ accounts: { 'synthetic-account': { credentials: savedCredentials } } }) },
+    store: { get: key => key === 'clientAccessBindings' ? bindings : key === 'accountData' ? ({ accounts: { 'synthetic-account': { credentials: savedCredentials } } }) : undefined },
     resolveProfileArnForWrite: () => undefined,
     resolveIdentity, resolveKiroCliDatabasePath, KiroCliRegistrationError,
     inspectKiroCliRegistration: inspectRegistration, writeKiroCliRegisteredToken: writeRegistration,
     os: { homedir: () => 'C:\\SyntheticHome' },
-    refreshTokenByMethod: async () => { refreshes++; return refreshFails ? { success: false, error: 'SYNTHETIC_DENIED' } : { success: true, accessToken: 'SYNTHETIC_ACCESS_NEW', refreshToken: 'SYNTHETIC_REFRESH_NEW', expiresIn: 7200 } },
+    refreshTokenByMethod: async () => { refreshes++; if (onRefresh) await onRefresh(); return refreshFails ? { success: false, error: 'SYNTHETIC_DENIED' } : { success: true, accessToken: 'SYNTHETIC_ACCESS_NEW', refreshToken: 'SYNTHETIC_REFRESH_NEW', expiresIn: 7200 } },
     process: { platform: 'win32', env: {} },
     require: name => {
       if (name === 'os') return { homedir: () => 'SYNTHETIC_HOME' }
@@ -88,8 +89,84 @@ function cliHarness({ refreshFails = false, diskFails = false, onMkdir, inspectR
     }
   })
   vm.runInContext(transpile(`globalThis.run = ${callback}`), context)
-  return { run: (over = {}) => context.run(undefined, { accessToken: 'SYNTHETIC_ACCESS_OLD', refreshToken: 'SYNTHETIC_REFRESH_OLD', provider: 'Google', ...over }), sql, handoffs, setSaved: credentials => { savedCredentials = credentials }, get refreshes() { return refreshes }, get directories() { return directories } }
+  return { run: (over = {}) => context.run(undefined, { accessToken: 'SYNTHETIC_ACCESS_OLD', refreshToken: 'SYNTHETIC_REFRESH_OLD', provider: 'Google', ...over }), sql, handoffs,
+    setSaved: credentials => { savedCredentials = credentials }, setBindings: next => { bindings = next },
+    get refreshes() { return refreshes }, get directories() { return directories } }
 }
+
+const activeCliProjection = () => ({ status: 'active', accountId: 'synthetic-projected-account', runtimeId: 'cli:synthetic-runtime', authDomainId: 'synthetic-domain' })
+
+test('legacy CLI refuses active access synchronization before refresh, registration inspection or filesystem changes', async () => {
+  for (const credentials of [{ provider: 'Google' }, { provider: 'BuilderId', clientId: 'SYNTHETIC_CLIENT', clientSecret: 'SYNTHETIC_SECRET' }]) {
+    let registrationReads = 0
+    const h = cliHarness({ projectionBindings: [activeCliProjection()], inspectRegistration: async () => { registrationReads++; return {} } })
+    const result = await h.run(credentials)
+    assert.equal(result.success, false)
+    assert.match(result.error, /停止同步/)
+    assert.equal(result.refreshedCredentials, undefined)
+    assert.equal(h.refreshes, 0)
+    assert.equal(h.directories, 0)
+    assert.equal(h.sql.length, 0)
+    assert.equal(registrationReads, 0)
+  }
+})
+
+test('legacy CLI remains available after disconnect and for an unrelated independent Crew binding', async () => {
+  for (const binding of [
+    { ...activeCliProjection(), status: 'needs-attention', reason: 'user-disconnected' },
+    { ...activeCliProjection(), runtimeId: 'crew:synthetic-independent-runtime' }
+  ]) {
+    const h = cliHarness({ projectionBindings: [binding] })
+    const result = await h.run()
+    assert.equal(result.success, true)
+    assert.equal(h.refreshes, 1)
+    assert.equal(h.sql.length, 1)
+  }
+})
+
+test('a binding created while legacy refresh is pending rejects the commit but retains completed rotation', async () => {
+  for (const idc of [false, true]) {
+    let signalEntered, resumeRefresh
+    const entered = new Promise(resolve => { signalEntered = resolve })
+    const proceed = new Promise(resolve => { resumeRefresh = resolve })
+    let registeredWrites = 0
+    const h = cliHarness({
+      onRefresh: async () => { signalEntered(); await proceed },
+      inspectRegistration: async () => ({ registration: 'SYNTHETIC_REGISTRATION', tokens: [null, null, null] }),
+      writeRegistration: async (_path, _identity, _revision, _tokenJson, assertCurrent) => { assertCurrent(); registeredWrites++ }
+    })
+    const pending = h.run(idc ? { provider: 'BuilderId', clientId: 'SYNTHETIC_CLIENT', clientSecret: 'SYNTHETIC_SECRET' } : {})
+    await entered
+    h.setBindings([activeCliProjection()])
+    resumeRefresh()
+    const result = await pending
+    assert.equal(result.success, false)
+    assert.equal(h.refreshes, 1)
+    assert.equal(h.sql.length, 0)
+    assert.equal(registeredWrites, 0)
+    assert.equal(result.refreshedCredentials.accessToken, 'SYNTHETIC_ACCESS_NEW')
+    assert.equal(result.refreshedCredentials.refreshToken, 'SYNTHETIC_REFRESH_NEW')
+    assert.equal(result.refreshedCredentials.expiresIn, 7200)
+    assert.ok(result.preparedExpiresAt > Date.now())
+  }
+})
+
+test('active synchronization blocks a prepared Both handoff without consuming its one-use proof', async () => {
+  const h = cliHarness({ projectionBindings: [activeCliProjection()] })
+  const credentials = { accessToken: 'SYNTHETIC_IDE_ACCESS', refreshToken: 'SYNTHETIC_IDE_REFRESH', expiresAt: Date.now() + 7200000 }
+  const handoffProof = h.handoffs.issue('synthetic-account', credentials)
+  h.setSaved(credentials)
+  const payload = { ...credentials, accountId: 'synthetic-account', reusePreparedCredentials: true, handoffProof }
+  const blocked = await h.run(payload)
+  assert.equal(blocked.success, false)
+  assert.match(blocked.error, /停止同步/)
+  assert.equal(h.refreshes, 0)
+  assert.equal(h.sql.length, 0)
+  h.setBindings([{ ...activeCliProjection(), status: 'needs-attention', reason: 'user-disconnected' }])
+  assert.equal((await h.run(payload)).success, true)
+  assert.equal(h.refreshes, 0)
+  assert.equal(h.sql.length, 1)
+})
 
 test('CLI IdC handoff refuses missing native registration before any refresh or file write', async () => {
   const harness = cliHarness({ inspectRegistration: async () => { throw new KiroCliRegistrationError() } })

@@ -215,24 +215,36 @@ test('actual automatic switching awaits CLI and keeps the current active account
   assert.equal(h.warnings.length, 1)
 })
 
-test('real card and list handlers delegate to the same coordinator and surface failed switches', async () => {
+test('real card and list handlers only open the chooser, whose IDE callback explicitly preserves the legacy coordinator result', async () => {
   for (const file of ['AccountCard.tsx', 'AccountListRow.tsx']) {
     const source = readFileSync(new URL(`../../src/renderer/src/components/accounts/${file}`, import.meta.url), 'utf8')
     const tree = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
     let handler
+    const ideCallbacks = []
     function find(node) {
       if (ts.isVariableDeclaration(node) && node.name.getText(tree) === 'handleSwitch') handler = node.getText(tree)
+      if (ts.isJsxSelfClosingElement(node) && node.tagName.getText(tree) === 'ClientSwitchDialog') {
+        const attribute = node.attributes.properties.find(prop => ts.isJsxAttribute(prop) && prop.name.getText(tree) === 'onSwitchIde')
+        if (attribute?.initializer && ts.isJsxExpression(attribute.initializer) && attribute.initializer.expression) ideCallbacks.push(attribute.initializer.expression.getText(tree))
+      }
       ts.forEachChild(node, find)
     }
     find(tree)
     assert.ok(handler)
-    const calls = [], alerts = []
+    assert.equal(ideCallbacks.length, 1, `${file} passes one actual IDE callback to the chooser`)
+    const calls = [], alerts = [], visibility = []
     const context = vm.createContext({ account: { id: 'candidate' }, isEn: false, alert: message => alerts.push(message), useCallback: fn => fn,
-      useAccountsStore: { getState: () => ({ switchAccountToTarget: async id => { calls.push(id); return { success: false, error: 'synthetic failure' } } }) } })
-    vm.runInContext(ts.transpileModule(`const ${handler};`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context)
+      setShowClientSwitchDialog: value => visibility.push(value),
+      useAccountsStore: { getState: () => ({ switchAccountToTarget: async (id, target) => { calls.push([id, target]); return { success: false, error: 'synthetic failure' } } }) } })
+    vm.runInContext(ts.transpileModule(`const ${handler}; const confirmIde = ${ideCallbacks[0]};`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context)
     await vm.runInContext('handleSwitch', context)({ stopPropagation() {} })
-    assert.deepEqual(calls, ['candidate'])
-    assert.equal(alerts.length, 1)
-    assert.match(alerts[0], /synthetic failure/)
+    assert.deepEqual(visibility, [true])
+    assert.deepEqual(calls, [], 'opening the chooser must not refresh or write credentials')
+    assert.deepEqual(alerts, [])
+    const result = await vm.runInContext('confirmIde', context)()
+    assert.deepEqual(calls, [['candidate', 'ide']], 'the manual default does not inherit the legacy global cli/both setting')
+    assert.equal(result.success, false, 'a failed legacy IDE write is returned to the dialog, not hidden as success')
+    assert.match(result.error, /synthetic failure/)
+    assert.deepEqual(alerts, [], 'the shared dialog renders the failure instead of a second alert from the account row')
   }
 })

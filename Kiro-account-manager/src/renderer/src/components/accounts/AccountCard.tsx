@@ -28,6 +28,7 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { AddOnCredits } from './AddOnCredits'
+import { ClientSwitchDialog } from './ClientSwitchDialog'
 import { getSubscriptionColor } from './_helpers'
 import { normalizeSubscriptionType } from '../../../../shared/accountSubscription'
 
@@ -169,6 +170,7 @@ export const AccountCard = memo(function AccountCard({
 
   // 解除封禁标记中（loading 状态）
   const [isClearingSuspended, setIsClearingSuspended] = useState(false)
+  const [showClientSwitchDialog, setShowClientSwitchDialog] = useState(false)
 
   // 手动解除封禁标记：调用后端 IPC → 清反代池 suspended + 清前端 lastError
   const handleClearSuspended = async (e: React.MouseEvent) => {
@@ -202,10 +204,7 @@ export const AccountCard = memo(function AccountCard({
     return Math.floor(value).toLocaleString()
   }
 
-  const handleSwitch = async (): Promise<void> => {
-    const result = await useAccountsStore.getState().switchAccountToTarget(account.id)
-    if (!result.success) alert(isEn ? `Switch failed: ${result.error || ''}` : `切换失败：${result.error || ''}`)
-  }
+  const handleSwitch = (): void => setShowClientSwitchDialog(true)
 
   const handleRefresh = async (): Promise<void> => {
     // 获取最新的使用量数据
@@ -742,7 +741,7 @@ export const AccountCard = memo(function AccountCard({
 
             {/* Right: Actions */}
             <div className="flex items-center gap-0.5">
-               {account.isActive ? (
+               {account.isActive && (
                  <Button
                    size="icon"
                    variant="ghost"
@@ -752,17 +751,18 @@ export const AccountCard = memo(function AccountCard({
                  >
                    <LogOut className="h-3.5 w-3.5" />
                  </Button>
-               ) : (
-                 <Button
-                   size="icon"
-                   variant="ghost"
-                   className="h-7 w-7 hover:bg-primary/10 hover:text-primary transition-colors"
-                   onClick={(e) => { e.stopPropagation(); handleSwitch() }}
-                   title={isEn ? 'Switch to this account' : '切换到此账号'}
-                 >
-                   <Power className="h-3.5 w-3.5" />
-                 </Button>
                )}
+               <Button
+                 size="icon"
+                 variant="ghost"
+                 className="h-7 w-7 hover:bg-primary/10 hover:text-primary transition-colors"
+                 onClick={(e) => { e.stopPropagation(); handleSwitch() }}
+                 disabled={isAccountOperationPending}
+                 title={isEn ? 'Choose a client to switch' : '选择切换客户端'}
+                 aria-label={isEn ? 'Choose a client to switch' : '选择切换客户端'}
+               >
+                 <Power className="h-3.5 w-3.5" />
+               </Button>
                
                <Button size="icon" variant="ghost" className="h-7 w-7 text-muted-foreground hover:text-foreground" onClick={(e) => { e.stopPropagation(); handleRefresh() }} disabled={isAccountOperationPending} title={isEn ? 'Check account info' : '检查账户信息（用量、订阅、封禁状态）'}>
                   <RefreshCw className={cn("h-3.5 w-3.5", isAccountOperationPending && "animate-spin")} />
@@ -797,6 +797,19 @@ export const AccountCard = memo(function AccountCard({
           </div>
         )}
       </CardContent>
+
+      {showClientSwitchDialog && (
+        <ClientSwitchDialog
+          key={account.id}
+          accountId={account.id}
+          accountLabel={account.nickname ? maskNickname(account.nickname) : account.email ? maskEmail(account.email) : getDisplayName(account)}
+          isCurrentAccount={account.isActive}
+          isEn={isEn}
+          api={window.api.clientSwitch}
+          onSwitchIde={() => useAccountsStore.getState().switchAccountToTarget(account.id, 'ide')}
+          onClose={() => setShowClientSwitchDialog(false)}
+        />
+      )}
 
       {/* 封禁详情弹窗 */}
       {showBanDialog && isUnauthorized && createPortal(
