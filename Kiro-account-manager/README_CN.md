@@ -2,7 +2,7 @@
 
 本目录为 Electron 应用源码。使用说明见[项目首页](../README.md)，安装包见 [Releases](https://github.com/rw0104/kiroaccout/releases)。
 
-当前源码目标为 **1.10.0 · Windows / macOS / Linux**，发布状态与附件以 Releases 为准。账户绑定与轮换保护已做合成数据回归，双真实账户登录及刷新尚未完成验收。本次验收范围见发布说明。
+当前源码目标为 **1.10.1 · Windows / macOS / Linux**，发布状态与附件以 Releases 为准。账户绑定与轮换保护已做合成数据回归，双真实账户登录及刷新尚未完成验收。本次验收范围见发布说明。
 
 账户电源按钮现在先选择 IDE / Crew / CLI，每次默认 IDE，原退出登录保留。Windows 新连接支持官方 CLI 3.1.0、Crew 0.12.0，只同步短期访问凭证，不向目标交出管理器的 refreshToken，也不改变原自动刷新设置。请保持管理器运行；原自动刷新关闭或访问凭证未就绪时，目标访问可能暂停。“停止同步”不会退出管理器账号，目标现有访问凭证自然到期。使用旧 CLI/两者切号前须先停止新 CLI 同步。Crew 使用官方内置引擎，本地覆盖配置冲突时拒绝写入，不覆盖用户选择。
 
@@ -26,4 +26,4 @@
 
 页面提供运行状态、正常停止和重启。未保存编辑可能阻止关闭，不会自动强杀；移除配置保留资料。旧 RC 的 Windows 用户配置已停用，需移除后重建。系统网络、代理、证书、Windows 身份和 DPAPI 仍共享，不是安全沙箱。
 
-[1.10.0 说明](../docs/releases/v1.10.0.md) · [AGPL-3.0](../LICENSE) · [开源来源说明](../docs/NOTICE.md) · [English](README.md)
+[1.10.1 说明](../docs/releases/v1.10.1.md) · [AGPL-3.0](../LICENSE) · [开源来源说明](../docs/NOTICE.md) · [English](README.md)

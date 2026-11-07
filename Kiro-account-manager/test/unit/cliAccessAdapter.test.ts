@@ -339,6 +339,87 @@ test('real service and SQLite adapter continue syncing after native CLI optional
   }
 })
 
+test('UTC expiry serialization from whole-second .000Z to Z does not stop a real service binding', async t => {
+  const wholeSecond = Math.floor(Date.now() / 1000) * 1000 + 3_600_000
+  const credential = access({ provider: 'BuilderId', authMethod: 'IdC', region: 'us-east-1', profileArn: undefined, expiresAt: wholeSecond })
+  const f = projectionFixture(t, credential)
+  assert.equal((await f.service.execute(f.request)).status, 'projected')
+  const initialBinding = { ...f.bindings.get('synthetic-auth')! }
+  const native = nativeSerialization(f.path, idcKey, 'SYNTHETIC_EXPIRY_TELEMETRY')
+  assert.match(String(native.expires_at), /\.000Z$/)
+  native.expires_at = String(native.expires_at).replace(/\.000Z$/, 'Z')
+  mutate(f.path, db => db.prepare('UPDATE auth_kv SET value=? WHERE key=?').run(JSON.stringify(native), idcKey))
+  const unchanged = (await f.service.tick())[0]
+  assert.equal(unchanged.status, 'unchanged', 'the official CLI changed only UTC formatting, not the expiration instant')
+  assert.equal(f.bindings.get('synthetic-auth')!.status, 'active')
+  assert.equal(f.bindings.get('synthetic-auth')!.revision, initialBinding.revision)
+  const renewed = { ...f.accounts.get('account-a')!, accessToken: 'SYNTHETIC_NEW_ACCESS_AFTER_FORMAT_CHANGE', expiresAt: wholeSecond + 3_600_000 }
+  f.accounts.set('account-a', renewed)
+  assert.equal((await f.service.tick())[0].status, 'projected')
+  const projected = JSON.parse(rows(f.path).find(([key]) => key === idcKey)![1])
+  assert.equal(projected.access_token, renewed.accessToken)
+  assert.equal(projected.expires_at, new Date(renewed.expiresAt).toISOString())
+  assert.equal(projected.telemetry_generation, 'SYNTHETIC_EXPIRY_TELEMETRY')
+  assert.equal(projected.refresh_token, undefined)
+  assert.equal(f.bindings.get('synthetic-auth')!.principalFingerprint, initialBinding.principalFingerprint)
+  assert.equal(f.accounts.get('account-a'), renewed)
+})
+
+test('UTC expiry fractional trailing zeros are equivalent without changing the active binding', async t => {
+  const base = Date.UTC(2099, 2, 1, 12, 0, 0)
+  for (const sample of [
+    { millis: 120, representations: ['.120000Z', '.12Z'] },
+    { millis: 100, representations: ['.100000Z', '.1Z'] },
+    { millis: 10, representations: ['.010000Z', '.01Z'] },
+    { millis: 1, representations: ['.001000Z', '.001Z'] },
+    { millis: 0, representations: ['.000000Z', 'Z'] }
+  ]) {
+    const credential = access({ provider: 'BuilderId', authMethod: 'IdC', region: 'us-east-1', profileArn: undefined, expiresAt: base + sample.millis })
+    const f = projectionFixture(t, credential)
+    await f.service.execute(f.request)
+    const binding = { ...f.bindings.get('synthetic-auth')! }
+    const native = nativeSerialization(f.path, idcKey, 'SYNTHETIC_TRAILING_ZERO_TELEMETRY')
+    for (const fraction of sample.representations) {
+      native.expires_at = '2099-03-01T12:00:00' + fraction
+      mutate(f.path, db => db.prepare('UPDATE auth_kv SET value=? WHERE key=?').run(JSON.stringify(native), idcKey))
+      assert.equal((await f.service.tick())[0].status, 'unchanged', String(native.expires_at))
+      assert.equal(f.bindings.get('synthetic-auth')!.revision, binding.revision)
+      assert.equal(f.bindings.get('synthetic-auth')!.status, 'active')
+      assert.equal(await f.adapter.readRevision(), binding.targetRevision)
+    }
+  }
+})
+
+test('UTC expiry normalization still rejects real time changes, invalid calendar dates and non-string fields', async t => {
+  const wholeSecond = Date.UTC(2099, 2, 1, 12, 0, 0)
+  for (const replacement of [
+    new Date(wholeSecond + 1).toISOString(),
+    new Date(wholeSecond + 1000).toISOString(),
+    'not-an-expiry',
+    '2099-02-29T12:00:00Z',
+    '2099-03-01T12:00:00.invalidZ',
+    wholeSecond,
+    null,
+    { utc: '2099-03-01T12:00:00Z' }
+  ]) {
+    const credential = access({ provider: 'BuilderId', authMethod: 'IdC', region: 'us-east-1', profileArn: undefined, expiresAt: wholeSecond })
+    const f = projectionFixture(t, credential)
+    await f.service.execute(f.request)
+    const expected = f.bindings.get('synthetic-auth')!.targetRevision
+    const native = nativeSerialization(f.path, idcKey, 'SYNTHETIC_INVALID_EXPIRY_TELEMETRY')
+    native.expires_at = replacement
+    mutate(f.path, db => db.prepare('UPDATE auth_kv SET value=? WHERE key=?').run(JSON.stringify(native), idcKey))
+    const changed = rows(f.path)
+    assert.notEqual(await f.adapter.readRevision(), expected, JSON.stringify(replacement))
+    await assert.rejects(f.adapter.write(credential, expected, guard, contextFor(credential)), isError('target-changed'))
+    const stopped = (await f.service.tick())[0]
+    assert.equal(stopped.reason, 'target-changed')
+    assert.equal(stopped.targetCommitted, false)
+    assert.equal(f.bindings.get('synthetic-auth')!.status, 'needs-attention')
+    assert.deepEqual(rows(f.path), changed)
+  }
+})
+
 test('normalization still rejects real access, refresh, profile, expiry and other authentication changes', async t => {
   const mutations: Array<{ credential?: AccessCredential; patch: Record<string, unknown> }> = [
     { patch: { access_token: 'SYNTHETIC_EXTERNAL_LOGIN_ACCESS' } },

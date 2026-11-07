@@ -9,6 +9,21 @@ const registrationKey = 'kirocli:odic:device-registration'
 const runtimeMarkerKey = 'kirocli:auth:last-forced-refresh-at'
 const supportedKeys = new Set<string>([...tokenKeys, registrationKey, runtimeMarkerKey])
 
+function normalizeUtcExpiry(value: unknown): unknown {
+  if (typeof value !== 'string') return value
+  const parts = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/.exec(value)
+  if (!parts) return value
+  const year = Number(parts[1]), month = Number(parts[2]), day = Number(parts[3])
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+  if (month < 1 || month > 12 || day < 1 || day > days[month - 1] ||
+      Number(parts[4]) > 23 || Number(parts[5]) > 59 || Number(parts[6]) > 59) return value
+  // CLI's UTC serializer drops .000 and other insignificant fractional zeros.
+  // Do not use Date.parse: its calendar rollover could hide invalid edits.
+  const fraction = parts[7]?.replace(/0+$/, '')
+  return `${parts[1]}-${parts[2]}-${parts[3]}T${parts[4]}:${parts[5]}:${parts[6]}${fraction ? `.${fraction}` : ''}Z`
+}
+
 function authenticationValue(key: string, raw: string): unknown {
   if (!(tokenKeys as readonly string[]).includes(key)) return raw
   try {
@@ -18,7 +33,7 @@ function authenticationValue(key: string, raw: string): unknown {
     // on its first real request. Neither operation changes the authentication.
     const optional = new Set(['refresh_token', 'start_url', 'scopes', 'profile_arn'])
     return Object.keys(value).sort().filter(name => name !== 'telemetry_generation' && !(optional.has(name) && value[name] === null))
-      .map(name => [name, value[name]])
+      .map(name => [name, name === 'expires_at' ? normalizeUtcExpiry(value[name]) : value[name]])
   } catch { return raw }
 }
 
