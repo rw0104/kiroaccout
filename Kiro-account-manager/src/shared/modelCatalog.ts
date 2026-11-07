@@ -7,6 +7,8 @@ export interface KiroModel {
   rateMultiplier?: number
   rateUnit?: string
   status?: string | null
+  /** Opaque service value; presence makes a model ineligible as a fallback. */
+  consentStatus?: string | null
   supportedInputTypes?: string[]
   tokenLimits?: { maxInputTokens?: number | null; maxOutputTokens?: number | null }
   promptCaching?: {
@@ -45,6 +47,7 @@ export interface AccountModelInfo {
   promptCaching?: KiroModel['promptCaching']
   additionalModelRequestFieldsSchema?: KiroModel['additionalModelRequestFieldsSchema']
   status?: string | null
+  consentStatus?: string | null
   availableOrigins?: string[] | null
 }
 
@@ -121,6 +124,8 @@ export function toAccountModel(model: KiroModel): AccountModelInfo {
     supportsPromptCaching: model.promptCaching?.supportsPromptCaching === true,
     modelProvider: model.modelProvider, promptCaching: model.promptCaching,
     additionalModelRequestFieldsSchema: model.additionalModelRequestFieldsSchema,
-    status: model.status, availableOrigins: model.availableOrigins
+    status: model.status,
+    consentStatus: model.consentStatus === undefined || typeof model.consentStatus === 'string' ? model.consentStatus : null,
+    availableOrigins: model.availableOrigins
   }
 }

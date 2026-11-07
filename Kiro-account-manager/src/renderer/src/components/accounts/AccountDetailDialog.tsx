@@ -11,6 +11,8 @@ import { useTranslation } from '@/hooks/useTranslation'
 import { getSubscriptionColor } from './_helpers'
 import { AddOnCredits } from './AddOnCredits'
 import { ModelPricing } from '../ModelPricing'
+import { ModelConsentStatus } from '../ModelConsentStatus'
+import { ModelFallbackPreferences } from './ModelFallbackPreferences'
 import { mergeSourceAccountNames } from '../../../../shared/accountSearch'
 
 import type { AccountModelInfo } from '../../../../shared/modelCatalog'
@@ -239,6 +241,12 @@ export function AccountDetailDialog({
                  </div>
                </div>
             </div>
+            {(['Enterprise', 'Teams'].includes(subscription.type) || ['Enterprise', 'IAM_SSO', 'AWSIdC', 'ExternalIdp'].includes(credentials.provider || account.idp)) && (
+              <p className="text-xs leading-relaxed text-muted-foreground">
+                {isEn ? 'Organization usage can be limited by a shared pool and user, group or profile limits. The figures above are returned by the account service; check the Kiro console for effective available credits.' : '组织额度可能受共享池以及用户、组或 profile 限制。上方显示账户接口返回的用量，最终可用额度请以 Kiro 控制台为准。'}{' '}
+                <button type="button" className="text-primary hover:underline" onClick={() => window.api.openExternal('https://kiro.dev/docs/enterprise/credit-pooling/')}>{isEn ? 'Credit sharing guide' : '共享额度说明'}</button>
+              </p>
+            )}
           </section>
 
           <AddOnCredits credits={usage.addOnCredits} isEn={isEn} precision={usagePrecision} detailed />
@@ -404,6 +412,7 @@ export function AccountDetailDialog({
                           <div className="flex flex-wrap gap-1 mb-1">
                             {model.modelProvider && <Badge variant="secondary" className="text-[10px]">{model.modelProvider}</Badge>}
                             {model.status && <Badge variant="secondary" className="text-[10px]">{model.status}</Badge>}
+                            <ModelConsentStatus value={model.consentStatus} isEn={isEn} />
                             {model.supportsThinking && <Badge variant="secondary" title={model.thinkingEfforts?.join(', ')} className="text-[10px]"><Brain className="h-3 w-3" /></Badge>}
                             {model.supportsPromptCaching && <Badge variant="secondary" className="text-[10px]"><Database className="h-3 w-3" /></Badge>}
                           </div>
@@ -442,6 +451,7 @@ export function AccountDetailDialog({
                 </div>
               )}
             </div>
+            <ModelFallbackPreferences identity={{ accountId: account.id, accessToken: credentials.accessToken, refreshToken: credentials.refreshToken, expiresAt: credentials.expiresAt, profileArn: account.profileArn || credentials.profileArn }} isEn={isEn} />
           </section>
         </div>
       </div>

@@ -3,6 +3,7 @@ import { X, RefreshCw, Loader2, Cpu, FileText, Image, Hash, Sparkles, Shuffle, B
 import { Button, Card, CardContent, CardHeader, CardTitle, Badge } from '../ui'
 import { cn } from '@/lib/utils'
 import { ModelPricing } from '../ModelPricing'
+import { ModelConsentStatus } from '../ModelConsentStatus'
 
 import type { AccountModelInfo } from '../../../../shared/modelCatalog'
 
@@ -219,6 +220,7 @@ export function ModelsDialog({
                         <div className="flex flex-wrap gap-1 mt-1">
                           {model.modelProvider && <Badge variant="secondary" className="text-[10px]">{model.modelProvider}</Badge>}
                           {model.status && <Badge variant="secondary" className="text-[10px]">{model.status}</Badge>}
+                          <ModelConsentStatus value={model.consentStatus} isEn={isEn} />
                         </div>
                       </div>
                     </div>

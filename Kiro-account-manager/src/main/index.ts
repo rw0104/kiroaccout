@@ -51,8 +51,11 @@ import { parseAccountUsage, normalizeUsageDate, type ParsedAccountUsage } from '
 import { normalizeSubscriptionType } from '../shared/accountSubscription'
 import { requestControlPlane, ControlPlaneError } from './kiroControlPlane'
 import { SwitchHandoffStore } from './switchHandoff'
+import { inspectKiroCliRegistration, KiroCliRegistrationError, resolveKiroCliDatabasePath, writeKiroCliRegisteredToken } from './kiroCliStorage'
 import { trackWindowVisibility } from './windowVisibility'
 import { filterAvailableModels, toAccountModel } from '../shared/modelCatalog'
+import { KiroModelPreferencesService, ModelPreferencesError, type ModelPreferenceAccount } from './kiroModelPreferences'
+import type { ModelPreferencesWrite } from '../shared/modelPreferences'
 import { normalizeProvider, resolveIdentity } from '../shared/authIdentity'
 import { AppUpdateController, UpdatePreparationError, type UpdatePreparationErrorCode, type AppUpdateState, type UpdateEngine } from './appUpdater'
 import { randomUUID } from 'node:crypto'
@@ -369,7 +372,6 @@ function initProxyServer(): ProxyServer {
       // Token 刷新回调 - 复用已有的刷新逻辑，含账号绑定代理
       onTokenRefresh: async (account) => {
         try {
-          console.log(`[ProxyServer] Refreshing token for ${account.email || account.id}${account.proxyUrl ? ' [via bound proxy]' : ''}`)
           const refreshResult = await refreshTokenByMethod(
             account.refreshToken || '',
             account.clientId || '',
@@ -380,17 +382,17 @@ function initProxyServer(): ProxyServer {
             account.clientSecretExpiresAt
           )
 
-          if (refreshResult.success && refreshResult.accessToken) {
+          if (refreshResult.success && refreshResult.accessToken && typeof refreshResult.expiresIn === 'number' && Number.isFinite(refreshResult.expiresIn) && refreshResult.expiresIn > 0) {
             return {
               success: true,
               accessToken: refreshResult.accessToken,
               refreshToken: refreshResult.refreshToken,
-              expiresAt: Date.now() + (refreshResult.expiresIn || 3600) * 1000
+              expiresAt: Date.now() + refreshResult.expiresIn * 1000
             }
           }
-          return { success: false, error: refreshResult.error || 'Token 刷新失败' }
-        } catch (error) {
-          return { success: false, error: error instanceof Error ? error.message : 'Unknown error' }
+          return { success: false, error: refreshResult.error || 'Token 刷新失败', failureKind: refreshResult.failureKind }
+        } catch {
+          return { success: false, error: '凭证刷新未完成，请检查账户状态。' }
         }
       },
       // 账号更新回调 - 通知渲染进程更新账号数据
@@ -1266,6 +1268,26 @@ const switchHandoffs = new SwitchHandoffStore()
 const instanceAccountOwnership = new InstanceAccountOwnership({
   records: () => store?.get('kiroInstances'),
   accounts: () => (store?.get('accountData') as { accounts?: Record<string, unknown> } | undefined)?.accounts || {}
+})
+
+const modelPreferences = new KiroModelPreferencesService({
+  account: id => {
+    const data = store?.get('accountData') as {
+      accounts?: Record<string, ModelPreferenceAccount>
+      accountProxyBindings?: Record<string, string>
+      proxyPool?: Record<string, { url?: string; enabled?: boolean; status?: string }>
+    } | undefined
+    if (!data?.accounts || !Object.hasOwn(data.accounts, id)) return undefined
+    const account = data.accounts[id]
+    const proxyId = data.accountProxyBindings && Object.hasOwn(data.accountProxyBindings, id) ? data.accountProxyBindings[id] : undefined
+    const proxy = proxyId && data.proxyPool && Object.hasOwn(data.proxyPool, proxyId) ? data.proxyPool[proxyId] : undefined
+    return { ...account, proxyUrl: proxy?.enabled && proxy.status !== 'dead' ? proxy.url : undefined }
+  },
+  beginOperation: account => instanceAccountOwnership.beginOperation({ accountId: account.id, ...account.credentials }),
+  models: identity => fetchKiroModels(identity as ProxyAccount),
+  request: (identity, operation, input) => requestControlPlane(identity, operation, input, {
+    fetch: (url, init) => fetchWithAppProxy(String(url), init ?? {}, identity.proxyUrl)
+  })
 })
 
 // The lease covers the complete handler, including post-refresh cache and store writes.
@@ -4760,7 +4782,7 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 切换账号到 Kiro CLI - 写入凭证到 SQLite 数据库
-  // kiro-cli 使用 ~/.local/share/kiro-cli/data.sqlite3 中的 auth_kv 表
+  // kiro-cli 使用各平台的本地数据目录中的 data.sqlite3/auth_kv。
   registerUnboundAccountHandler('switch-account-cli', async (_event, credentials: {
     accountId?: string
     handoffProof?: string
@@ -4777,7 +4799,6 @@ app.whenReady().then(async () => {
     provider?: string
     scopes?: string[]
   }) => {
-    const os = await import('os')
     const path = await import('path')
     const { mkdir } = await import('fs/promises')
 
@@ -4795,7 +4816,14 @@ app.whenReady().then(async () => {
         scopes
       } = credentials
       if (!refreshToken) return { success: false, error: '缺少刷新凭证，请重新授权' }
-      const authMethod = credentials.authMethod || ((provider === 'Google' || provider === 'Github') ? 'social' : 'IdC')
+      const identity = resolveIdentity({ provider, authMethod: credentials.authMethod, hasClientCredentials: !!clientId && !!clientSecret })
+      if (!identity.ok) return { success: false, error: identity.message }
+      const { authMethod } = identity
+      const isSocial = authMethod === 'social'
+      const dbPath = resolveKiroCliDatabasePath(process.platform, os.homedir(), process.env)
+      const registrationIdentity = { clientId, clientSecret, region }
+      // Only reuse a CLI-created registration for the exact same OIDC client.
+      const registration = isSocial ? undefined : await inspectKiroCliRegistration(dbPath, registrationIdentity)
       const assertPreparedCurrent = (): void => {
         if (!credentials.reusePreparedCredentials) return
         const saved = store?.get('accountData') as { accounts?: Record<string, { credentials?: { accessToken?: string; refreshToken?: string } }> } | undefined
@@ -4824,26 +4852,12 @@ app.whenReady().then(async () => {
       }
       const { accessToken } = refreshedCredentials
 
-      // kiro-cli SQLite 数据库路径
-      // Windows: %LOCALAPPDATA%\kiro-cli\data.sqlite3
-      // macOS/Linux: ~/.local/share/kiro-cli/data.sqlite3
-      const dataDir = process.platform === 'win32'
-        ? path.join(os.homedir(), 'AppData', 'Local', 'kiro-cli')
-        : path.join(os.homedir(), '.local', 'share', 'kiro-cli')
-      await mkdir(dataDir, { recursive: true })
-      const dbPath = path.join(dataDir, 'data.sqlite3')
-
-      // 判断 token key：social 登录用 social:token，IdC 登录用 odic:token
-      const isSocial = provider === 'Google' || provider === 'Github'
-      const preferredTokenKey = isSocial ? 'kirocli:social:token' : 'kirocli:odic:token'
-      const preferredRegKey = 'kirocli:odic:device-registration'
-
       // profileArn 决策统一由 helper：BuilderId 不带 profileArn
       // kiro-cli 同样不应该在 SQLite 里塞占位符 ARN（实测会触发 REST 端点 403）
       const resolvedProfileArn = resolveProfileArnForWrite({
         profileArn,
-        authMethod: isSocial ? 'social' : 'IdC',
-        provider,
+        authMethod,
+        provider: identity.provider,
         region
       })
 
@@ -4861,6 +4875,14 @@ app.whenReady().then(async () => {
       }
       if (scopes) tokenData.scopes = scopes
 
+      if (registration !== undefined) {
+        await writeKiroCliRegisteredToken(dbPath, registrationIdentity, registration, JSON.stringify(tokenData), assertPreparedCurrent)
+        return { success: true, dbPath, refreshedCredentials, preparedExpiresAt }
+      }
+
+      await mkdir(path.dirname(dbPath), { recursive: true })
+      const preferredTokenKey = 'kirocli:social:token'
+
       // 使用 sqlite3 命令行操作（跨平台兼容，无需原生模块编译）
       const { execFileSync } = await import('child_process')
       const sqlite3Bin = process.platform === 'win32' ? 'sqlite3.exe' : 'sqlite3'
@@ -4872,20 +4894,10 @@ app.whenReady().then(async () => {
         `INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('${preferredTokenKey}', '${JSON.stringify(tokenData).replace(/'/g, "''")}');`
       ]
 
-      // 写入 device-registration（仅 IdC 登录）
-      if (clientId && clientSecret && !isSocial) {
-        const regData = { client_id: clientId, client_secret: clientSecret, region }
-        sqlStatements.push(
-          `INSERT OR REPLACE INTO auth_kv (key, value) VALUES ('${preferredRegKey}', '${JSON.stringify(regData).replace(/'/g, "''")}');`
-        )
-      }
-
       // 清除其他优先级的旧 key
-      const cliTokenKeys = ['kirocli:social:token', 'kirocli:odic:token', 'codewhisperer:odic:token']
+      const cliTokenKeys = ['kirocli:odic:token', 'codewhisperer:odic:token']
       for (const key of cliTokenKeys) {
-        if (key !== preferredTokenKey) {
-          sqlStatements.push(`DELETE FROM auth_kv WHERE key = '${key}';`)
-        }
+        sqlStatements.push(`DELETE FROM auth_kv WHERE key = '${key}';`)
       }
 
       sqlStatements.push('COMMIT;')
@@ -4920,7 +4932,7 @@ app.whenReady().then(async () => {
       return { success: true, dbPath, refreshedCredentials, preparedExpiresAt }
     } catch (error) {
       console.error('[Switch CLI] Credential handoff failed')
-      return { success: false, error: 'CLI 凭证写入失败，请检查本机 CLI 安装和数据库状态',
+      return { success: false, error: error instanceof KiroCliRegistrationError ? error.message : 'CLI 凭证写入失败，请检查本机 CLI 安装和数据库状态',
         refreshedCredentials: credentials.reusePreparedCredentials ? undefined : refreshedCredentials,
         preparedExpiresAt: credentials.reusePreparedCredentials ? undefined : preparedExpiresAt }
     }
@@ -5861,19 +5873,28 @@ app.whenReady().then(async () => {
       } as ProxyAccount)
       return {
         success: true,
-        models: models.map(m => ({
-          id: m.modelId,
-          name: m.modelName,
-          description: m.description,
-          inputTypes: m.supportedInputTypes,
-          maxInputTokens: m.tokenLimits?.maxInputTokens,
-          maxOutputTokens: m.tokenLimits?.maxOutputTokens,
-          rateMultiplier: m.rateMultiplier,
-          rateUnit: m.rateUnit
-        }))
+        models: filterAvailableModels(models).map(toAccountModel)
       }
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to get models', models: [] }
+    }
+  })
+
+  // Preferences use stored account identity, never renderer-supplied tokens or profiles.
+  ipcMain.handle('account-read-model-preferences', async (event, accountId: string) => {
+    try {
+      requireTrustedMainWindow(event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined)
+      return { success: true, snapshot: await modelPreferences.read(accountId) }
+    } catch (error) {
+      return { success: false, error: error instanceof ControlPlaneError || error instanceof InstanceOwnershipError || error instanceof ModelPreferencesError ? error.message : '模型偏好读取未完成，请检查账户状态后重试。' }
+    }
+  })
+  ipcMain.handle('account-save-model-preferences', async (event, input: ModelPreferencesWrite) => {
+    try {
+      requireTrustedMainWindow(event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined)
+      return { success: true, snapshot: await modelPreferences.save(input) }
+    } catch (error) {
+      return { success: false, error: error instanceof ControlPlaneError || error instanceof InstanceOwnershipError || error instanceof ModelPreferencesError ? error.message : '模型偏好保存未完成，请重新读取后核对。' }
     }
   })
 

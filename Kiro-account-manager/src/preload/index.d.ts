@@ -1,4 +1,5 @@
 import type { AccountModelInfo } from '../shared/modelCatalog'
+import type { ModelPreferencesResult, ModelPreferencesWrite } from '../shared/modelPreferences'
 import type { LogPage } from '../shared/logHistory'
 import type { WindowVisibilityState } from '../shared/windowVisibility'
 import type { AppUpdateState, UpdateActionResult } from '../main/appUpdater'
@@ -626,6 +627,8 @@ interface KiroApi {
 
   // 获取账户可用模型列表
   accountGetModels: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => Promise<{ success: boolean; error?: string; models: AccountModelInfo[] }>
+  accountReadModelPreferences: (accountId: string) => Promise<ModelPreferencesResult>
+  accountSaveModelPreferences: (input: ModelPreferencesWrite) => Promise<ModelPreferencesResult>
 
   // 获取可用订阅列表
   accountGetSubscriptions: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string) => Promise<{ success: boolean; error?: string; plans: Array<{ name: string; qSubscriptionType: string; description: { title: string; billingInterval: string; featureHeader: string; features: string[] }; pricing: { amount: number; currency: string } }>; disclaimer?: string[] }>

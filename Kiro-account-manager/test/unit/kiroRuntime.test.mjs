@@ -54,6 +54,44 @@ test('actual current SDK wire uses Runtime JSON-RPC, canonical TokenType and bod
   assert.equal(buildRuntimeRequest(account({ authMethod: 'external_idp', provider: 'ExternalIdp' }), payload()).headers.TokenType, 'EXTERNAL_IDP')
 })
 
+test('Spec-family modes use the official spectask wire value without mutating caller state', () => {
+  const original = payload()
+  original.conversationState.agentTaskType = 'vibe'
+  const configuredSpec = buildRuntimeRequest(account(), original, { agentMode: 'spec' })
+  assert.equal(configuredSpec.payload.conversationState.agentTaskType, 'spectask')
+  assert.equal(configuredSpec.headers['x-amzn-kiro-mode-identifier'], undefined, 'agentMode alone is not backend attribution')
+  for (const modeIdentifier of ['spec', 'quick-spec', 'bug-fix']) {
+    const request = buildRuntimeRequest(account(), original, { agentMode: 'vibe', modeIdentifier })
+    assert.equal(request.payload.conversationState.agentTaskType, 'spectask')
+    assert.equal(request.headers['x-amzn-kiro-mode-identifier'], modeIdentifier)
+  }
+  assert.equal(original.conversationState.agentTaskType, 'vibe')
+  assert.equal(buildRuntimeRequest(account(), original, { agentMode: 'vibe' }).payload.conversationState.agentTaskType, 'vibe')
+})
+
+test('single-invocation Runtime requests report one actual attempt and no model fallback', () => {
+  const request = buildRuntimeRequest(account(), payload())
+  assert.equal(request.headers['amz-sdk-request'], 'attempt=1; max=1')
+  assert.equal(request.headers['x-amzn-kiro-attempt'], '1;max=1')
+  assert.equal(request.headers['x-amzn-kiro-fallback'], '0;max=0')
+  assert.equal(request.headers['x-amzn-kiro-mode-identifier'], undefined)
+  assert.equal('modeIdentifier' in request.payload, false, 'attribution is not a new GAR body field')
+})
+
+test('request-scoped mode identifiers are bounded, header-safe and never inherited by later requests', async () => {
+  const request = buildRuntimeRequest(account(), payload(), { modeIdentifier: 'workflow:review/step-1' })
+  assert.equal(request.headers['x-amzn-kiro-mode-identifier'], 'workflow:review/step-1')
+  assert.equal(buildRuntimeRequest(account(), payload()).headers['x-amzn-kiro-mode-identifier'], undefined)
+  assert.equal(buildRuntimeRequest(account(), payload(), { modeIdentifier: '' }).headers['x-amzn-kiro-mode-identifier'], undefined)
+  for (const modeIdentifier of ['spec\r\nAuthorization: injected', 'bad mode', 'x'.repeat(129), 7, null]) {
+    const result = await run(null, { modeIdentifier })
+    assert.equal(result.calls.length, 0)
+    assert.equal(result.errors.length, 1)
+    assert.equal(result.errors[0].code, 'invalid_context')
+    assert.doesNotMatch(result.errors[0].message, /injected/)
+  }
+})
+
 test('service profile and current official provider defaults are retained; arbitrary payload profiles are ignored', () => {
   const arn = 'arn:aws:codewhisperer:ap-northeast-1:123456789012:profile/synthetic'
   assert.equal(buildRuntimeRequest(account({ profileArn: arn }), payload()).url, 'https://runtime.ap-northeast-1.kiro.dev/')

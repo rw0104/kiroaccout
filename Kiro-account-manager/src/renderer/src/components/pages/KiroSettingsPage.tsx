@@ -726,6 +726,10 @@ export function KiroSettingsPage() {
                 <p id="kiro-memory-hint" className="text-sm text-muted-foreground mt-1">{isEn
                   ? 'User-level setting for the selected IDE. Switching to or from Off or Use only applies to new sessions. Switching between the two learning modes applies immediately to local sessions.'
                   : '所选 IDE 的用户级设置。切换关闭或仅使用（只读）需新建会话；在两种学习模式间切换会立即应用到本地会话。'}</p>
+                <p className="text-sm text-muted-foreground mt-1">{isEn
+                  ? 'Cloud sync is managed separately in Kiro and may be limited by your organization.'
+                  : '云端同步在 Kiro 中单独管理，并可能受组织设置限制。'}</p>
+                <button type="button" className="text-sm text-primary hover:underline mt-1" onClick={() => window.api.openExternal('https://kiro.dev/docs/memory/')}>{isEn ? 'Memory guide' : '记忆使用说明'}</button>
               </div>
               <Select
                 id="kiro-memory"
@@ -755,7 +759,10 @@ export function KiroSettingsPage() {
               <p className="text-sm text-muted-foreground">{isEn
                 ? 'Choose Only when asked, Only for large tasks, or As much as possible in Use workflows above the parent chat in Kiro. This session preference is separate from the switch here.'
                 : '请在 Kiro 主会话上方的 Use workflows 中选择“仅在要求时”“仅复杂任务”或“尽量使用”。会话偏好与此处的总开关分开。'}</p>
-              <button type="button" className="text-sm text-primary hover:underline" onClick={() => window.api.openExternal('https://kiro.dev/docs/workflows/')}>{isEn ? 'Workflows guide' : '工作流说明'}</button>
+              <div className="flex flex-wrap gap-x-4 gap-y-2">
+                <button type="button" className="text-sm text-primary hover:underline" onClick={() => window.api.openExternal('https://kiro.dev/docs/workflows/')}>{isEn ? 'Workflows guide' : '工作流说明'}</button>
+                <button type="button" className="text-sm text-primary hover:underline" onClick={() => window.api.openExternal('https://kiro.dev/docs/hooks/types/#pre-compaction')}>{isEn ? 'Compaction Hooks guide' : '压缩前后 Hooks 说明'}</button>
+              </div>
             </div>
 
             {/* Agent Autonomy */}

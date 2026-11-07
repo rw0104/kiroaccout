@@ -2,7 +2,7 @@
 
 Electron application source. See the [project README](../README.md), [stable download](https://github.com/rw0104/kiroaccout/releases/latest) and [all releases](https://github.com/rw0104/kiroaccout/releases).
 
-This source targets **1.8.18 · Windows / macOS / Linux**. Release availability and assets are listed in Releases. Account binding and rotation protection have synthetic-data regression coverage; login and refresh with two real bound accounts have not been validated. Runtime checks succeeded in one Social session; see the release notes for the scope of validation.
+This source targets **1.9.0 · Windows / macOS / Linux**. Release availability and assets are listed in Releases. Account binding and rotation protection have synthetic-data regression coverage; login and refresh with two real bound accounts have not been validated. See the release notes for this version's validation scope.
 
 Migration recovery: if changed legacy data blocks startup after upgrading, choose the recovery option to back up both generations and use the existing secure store. Legacy accounts and credentials are not merged automatically. Keep the entire data directory and its key for later comparison.
 
@@ -11,6 +11,8 @@ Use Add Account → Online Login → Sign in on Kiro website for portal login. F
 Security update: HTTPS proxy traffic verifies destination certificates, remote images are restricted to public addresses, and inference keys cannot use HTTP admin endpoints. Account data migrates to an OS-protected encrypted store on first launch. Unlock your OS keychain before starting; migrate between computers using an explicit credential export.
 
 Kiro Settings now supports Memory and Workflows for the default IDE or a selected managed instance. Saves retain JSONC comments and unrelated settings. Account search also accepts original import names; model cards show documented context tiers when they match the current catalog rate.
+
+Open an account's details to read its model fallback preferences. Set one fallback for a primary model, or clear that setting, then save. Model consent metadata remains visible without automatic consent. Manage instance-bound accounts inside their official instance. Organization usage can be limited by a shared pool and user or group limits; use the Kiro console to confirm effective availability.
 
 Use Kiro Settings → Tool auto-approval to inspect the selected default IDE or managed instance. Changes require an explicit click on Apply auto-approval. The manager backs up the original configuration before writing and can restore it while the file remains unchanged externally. A JSON-only permissions configuration stays read-only; export the YAML template for manual migration. Auto-approval permits command execution and file changes; existing restrictions and built-in protections may still prompt or block execution. Start a new Kiro session to verify the result.
 
@@ -22,4 +24,4 @@ If missing or expired cache data or a changed IDE account prevents synchronizati
 
 The instance page provides observed state, graceful stop and restart. Unsaved changes can prevent closure; no automatic force kill is performed. Removing a configuration preserves profile files. Old RC Windows-user configurations are inactive and must be recreated. Network, proxy, certificates, the Windows identity and DPAPI remain shared; this is not a security sandbox. A separate install directory or ZIP does not isolate the account manager itself.
 
-[1.8.18 notes](../docs/releases/v1.8.18.md) · [AGPL-3.0](../LICENSE) · [Source attribution](../docs/NOTICE.md) · [中文](README_CN.md)
+[1.9.0 notes](../docs/releases/v1.9.0.md) · [AGPL-3.0](../LICENSE) · [Source attribution](../docs/NOTICE.md) · [中文](README_CN.md)

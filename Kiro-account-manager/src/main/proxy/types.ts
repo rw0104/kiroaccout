@@ -590,6 +590,8 @@ export type TokenRefreshCallback = (account: ProxyAccount) => Promise<{
   refreshToken?: string
   expiresAt?: number
   error?: string
+  /** A lost response may already have consumed the input refresh token. */
+  failureKind?: 'temporary' | 'reauth-required' | 'uncertain'
 }>
 
 export interface ProxyStats {

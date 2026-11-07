@@ -101,6 +101,7 @@ type ClientModel = {
   promptCaching?: KiroModel['promptCaching']
   additionalModelRequestFieldsSchema?: KiroModel['additionalModelRequestFieldsSchema']
   status?: string | null
+  consentStatus?: string | null
   availableOrigins?: string[] | null
   defaultThinkingEffort?: string
   permission: unknown[]
@@ -174,6 +175,7 @@ function buildClientModel(input: {
   additionalModelRequestFieldsSchema?: Record<string, unknown> | null
   modelProvider?: string | null
   status?: string | null
+  consentStatus?: string | null
   availableOrigins?: string[] | null
 }): ClientModel {
   const name = modelDisplayName(input.id, input.modelName)
@@ -233,6 +235,7 @@ function buildClientModel(input: {
     promptCaching: input.promptCaching,
     additionalModelRequestFieldsSchema: input.additionalModelRequestFieldsSchema,
     status: input.status,
+    consentStatus: input.consentStatus,
     availableOrigins: input.availableOrigins,
     permission: [],
     root: input.id,
@@ -256,7 +259,12 @@ export class ProxyServer {
   private stats: ProxyStats
   private sessionStats: { totalRequests: number; successRequests: number; failedRequests: number; startTime: number }
   private events: ProxyServerEvents
-  private refreshingTokens: Map<string, Promise<boolean>> = new Map() // 在途刷新去重（并发方共享同一结果）
+  private refreshingTokens = new Map<string, Promise<'rotated' | 'superseded' | 'failed'>>()
+  private tokenRefreshSchedules = new Map<string, {
+    generation: ProxyAccount
+    nextAttemptAt: number
+    failureKind?: 'temporary' | 'reauth-required' | 'uncertain'
+  }>()
   private isHttps: boolean = false
   private isStopping: boolean = false
   private startGeneration = 0
@@ -1107,14 +1115,81 @@ export class ProxyServer {
 
   // 检查 Token 是否需要刷新
   private isTokenExpiringSoon(account: ProxyAccount): boolean {
-    if (!account.expiresAt) return false
+    if (account.expiresAt === undefined) return false
+    if (!Number.isFinite(account.expiresAt)) return true
+    const schedule = this.getRefreshSchedule(account)
+    if (schedule && this.isAccessTokenUsable(account) && Date.now() <= schedule.nextAttemptAt) return false
     const refreshBeforeMs = (this.config.tokenRefreshBeforeExpiry || 300) * 1000
     return Date.now() + refreshBeforeMs >= account.expiresAt
   }
 
+  private sameRefreshGeneration(left: ProxyAccount, right?: ProxyAccount | null): boolean {
+    return !!right && left.accessToken === right.accessToken && left.refreshToken === right.refreshToken
+      && left.clientId === right.clientId && left.clientSecret === right.clientSecret
+      && left.provider === right.provider && left.authMethod === right.authMethod && left.region === right.region
+      && left.profileArn === right.profileArn && left.proxyUrl === right.proxyUrl
+      && left.expiresAt === right.expiresAt && left.clientSecretExpiresAt === right.clientSecretExpiresAt
+  }
+
+  private isAccessTokenUsable(account?: ProxyAccount | null): boolean {
+    return !!account?.accessToken && account.isAvailable !== false && !this.accountPool.isSuspended(account)
+      && typeof account.expiresAt === 'number' && Number.isFinite(account.expiresAt)
+      && account.expiresAt >= Date.now() + 10_000
+  }
+
+  private getRefreshSchedule(account: ProxyAccount): { generation: ProxyAccount; nextAttemptAt: number; failureKind?: 'temporary' | 'reauth-required' | 'uncertain' } | undefined {
+    // Keep at most one schedule per currently present credential generation.
+    for (const [id, schedule] of this.tokenRefreshSchedules) {
+      if (!this.sameRefreshGeneration(schedule.generation, this.accountPool.getAccount(id))) this.tokenRefreshSchedules.delete(id)
+    }
+    const schedule = this.tokenRefreshSchedules.get(account.id)
+    return schedule && this.sameRefreshGeneration(schedule.generation, account) ? schedule : undefined
+  }
+
+  private rememberRefreshSchedule(account: ProxyAccount, failureKind?: 'temporary' | 'reauth-required' | 'uncertain'): void {
+    const refreshBeforeMs = (this.config.tokenRefreshBeforeExpiry || 300) * 1000
+    if (!failureKind && (account.expiresAt ?? 0) > Date.now() + refreshBeforeMs) {
+      this.tokenRefreshSchedules.delete(account.id)
+      return
+    }
+    const usableUntil = (account.expiresAt ?? 0) - 10_000
+    const nextAttemptAt = failureKind === 'temporary' ? Math.min(Date.now() + 30_000, usableUntil) : usableUntil
+    this.tokenRefreshSchedules.set(account.id, { generation: { ...account }, nextAttemptAt, failureKind })
+  }
+
+  private canRetainAccessToken(account: ProxyAccount): boolean {
+    const current = this.accountPool.getAccount(account.id)
+    if (!this.sameRefreshGeneration(account, current) || !this.isAccessTokenUsable(current)) return false
+    const kind = this.getRefreshSchedule(current!)?.failureKind
+    return kind === 'temporary' || kind === 'uncertain'
+  }
+
+  private acceptRefreshResult(account: ProxyAccount, outcome: 'rotated' | 'superseded' | 'failed', force: boolean): boolean {
+    const current = this.accountPool.getAccount(account.id)
+    if (outcome === 'superseded') {
+      return this.isAccessTokenUsable(current) && (!force || current?.accessToken !== account.accessToken)
+    }
+    if (!force) return outcome === 'rotated' ? this.isAccessTokenUsable(current) : this.canRetainAccessToken(account)
+    // A rejected access token cannot be retried just because a refresh cache
+    // reports success for the same token, or a proactive waiter kept it alive.
+    if (outcome === 'rotated' && this.isAccessTokenUsable(current) && current?.accessToken !== account.accessToken) return true
+    if (current?.accessToken === account.accessToken && (outcome === 'rotated' || this.sameRefreshGeneration(account, current))) this.accountPool.markNeedsRefresh(account.id)
+    return false
+  }
+
   // 刷新 Token
-  private async refreshToken(account: ProxyAccount, signal?: AbortSignal): Promise<boolean> {
+  private async refreshToken(account: ProxyAccount, signal?: AbortSignal, force = false): Promise<boolean> {
     this.throwIfAborted(signal)
+    const current = this.accountPool.getAccount(account.id)
+    if (!current || current.isAvailable === false || this.accountPool.isSuspended(current)) return false
+    if (!this.sameRefreshGeneration(account, current)) return this.acceptRefreshResult(account, 'superseded', force)
+    const schedule = this.getRefreshSchedule(account)
+    // An uncertain POST must not be replayed for this generation, including after expiry.
+    if (schedule?.failureKind === 'uncertain') {
+      if (!force && this.canRetainAccessToken(account)) return true
+      this.accountPool.markNeedsRefresh(account.id)
+      return false
+    }
     if (!this.events.onTokenRefresh) {
       console.warn('[ProxyServer] No token refresh callback configured')
       return false
@@ -1124,9 +1199,10 @@ export class ProxyServer {
     // 旧实现固定等 1 秒后按过期时间"猜"结果，慢刷新（网络抖动/慢代理）会被误判失败导致多余切号。
     const existing = this.refreshingTokens.get(account.id)
     if (existing) {
-      console.log(`[ProxyServer] Token refresh already in progress for ${account.email || account.id}, awaiting result`)
+      console.log('[ProxyServer] Token refresh already in progress, awaiting result')
       try {
-        return await this.abortable(existing, signal)
+        const refreshed = await this.abortable(existing, signal)
+        return this.acceptRefreshResult(account, refreshed, force)
       } catch {
         // 只有"本请求自己"被中止才向上抛；在途刷新因发起方中止/失败时，对本请求按刷新失败处理
         if (signal?.aborted) throw this.getAbortError(signal)
@@ -1136,30 +1212,44 @@ export class ProxyServer {
 
     const task = this.doRefreshToken(account, signal)
     this.refreshingTokens.set(account.id, task)
-    try {
-      return await task
-    } finally {
-      this.refreshingTokens.delete(account.id)
+    const clear = (): void => {
+      if (this.refreshingTokens.get(account.id) === task) this.refreshingTokens.delete(account.id)
     }
+    // Cancelling this request must not evict a dispatched refresh while other
+    // requests can still join it or the credential service can still rotate it.
+    void task.then(clear, clear)
+    const refreshed = await this.abortable(task, signal)
+    return this.acceptRefreshResult(account, refreshed, force)
   }
 
   /** 实际执行 Token 刷新（由 refreshToken 包裹在途去重后调用） */
-  private async doRefreshToken(account: ProxyAccount, signal?: AbortSignal): Promise<boolean> {
-    console.log(`[ProxyServer] Refreshing token for ${account.email || account.id}`)
-
+  private async doRefreshToken(account: ProxyAccount, signal?: AbortSignal): Promise<'rotated' | 'superseded' | 'failed'> {
     try {
       // 随机延迟 0-3 秒，避免多账号同时刷新被识别为批量操作
       const jitter = Math.floor(Math.random() * 3000)
       if (jitter > 0) await this.waitForRetry(jitter, signal)
-      
-      const result = await this.abortable(this.events.onTokenRefresh!(account), signal)
-      if (result.success && result.accessToken) {
+      this.throwIfAborted(signal)
+      const before = this.accountPool.getAccount(account.id)
+      if (!before || before.isAvailable === false || this.accountPool.isSuspended(before)) return 'failed'
+      if (!this.sameRefreshGeneration(account, before)) return 'superseded'
+      console.log('[ProxyServer] Refreshing proxy account token')
+      // A submitted refresh may consume the input even when its initiating
+      // inference request disconnects. Observe the outcome independently.
+      const result = await this.events.onTokenRefresh!(account)
+      const current = this.accountPool.getAccount(account.id)
+      if (!current) return 'failed'
+      // Another operation may have rotated/rebound/removed this account while awaiting refresh.
+      if (!this.sameRefreshGeneration(account, current)) return 'superseded'
+      if (current.isAvailable === false || this.accountPool.isSuspended(current)) return 'failed'
+      if (result.success && result.accessToken && typeof result.expiresAt === 'number' && Number.isFinite(result.expiresAt) && result.expiresAt > Date.now()) {
         // 更新账号池中的 Token
         this.accountPool.updateAccount(account.id, {
           accessToken: result.accessToken,
           refreshToken: result.refreshToken || account.refreshToken,
           expiresAt: result.expiresAt
         })
+        const updated = this.accountPool.getAccount(account.id)!
+        this.rememberRefreshSchedule(updated)
         // 通知外部更新
         this.events.onAccountUpdate?.({
           ...account,
@@ -1167,18 +1257,24 @@ export class ProxyServer {
           refreshToken: result.refreshToken || account.refreshToken,
           expiresAt: result.expiresAt
         })
-        console.log(`[ProxyServer] Token refreshed for ${account.email || account.id}`)
-        return true
+        console.log('[ProxyServer] Proxy account token refreshed')
+        if (!this.isAccessTokenUsable(updated)) {
+          this.accountPool.markNeedsRefresh(account.id)
+          return 'failed'
+        }
+        return 'rotated'
       } else {
-        console.error(`[ProxyServer] Token refresh failed for ${account.email || account.id}: ${result.error}`)
-        this.accountPool.markNeedsRefresh(account.id)
-        return false
+        console.warn('[ProxyServer] Proxy account token refresh failed')
+        this.rememberRefreshSchedule(current, result.failureKind ?? 'reauth-required')
+        if (!this.canRetainAccessToken(current)) this.accountPool.markNeedsRefresh(account.id)
+        return 'failed'
       }
     } catch (error) {
       if (this.isAbortError(error, signal)) throw error
-      console.error(`[ProxyServer] Token refresh error for ${account.email || account.id}:`, error)
-      this.accountPool.markNeedsRefresh(account.id)
-      return false
+      console.warn('[ProxyServer] Proxy account token refresh did not complete')
+      const current = this.accountPool.getAccount(account.id)
+      if (this.sameRefreshGeneration(account, current)) this.accountPool.markNeedsRefresh(account.id)
+      return 'failed'
     }
   }
 
@@ -1398,7 +1494,7 @@ export class ProxyServer {
         // 401/403: 尝试刷新 Token
         if (errMsg.includes('401') || errMsg.includes('403') || errMsg.includes('Auth')) {
           console.log('[ProxyServer] Auth error, attempting token refresh')
-          const refreshed = await this.refreshToken(currentAccount, signal)
+          const refreshed = await this.refreshToken(currentAccount, signal, true)
           if (refreshed) {
             const refreshedAccount = this.accountPool.getAccount(currentAccount.id)
             if (!refreshedAccount || !this.isAccountAllowed(refreshedAccount, apiKeyId)) break
@@ -2236,7 +2332,7 @@ export class ProxyServer {
         maxInputTokens: model.maxInputTokens, maxOutputTokens: model.maxOutputTokens,
         rateMultiplier: model.rateMultiplier, rateUnit: model.rateUnit,
         promptCaching: model.promptCaching, additionalModelRequestFieldsSchema: model.additionalModelRequestFieldsSchema,
-        modelProvider: model.modelProvider, status: model.status, availableOrigins: model.availableOrigins
+        modelProvider: model.modelProvider, status: model.status, consentStatus: model.consentStatus, availableOrigins: model.availableOrigins
       }))
       this.throwIfResponseClosed(res, signal)
       res.writeHead(200, { 'Content-Type': 'application/json' })

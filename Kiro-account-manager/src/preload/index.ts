@@ -1,4 +1,5 @@
 import type { AccountModelInfo } from '../shared/modelCatalog'
+import type { ModelPreferencesResult, ModelPreferencesWrite } from '../shared/modelPreferences'
 import type { LogPage } from '../shared/logHistory'
 import type { WindowVisibilityState } from '../shared/windowVisibility'
 import type { AppUpdateState, UpdateActionResult } from '../main/appUpdater'
@@ -659,6 +660,9 @@ const api = {
   accountGetModels: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string): Promise<{ success: boolean; error?: string; models: AccountModelInfo[] }> => {
     return ipcRenderer.invoke('account-get-models', accessToken, region, profileArn, machineId, provider, authMethod, accountId)
   },
+
+  accountReadModelPreferences: (accountId: string): Promise<ModelPreferencesResult> => ipcRenderer.invoke('account-read-model-preferences', accountId),
+  accountSaveModelPreferences: (input: ModelPreferencesWrite): Promise<ModelPreferencesResult> => ipcRenderer.invoke('account-save-model-preferences', input),
 
   // 获取可用订阅列表
   accountGetSubscriptions: (accessToken: string, region?: string, profileArn?: string, machineId?: string, provider?: string, authMethod?: string, accountId?: string): Promise<{ success: boolean; error?: string; plans: Array<{ name: string; qSubscriptionType: string; description: { title: string; billingInterval: string; featureHeader: string; features: string[] }; pricing: { amount: number; currency: string } }>; disclaimer?: string[] }> => {

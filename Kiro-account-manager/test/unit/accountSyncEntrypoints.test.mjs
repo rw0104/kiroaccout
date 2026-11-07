@@ -8,6 +8,8 @@ import { parseAccountUsage, normalizeUsageDate } from '../../src/shared/accountU
 import { normalizeSubscriptionType } from '../../src/shared/accountSubscription.ts'
 import { SwitchHandoffStore } from '../../src/main/switchHandoff.ts'
 import { applyManagerTokenRotation } from '../../src/main/managerAccountRefresh.ts'
+import { inspectKiroCliRegistration, KiroCliRegistrationError, resolveKiroCliDatabasePath, writeKiroCliRegisteredToken } from '../../src/main/kiroCliStorage.ts'
+import { resolveIdentity } from '../../src/shared/authIdentity.ts'
 
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
@@ -59,7 +61,7 @@ test('real usage transport wrapper preserves new fields through both configured 
   assert.equal(parseAccountUsage(invalid).addOnCredits[0].status, 'inactive')
 })
 
-function cliHarness({ refreshFails = false, diskFails = false, onMkdir } = {}) {
+function cliHarness({ refreshFails = false, diskFails = false, onMkdir, inspectRegistration = inspectKiroCliRegistration, writeRegistration = writeKiroCliRegisteredToken } = {}) {
   const callback = find(node => ts.isCallExpression(node) && node.arguments[0]?.text === 'switch-account-cli').arguments[1].getText(tree)
   const sql = []
   let directories = 0
@@ -72,8 +74,11 @@ function cliHarness({ refreshFails = false, diskFails = false, onMkdir } = {}) {
     switchHandoffs: handoffs,
     store: { get: () => ({ accounts: { 'synthetic-account': { credentials: savedCredentials } } }) },
     resolveProfileArnForWrite: () => undefined,
+    resolveIdentity, resolveKiroCliDatabasePath, KiroCliRegistrationError,
+    inspectKiroCliRegistration: inspectRegistration, writeKiroCliRegisteredToken: writeRegistration,
+    os: { homedir: () => 'C:\\SyntheticHome' },
     refreshTokenByMethod: async () => { refreshes++; return refreshFails ? { success: false, error: 'SYNTHETIC_DENIED' } : { success: true, accessToken: 'SYNTHETIC_ACCESS_NEW', refreshToken: 'SYNTHETIC_REFRESH_NEW', expiresIn: 7200 } },
-    process: { platform: 'win32' },
+    process: { platform: 'win32', env: {} },
     require: name => {
       if (name === 'os') return { homedir: () => 'SYNTHETIC_HOME' }
       if (name === 'path') return path
@@ -85,6 +90,30 @@ function cliHarness({ refreshFails = false, diskFails = false, onMkdir } = {}) {
   vm.runInContext(transpile(`globalThis.run = ${callback}`), context)
   return { run: (over = {}) => context.run(undefined, { accessToken: 'SYNTHETIC_ACCESS_OLD', refreshToken: 'SYNTHETIC_REFRESH_OLD', provider: 'Google', ...over }), sql, handoffs, setSaved: credentials => { savedCredentials = credentials }, get refreshes() { return refreshes }, get directories() { return directories } }
 }
+
+test('CLI IdC handoff refuses missing native registration before any refresh or file write', async () => {
+  const harness = cliHarness({ inspectRegistration: async () => { throw new KiroCliRegistrationError() } })
+  const result = await harness.run({ provider: 'BuilderId', clientId: 'SYNTHETIC_CLIENT', clientSecret: 'SYNTHETIC_SECRET' })
+  assert.equal(result.success, false)
+  assert.match(result.error, /kiro-cli login/)
+  assert.equal(harness.refreshes, 0)
+  assert.equal(harness.directories, 0)
+  assert.equal(harness.sql.length, 0)
+})
+
+test('CLI IdC uses the transaction writer with the preflight revision and rotated credentials', async () => {
+  const revision = { registration: 'SYNTHETIC_REGISTRATION', tokens: [null, null, null] }
+  const steps = []
+  const harness = cliHarness({
+    inspectRegistration: async (_dbPath, identity) => { steps.push(['inspect', identity.clientId]); return revision },
+    writeRegistration: async (_dbPath, identity, expected, tokenJson) => { steps.push(['write', identity.clientId]); assert.equal(expected, revision); assert.equal(JSON.parse(tokenJson).refresh_token, 'SYNTHETIC_REFRESH_NEW') }
+  })
+  const result = await harness.run({ provider: 'BuilderId', clientId: 'SYNTHETIC_CLIENT', clientSecret: 'SYNTHETIC_SECRET' })
+  assert.equal(result.success, true)
+  assert.equal(harness.refreshes, 1)
+  assert.deepEqual(steps, [['inspect', 'SYNTHETIC_CLIENT'], ['write', 'SYNTHETIC_CLIENT']])
+  assert.equal(harness.sql.length, 0)
+})
 
 test('actual CLI handoff writes rotated refresh token, real expiry and one transaction', async () => {
   const harness = cliHarness()

@@ -17,7 +17,7 @@ import type {
   ProxyAccount
 } from './types'
 import { proxyLogger } from './logger'
-import { executeRuntimeRequest } from './kiroRuntime'
+import { executeRuntimeRequest, type RuntimeCallContext } from './kiroRuntime'
 import { requestControlPlane } from '../kiroControlPlane'
 import { KIRO_LEGACY_IDENTITY } from '../../shared/kiroClientCompatibility'
 import { isRetiredModelId, ModelRequestError, type KiroModel } from '../../shared/modelCatalog'
@@ -1105,11 +1105,13 @@ export async function callKiroApiStream(
   onComplete: (usage: KiroUsage) => void,
   onError: (error: Error) => void,
   signal?: AbortSignal,
-  _preferredEndpoint?: 'runtime' | 'codewhisperer' | 'amazonq' | 'amazonq-cli'
+  _preferredEndpoint?: 'runtime' | 'codewhisperer' | 'amazonq' | 'amazonq-cli',
+  context?: RuntimeCallContext
 ): Promise<void> {
   await executeRuntimeRequest({
     account, payload, onChunk, onComplete, onError, signal,
     agentMode: configuredAgentMode,
+    modeIdentifier: context?.modeIdentifier,
     estimateTokens: countTokens,
     fetcher: (url, options) => fetchWithProxy(url, options, account),
     onEventCounts: logStreamEvents ? counts => proxyLogger.debug('Kiro', 'Runtime stream event counts', counts) : undefined
@@ -1125,7 +1127,8 @@ export function estimateTokens(text: string): number {
 export async function callKiroApi(
   account: ProxyAccount,
   payload: KiroPayload,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  context?: RuntimeCallContext
 ): Promise<{
   content: string
   toolUses: KiroToolUse[]
@@ -1168,7 +1171,9 @@ export async function callKiroApi(
         resolve({ content, toolUses, usage })
       },
       reject,
-      signal
+      signal,
+      undefined,
+      context
     ).catch(reject)
   })
 }

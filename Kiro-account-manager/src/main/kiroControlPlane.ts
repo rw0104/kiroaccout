@@ -11,7 +11,8 @@ export interface ControlPlaneIdentity {
   authMethod?: string
 }
 
-type Operation = 'GetUsageLimits' | 'ListAvailableModels'
+export type ControlPlaneOperation = 'GetUsageLimits' | 'ListAvailableModels' | 'GetUserPreference' | 'SetUserPreference'
+type Operation = ControlPlaneOperation
 const object = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value)
 const safeText = (value: unknown): value is string => typeof value === 'string' && !!value.trim() &&
   !Array.from(value).some(character => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127)
@@ -107,7 +108,7 @@ export class ControlPlaneError extends Error {
 export function buildControlPlaneRequest(identity: ControlPlaneIdentity, operation: Operation, input: Record<string, unknown>): {
   url: string; method: 'POST'; headers: Record<string, string>; body: string
 } {
-  if (!['GetUsageLimits', 'ListAvailableModels'].includes(operation)) throw new ControlPlaneError('unsupported_operation')
+  if (!['GetUsageLimits', 'ListAvailableModels', 'GetUserPreference', 'SetUserPreference'].includes(operation)) throw new ControlPlaneError('unsupported_operation')
   if (!safeText(identity.accessToken) || identity.accessToken.length > 131072) throw new ControlPlaneError('invalid_access_token')
   if (identity.region !== undefined && !/^[a-z]{2}(?:-[a-z]+){1,3}-\d+$/.test(identity.region)) throw new ControlPlaneError('invalid_region')
   const external = identity.authMethod === 'external_idp' || identity.provider === 'ExternalIdp'
@@ -141,7 +142,17 @@ export function buildControlPlaneRequest(identity: ControlPlaneIdentity, operati
   // The current Kiro client leaves the optional GetUsageLimits schema fields
   // out of this command. Keep the wire limited to the fields observed in the
   // current AWS JSON request; the legacy CBOR route owns its own input shape.
-  const body: Record<string, unknown> = { origin: 'AI_EDITOR', profileArn }
+  const body: Record<string, unknown> = operation === 'GetUserPreference' || operation === 'SetUserPreference'
+    ? { profileArn } : { origin: 'AI_EDITOR', profileArn }
+  // IDE 1.4.121 reads only fallback preferences and writes one target or an empty list to clear it.
+  if (operation === 'GetUserPreference') body.filter = ['MODEL_FALLBACKS']
+  if (operation === 'SetUserPreference') {
+    const target = input.targetModelId
+    const chain = input.chain
+    const modelId = (value: unknown): value is string => safeText(value) && value.length <= 512
+    if (!modelId(target) || !Array.isArray(chain) || chain.length > 1 || chain.some(id => !modelId(id) || id === target)) throw new ControlPlaneError('invalid_model_fallbacks')
+    body.modelFallbacks = { perModel: { [target]: chain.map(id => ({ modelId: id })) } }
+  }
   if (operation === 'ListAvailableModels' && input.nextToken !== undefined) {
     if (!safeText(input.nextToken) || input.nextToken.length > 16384) throw new ControlPlaneError('invalid_next_token')
     body.nextToken = input.nextToken

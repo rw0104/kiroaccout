@@ -66,8 +66,28 @@ test('real streaming call routes all old preferences to one account-region Runti
     assert.equal(call.init.headers['x-amz-target'], 'KiroRuntimeService.GenerateAssistantResponse')
     assert.equal(call.init.headers.TokenType, 'SSO_OIDC')
     assert.equal(JSON.parse(call.init.body).agentMode, 'spec')
+    assert.equal(JSON.parse(call.init.body).conversationState.agentTaskType, 'spectask')
+    assert.equal(call.init.headers['x-amzn-kiro-attempt'], '1;max=1')
+    assert.equal(call.init.headers['x-amzn-kiro-fallback'], '0;max=0')
     assert.equal(call.acc, account, 'bound account proxy remains available to the actual transport')
   }
+})
+
+test('actual streaming and nonstream wrappers retain per-call mode attribution without cross-request bleed', async () => {
+  const calls = []
+  const api = harness(async (_url, init) => {
+    calls.push(init)
+    return new Response(frame('assistantResponseEvent', { content: 'Synthetic reply' }))
+  })
+  const errors = []
+  await Promise.all([
+    api.callKiroApiStream(account, payload, () => {}, () => {}, error => errors.push(error), undefined, undefined, { modeIdentifier: 'quick-spec' }),
+    api.callKiroApiStream(account, payload, () => {}, () => {}, error => errors.push(error))
+  ])
+  await api.callKiroApi(account, payload, undefined, { modeIdentifier: 'bug-fix' })
+  assert.equal(errors.length, 0)
+  assert.deepEqual(calls.map(init => init.headers['x-amzn-kiro-mode-identifier']), ['quick-spec', undefined, 'bug-fix'])
+  for (const call of calls) assert.equal(JSON.parse(call.body).conversationState.agentTaskType, 'spectask')
 })
 
 test('real wrapper never replays after partial text followed by an upstream error', async () => {

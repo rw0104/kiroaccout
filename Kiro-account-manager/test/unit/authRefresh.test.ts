@@ -128,16 +128,20 @@ test('failed next-generation refresh is handed to old callers without an implici
   assert.equal(calls, 2)
 })
 
-test('a timed-out generation cannot publish late success or overwrite a later successful retry', async () => {
+test('a timed-out generation is never replayed and cannot publish late success over a reauthorized generation', async () => {
   const late = deferredResponse()
   let calls = 0
   const final = { ...good, refreshToken: 'SYNTHETIC_FINAL' }
   const service = new TokenRefreshService({ ...dependencies(async () => ++calls === 1 ? late.promise : response(final)), timeoutMs: 10 })
   assert.equal((await service.refresh(credential)).errorCode, 'timeout')
-  assert.equal((await service.refresh(credential)).refreshToken, final.refreshToken)
+  assert.equal((await service.refresh(credential)).failureKind, 'uncertain')
+  assert.equal(calls, 1)
+  const recovered = { ...credential, refreshToken: 'SYNTHETIC_REAUTHORIZED' }
+  assert.equal((await service.refresh(recovered)).refreshToken, final.refreshToken)
   late.resolve(response(good))
   await new Promise(resolve => setImmediate(resolve))
-  assert.equal((await service.refresh(credential)).refreshToken, final.refreshToken)
+  assert.equal((await service.refresh(credential)).failureKind, 'uncertain')
+  assert.equal((await service.refresh(recovered)).refreshToken, final.refreshToken)
   assert.equal(calls, 2)
 })
 
@@ -236,7 +240,7 @@ test('HTTP, malformed JSON and transport errors never echo server or transport s
   }
 })
 
-test('deadline aborts fetch and body reads, settles even a non-cooperative transport, then permits recovery', async () => {
+test('deadline aborts fetch and body reads and requires a new generation before recovery', async () => {
   let signal: AbortSignal | undefined
   let healthy = false
   let calls = 0
@@ -250,5 +254,32 @@ test('deadline aborts fetch and body reads, settles even a non-cooperative trans
   assert.equal(signal?.aborted, true)
   assert.equal(calls, 1)
   healthy = true
-  assert.equal((await service.refresh(credential)).success, true)
+  assert.equal((await service.refresh(credential)).failureKind, 'uncertain')
+  assert.equal(calls, 1)
+  assert.equal((await service.refresh({ ...credential, refreshToken: 'SYNTHETIC_REAUTHORIZED' })).success, true)
+})
+
+test('refresh failures distinguish temporary responses, permanent credentials and uncertain transports without replaying', async () => {
+  for (const [status, body, failureKind] of [
+    [429, {}, 'temporary'], [400, { error: 'slow_down' }, 'temporary'],
+    [500, {}, 'temporary'], [503, {}, 'temporary'],
+    [408, {}, 'uncertain'], [502, {}, 'uncertain'], [504, {}, 'uncertain'],
+    [400, { error: 'invalid_grant' }, 'reauth-required'],
+    [400, { error: 'expired_token' }, 'reauth-required'],
+    [401, {}, 'reauth-required'], [403, {}, 'reauth-required'],
+    [400, { error: 'invalid_client' }, 'reauth-required']
+  ] as const) {
+    let calls = 0
+    const service = new TokenRefreshService(dependencies(async () => { calls++; return response(body, status) }))
+    assert.equal((await service.refresh(credential)).failureKind, failureKind, String(status))
+    if (failureKind === 'uncertain') {
+      assert.equal((await service.refresh(credential)).failureKind, failureKind, String(status))
+      assert.equal(calls, 1, 'an intermediary failure may hide a completed refresh')
+    }
+  }
+  let calls = 0
+  const service = new TokenRefreshService(dependencies(async () => { calls++; throw new Error('SYNTHETIC_TRANSPORT') }))
+  assert.equal((await service.refresh(credential)).failureKind, 'uncertain')
+  assert.equal((await service.refresh(credential)).failureKind, 'uncertain')
+  assert.equal(calls, 1)
 })

@@ -1,5 +1,5 @@
-// Current Kiro IDE 1.4.5 / Agent 1.1.499 wire evidence:
-// docs/evidence/2026-10-20-current-kiro-requests.md, Runtime's actual awsJson1_0 serializer.
+// Kiro IDE 1.4.121 / Agent 1.1.787: Runtime's actual AWS JSON 1.0 serializer,
+// request mode attribution and single-transport attempt/fallback headers.
 // No Electron/store/system side effects; the HTTP seam is injectable for offline tests.
 import type { KiroPayload, KiroToolUse, KiroUsage, ProxyAccount } from './types'
 
@@ -49,7 +49,12 @@ function messageForRuntime(value: unknown): JsonObject {
   throw new KiroRuntimeError('invalid_payload', 'Invalid Runtime conversation message')
 }
 
-export interface RuntimeRequestOptions {
+export interface RuntimeCallContext {
+  /** Resolved mode for this call, when its caller has an explicit mode source. */
+  modeIdentifier?: string
+}
+
+export interface RuntimeRequestOptions extends RuntimeCallContext {
   regionOverride?: string
   agentMode?: 'vibe' | 'spec'
   clientVersion?: string
@@ -75,13 +80,22 @@ export function buildRuntimeRequest(account: ProxyAccount, original: KiroPayload
   if (!REGION.test(region)) throw new KiroRuntimeError('invalid_region', 'Invalid Runtime region')
   const state = original.conversationState
   if (!object(state) || typeof state.conversationId !== 'string' || !state.conversationId || state.chatTriggerType !== 'MANUAL') throw new KiroRuntimeError('invalid_payload', 'Invalid Runtime conversation state')
+  const modeIdentifier = options.modeIdentifier
+  if (modeIdentifier !== undefined && modeIdentifier !== '' &&
+      (typeof modeIdentifier !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(modeIdentifier))) {
+    throw new KiroRuntimeError('invalid_context', 'Invalid Runtime mode context')
+  }
   const conversationState = pick(state, ['chatTriggerType', 'conversationId', 'agentContinuationId', 'agentTaskType', 'rootConversationId'])
+  // The official SPEC_TASK enum serializes as "spectask", not "SPEC_TASK".
+  // Explicit call context has the same precedence as the client's mode baggage.
+  const agentMode = options.agentMode ?? 'vibe'
+  if (['spec', 'quick-spec', 'bug-fix'].includes(modeIdentifier || agentMode)) conversationState.agentTaskType = 'spectask'
   conversationState.currentMessage = messageForRuntime(state.currentMessage)
   if (state.history !== undefined) {
     if (!Array.isArray(state.history)) throw new KiroRuntimeError('invalid_payload', 'Invalid Runtime history')
     conversationState.history = state.history.map(messageForRuntime)
   }
-  const payload: JsonObject = { conversationState, agentMode: options.agentMode ?? 'vibe' }
+  const payload: JsonObject = { conversationState, agentMode }
   if (profileArn) payload.profileArn = profileArn
   if (original.additionalModelRequestFields !== undefined) {
     if (!object(original.additionalModelRequestFields)) throw new KiroRuntimeError('invalid_payload', 'Invalid Runtime model parameters')
@@ -97,8 +111,12 @@ export function buildRuntimeRequest(account: ProxyAccount, original: KiroPayload
     'x-amz-target': 'KiroRuntimeService.GenerateAssistantResponse',
     'Authorization': `Bearer ${account.accessToken}`,
     'user-agent': `kiroaccout/${options.clientVersion?.replace(/[^0-9A-Za-z.+-]/g, '') || '1'}`,
-    'amz-sdk-request': 'attempt=1; max=1'
+    'amz-sdk-request': 'attempt=1; max=1',
+    // This adapter makes exactly one transport invocation and no model fallback.
+    'x-amzn-kiro-attempt': '1;max=1',
+    'x-amzn-kiro-fallback': '0;max=0'
   }
+  if (modeIdentifier) headers['x-amzn-kiro-mode-identifier'] = modeIdentifier
   if (account.authMethod === 'external_idp' || account.provider === 'ExternalIdp') headers.TokenType = 'EXTERNAL_IDP'
   else if (account.authMethod?.toLowerCase() === 'idc' || ['BuilderId', 'Enterprise', 'IAM_SSO', 'AWSIdC', 'Internal'].includes(account.provider ?? '')) headers.TokenType = 'SSO_OIDC'
   let body: string

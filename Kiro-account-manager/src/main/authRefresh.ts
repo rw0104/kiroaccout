@@ -8,6 +8,7 @@ export interface AuthRefreshResult {
   expiresIn?: number
   error?: string
   errorCode?: 'invalid-input' | 'invalid-response' | 'http' | 'timeout' | 'network' | 'busy'
+  failureKind?: 'temporary' | 'reauth-required' | 'uncertain'
 }
 export interface AuthRefreshInput {
   kind: 'IdC' | 'social'
@@ -41,7 +42,7 @@ interface RefreshEntry {
 }
 const nonempty = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
-const failure = (errorCode: AuthRefreshResult['errorCode'], error: string): AuthRefreshResult => ({ success: false, errorCode, error })
+const failure = (errorCode: AuthRefreshResult['errorCode'], error: string, failureKind: AuthRefreshResult['failureKind'] = 'reauth-required'): AuthRefreshResult => ({ success: false, errorCode, error, failureKind })
 
 /** One refresh per credential across manual refresh, verification and background jobs.
  * Successful rotation is briefly replayed so a late caller cannot consume the old token twice.
@@ -51,6 +52,9 @@ export class TokenRefreshService {
   // Keys are hashes of the registration and token. All generations of a rotation share an entry.
   private readonly entries = new Map<string, RefreshEntry>()
   private readonly lineages = new Set<RefreshEntry>()
+  // Hashes only. A lost response may have rotated its input: a new credential
+  // generation or reauthorization is required, never an automatic replay.
+  private readonly uncertainInputs = new Map<string, AuthRefreshResult>()
   private readonly now: () => number
   private readonly deps: RefreshDependencies
   constructor(deps: RefreshDependencies) { this.deps = deps; this.now = deps.now || Date.now }
@@ -100,6 +104,8 @@ export class TokenRefreshService {
     }
     input = { ...input, region }
     const key = this.key(input)
+    const uncertain = this.uncertainInputs.get(key)
+    if (uncertain) return { ...uncertain }
     const replayMs = Math.max(0, this.deps.replayWindowMs ?? 15000)
     const now = this.now()
     for (const entry of this.lineages) if (!entry.task && now >= entry.retainUntil) this.drop(entry)
@@ -113,11 +119,13 @@ export class TokenRefreshService {
         return this.copyResult(existing, existing.result)
       }
     }
-    if (!existing && (this.lineages.size >= 1024 || this.entries.size >= 4096)) return failure('busy', '刷新任务较多，请稍后重试')
+    if (this.uncertainInputs.size >= 4096) return failure('busy', '刷新结果待确认的账户较多，请在客户端重新授权并同步最新凭证', 'temporary')
+    if (!existing && (this.lineages.size >= 1024 || this.entries.size >= 4096)) return failure('busy', '刷新任务较多，请稍后重试', 'temporary')
     const retentionMs = Math.max(1000, Math.min(3600000, this.deps.maxRetentionMs ?? 3600000))
     const entry: RefreshEntry = existing || { currentKey: key, aliases: new Set(), retainUntil: now + retentionMs }
     if (!existing) { this.lineages.add(entry); this.alias(entry, key) }
     const task = Promise.resolve().then(() => this.perform(input, region)).then(async result => {
+      if (!result.success && result.failureKind === 'uncertain') this.uncertainInputs.set(key, { ...result })
       const current = this.root(entry)
       if (current !== entry) return current.task ? await current.task : current.result || failure('busy', '凭证轮换状态已变化，请重新获取最新凭证')
       if (result.success && result.refreshToken) {
@@ -159,7 +167,7 @@ export class TokenRefreshService {
       timer = setTimeout(() => {
         timedOut = true
         controller.abort()
-        resolve(failure('timeout', '刷新请求超时，结果尚不确定，请稍后重试或重新登录'))
+        resolve(failure('timeout', '刷新请求超时，结果尚不确定，请重新授权或同步最新凭证', 'uncertain'))
       }, this.deps.timeoutMs ?? 30000)
     })
     const request = (async (): Promise<AuthRefreshResult> => {
@@ -177,21 +185,29 @@ export class TokenRefreshService {
         if (!response.ok) {
           // Do not return server bodies, URLs, tokens or transport exception text to the UI.
           const data = await response.json().catch(() => ({}))
-          const code = record(data).error
+          const rawCode = record(data).error
+          const code = typeof rawCode === 'string' ? rawCode.toLowerCase() : ''
+          // A gateway timeout or lost upstream response cannot tell us whether
+          // the authorization service already consumed the input credential.
+          if ([408, 502, 504].includes(response.status)) {
+            return failure('http', `HTTP ${response.status}: 刷新结果尚不确定，请重新授权或同步最新凭证`, 'uncertain')
+          }
           const reason = code === 'invalid_grant' || code === 'expired_token' ? '刷新凭证已失效，请重新登录'
             : code === 'invalid_client' || code === 'unauthorized_client' ? '客户端注册已失效，请重新登录'
-              : response.status === 429 ? '请求过于频繁，请稍后重试' : '凭证刷新失败，请检查登录状态和网络'
-          return failure('http', `HTTP ${response.status}: ${reason}`)
+              : response.status === 429 || code === 'slow_down' ? '请求过于频繁，请稍后重试' : '凭证刷新失败，请检查登录状态和网络'
+          const permanent = ['invalid_grant', 'expired_token', 'invalid_client', 'unauthorized_client', 'access_denied'].includes(code) || response.status === 401 || response.status === 403
+          const kind = permanent ? 'reauth-required' : response.status === 429 || code === 'slow_down' || response.status >= 500 ? 'temporary' : 'reauth-required'
+          return failure('http', `HTTP ${response.status}: ${reason}`, kind)
         }
         const data = record(await response.json())
         if (!nonempty(data.accessToken) || typeof data.expiresIn !== 'number' || !Number.isFinite(data.expiresIn) || data.expiresIn <= 0 ||
             data.refreshToken !== undefined && !nonempty(data.refreshToken)) {
-          return failure('invalid-response', '刷新响应缺少有效凭证或有效期，请重新登录')
+          return failure('invalid-response', '刷新响应缺少有效凭证或有效期，请重新授权或同步最新凭证', 'uncertain')
         }
         return { success: true, accessToken: data.accessToken, refreshToken: data.refreshToken as string | undefined || input.refreshToken, expiresIn: data.expiresIn }
       } catch {
-        return timedOut ? failure('timeout', '刷新请求超时，结果尚不确定，请稍后重试或重新登录')
-          : failure('network', '刷新连接失败，结果尚不确定，请检查网络后重试')
+        return timedOut ? failure('timeout', '刷新请求超时，结果尚不确定，请重新授权或同步最新凭证', 'uncertain')
+          : failure('network', '刷新连接失败，结果尚不确定，请重新授权或同步最新凭证', 'uncertain')
       }
     })()
     try { return await Promise.race([request, deadline]) }
