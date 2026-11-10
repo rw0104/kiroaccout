@@ -146,9 +146,11 @@ def process_identity(pid):
     kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
     kernel.OpenProcess.restype = wintypes.HANDLE
     kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
     kernel.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
     kernel.GetProcessTimes.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME), ctypes.POINTER(wintypes.FILETIME))
-    handle = kernel.OpenProcess(0x1000, False, pid)
+    handle = kernel.OpenProcess(0x1000 | 0x00100000, False, pid)
     if not handle:
         # ERROR_INVALID_PARAMETER means that this PID no longer exists. Access
         # refusal is not evidence that it stopped.
@@ -156,14 +158,27 @@ def process_identity(pid):
             return None
         raise ManagedCrewError("process-identity-unavailable")
     try:
+        # A terminated process may retain a PID and an open handle, even though
+        # Windows has already discarded its image name. Test the process object
+        # itself first, and repeat the check if it exits during the query.
+        def has_exited():
+            state = kernel.WaitForSingleObject(handle, 0)
+            if state == 0:  # WAIT_OBJECT_0
+                return True
+            if state == 258:  # WAIT_TIMEOUT; the process is still running
+                return False
+            raise ManagedCrewError("process-identity-unavailable")
+
+        if has_exited():
+            return None
         capacity = wintypes.DWORD(32768)
         path = ctypes.create_unicode_buffer(capacity.value)
         created, exited, kernel_time, user_time = (wintypes.FILETIME() for _ in range(4))
         if not kernel.QueryFullProcessImageNameW(handle, 0, path, ctypes.byref(capacity)) or not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel_time), ctypes.byref(user_time)):
-            if not pid_exists(pid):
+            if has_exited():
                 return None
             raise ManagedCrewError("process-identity-unavailable")
-        if exited.dwHighDateTime or exited.dwLowDateTime:
+        if has_exited():
             return None
         return {"pid": pid, "executable": os.path.normcase(str(Path(path.value).resolve())), "creationTime": str((created.dwHighDateTime << 32) | created.dwLowDateTime)}
     finally:

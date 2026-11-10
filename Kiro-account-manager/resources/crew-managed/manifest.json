@@ -62,7 +62,7 @@
   "supportFiles": [
     {
       "path": "launcher.py",
-      "sha256": "128e6433f78b4a7fd31b76ec69968dadfa5bcccf87b79ab23b5b8405869dd3a2"
+      "sha256": "cf8bfe39b45cf4e4ece9d8f01a080051010049bae34248a2ceedae7df145f848"
     },
     {
       "path": "overlay.py",
