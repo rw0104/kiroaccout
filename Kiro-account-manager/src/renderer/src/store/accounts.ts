@@ -150,6 +150,9 @@ interface BackgroundCredentialResult extends CredentialVersion {
 function credentialVersion(account: Account): CredentialVersion {
   return { expectedRefreshToken: account.credentials.refreshToken, expectedAccessToken: account.credentials.accessToken }
 }
+function receivedProfileArn(value: unknown): string | undefined {
+  return typeof value === 'string' ? value.trim() || undefined : undefined
+}
 function isDeferredAccountOperation(result: { success: boolean; code?: string; error?: { code?: string } }): boolean {
   const code = result.error?.code ?? result.code
   return !result.success && (code === 'instance-owned' || code === 'account-operation-in-flight')
@@ -244,6 +247,11 @@ async function syncLocalSsoAccountAsync(
     const importResult = await window.api.loadKiroCredentials()
     if (!importResult.success || !importResult.data) return
 
+    const provider = importResult.data.provider || 'BuilderId'
+    const profileArn = importResult.data.profileArn?.trim() || undefined
+    const startUrl = provider === 'Enterprise' || provider === 'IAM_SSO'
+      ? importResult.data.startUrl?.trim() || undefined
+      : undefined
     const verifyResult = await window.api.verifyAccountCredentials({
       refreshToken: importResult.data.refreshToken,
       clientId: importResult.data.clientId || '',
@@ -251,18 +259,22 @@ async function syncLocalSsoAccountAsync(
       clientSecretExpiresAt: importResult.data.clientSecretExpiresAt,
       region: importResult.data.region,
       authMethod: importResult.data.authMethod,
-      provider: importResult.data.provider
+      provider,
+      profileArn,
+      startUrl
     })
     if (!verifyResult.success || !verifyResult.data) return
 
     const now = Date.now()
+    const verifiedProfileArn = verifyResult.data.profileArn?.trim() || profileArn
     const newId = `${verifyResult.data.email}-${now}`
     const newAccount: Account = {
       id: newId,
       email: verifyResult.data.email,
       userId: verifyResult.data.userId,
       nickname: verifyResult.data.email ? verifyResult.data.email.split('@')[0] : undefined,
-      idp: (importResult.data.provider || 'BuilderId') as 'BuilderId' | 'Google' | 'Github',
+      idp: provider as Account['idp'],
+      profileArn: verifiedProfileArn,
       credentials: {
         accessToken: verifyResult.data.accessToken,
         csrfToken: '',
@@ -271,9 +283,11 @@ async function syncLocalSsoAccountAsync(
         clientSecret: importResult.data.clientSecret || '',
         clientSecretExpiresAt: importResult.data.clientSecretExpiresAt,
         region: importResult.data.region || 'us-east-1',
+        profileArn: verifiedProfileArn,
+        startUrl,
         expiresAt: verifyResult.data.expiresIn ? now + verifyResult.data.expiresIn * 1000 : now + 3600 * 1000,
         authMethod: importResult.data.authMethod as 'IdC' | 'social',
-        provider: (importResult.data.provider || 'BuilderId') as 'BuilderId' | 'Github' | 'Google'
+        provider: provider as Account['credentials']['provider']
       },
       subscription: normalizeAccountSubscription({
         type: verifyResult.data.subscriptionType,
@@ -1486,18 +1500,18 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           const accounts = new Map(state.accounts)
           const acc = accounts.get(id)
           if (acc) {
-            // Enterprise 账号刷新时主进程会返回真实 profileArn，持久化避免后续重复获取
-            const resolvedProfileArn = result.data!.profileArn || acc.credentials.profileArn || acc.profileArn
+            // Only a supplied profile may replace saved identity metadata.
+            const resolvedProfileArn = receivedProfileArn(result.data!.profileArn)
             accounts.set(id, {
               ...acc,
-              profileArn: resolvedProfileArn,
+              ...(resolvedProfileArn ? { profileArn: resolvedProfileArn } : {}),
               credentials: {
                 ...acc.credentials,
                 accessToken: result.data!.accessToken,
                 // 如果返回了新的 refreshToken，更新它
                 refreshToken: result.data!.refreshToken || acc.credentials.refreshToken,
                 expiresAt: Date.now() + result.data!.expiresIn * 1000,
-                profileArn: resolvedProfileArn
+                ...(resolvedProfileArn ? { profileArn: resolvedProfileArn } : {})
               },
               status: 'active',
               lastError: undefined,
@@ -1606,12 +1620,14 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           const acc = accounts.get(id)
           if (acc) {
             // 如果 token 被刷新，更新凭证
+            const profileArn = receivedProfileArn(result.data!.newCredentials?.profileArn)
             const updatedCredentials = result.data!.newCredentials 
               ? {
                   ...acc.credentials,
                   accessToken: result.data!.newCredentials.accessToken,
                   refreshToken: result.data!.newCredentials.refreshToken ?? acc.credentials.refreshToken,
-                  expiresAt: result.data!.newCredentials.expiresAt ?? acc.credentials.expiresAt
+                  expiresAt: result.data!.newCredentials.expiresAt ?? acc.credentials.expiresAt,
+                  ...(profileArn ? { profileArn } : {})
                 }
               : acc.credentials
 
@@ -1660,6 +1676,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
               status: result.data!.status as AccountStatus,
               usage: mergedUsage,
               subscription: mergedSubscription as AccountSubscription,
+              ...(profileArn ? { profileArn } : {}),
               credentials: updatedCredentials,
               lastCheckedAt: Date.now(),
               lastError: undefined
@@ -1681,13 +1698,16 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
             const accounts = new Map(state.accounts)
             const acc = accounts.get(id)
             if (acc) {
+              const profileArn = receivedProfileArn(result.data!.newCredentials!.profileArn)
               accounts.set(id, {
                 ...acc,
+                ...(profileArn ? { profileArn } : {}),
                 credentials: {
                   ...acc.credentials,
                   accessToken: result.data!.newCredentials!.accessToken,
                   refreshToken: result.data!.newCredentials!.refreshToken ?? acc.credentials.refreshToken,
-                  expiresAt: result.data!.newCredentials!.expiresAt ?? acc.credentials.expiresAt
+                  expiresAt: result.data!.newCredentials!.expiresAt ?? acc.credentials.expiresAt,
+                  ...(profileArn ? { profileArn } : {})
                 }
               })
             }
@@ -2582,7 +2602,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const newError = refreshData?.errorMessage
 
       // 后台刷新时主进程可能返回自动获取的 profileArn，持久化到顶层和 credentials
-      const bgProfileArn = refreshData?.profileArn || account.credentials.profileArn || account.profileArn
+      const bgProfileArn = receivedProfileArn(refreshData?.profileArn)
       accounts.set(id, {
         ...account,
         ...(bgProfileArn ? { profileArn: bgProfileArn } : {}),

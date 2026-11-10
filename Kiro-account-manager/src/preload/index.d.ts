@@ -1,5 +1,6 @@
 import type { AccountModelInfo } from '../shared/modelCatalog'
 import type { ClientSwitchApi } from '../shared/clientSwitch'
+import type { ManagedCrewApi } from '../shared/managedCrew'
 import type { ModelPreferencesResult, ModelPreferencesWrite } from '../shared/modelPreferences'
 import type { LogPage } from '../shared/logHistory'
 import type { WindowVisibilityState } from '../shared/windowVisibility'
@@ -79,7 +80,7 @@ interface RefreshResult {
     syncedToIde?: boolean
     /** 未同步到 IDE 时的原因描述（用于 UI 提示） */
     syncSkipReason?: string
-    /** Enterprise 账号刷新时主进程自动获取的真实 profileArn */
+    /** 本次续期或已验证的资料查询返回的 profileArn */
     profileArn?: string
   }
   error?: { message: string; code?: string }
@@ -154,12 +155,14 @@ interface StatusResult {
       accessToken: string
       refreshToken?: string
       expiresAt?: number
+      profileArn?: string
     }
   }
   error?: { message: string; code?: string }
 }
 
 interface KiroApi {
+  managedCrew: ManagedCrewApi
   clientSwitch: ClientSwitchApi
   getWindowVisibility: () => Promise<WindowVisibilityState>
   onWindowVisibilityChanged: (callback: (state: WindowVisibilityState) => void) => () => void
@@ -294,6 +297,7 @@ interface KiroApi {
     accessToken?: string
     expiresIn?: number
     profileArn?: string
+    startUrl?: string
     refreshToken: string
     clientId: string
     clientSecret: string
@@ -370,9 +374,11 @@ interface KiroApi {
       clientId: string
       clientSecret: string
       clientSecretExpiresAt?: number
+      profileArn?: string
+      startUrl?: string
       region: string
       authMethod: string  // 'IdC' 或 'social'
-      provider: string    // 'BuilderId', 'Github', 'Google'
+      provider: string    // 'BuilderId', 'Enterprise', 'IAM_SSO', 'Github', 'Google'
     }
     error?: string
   }>
@@ -430,7 +436,7 @@ interface KiroApi {
 
   // Every login operation is bound to the caller's session, including cancellation during start.
   kiroInstances: KiroInstancesApi
-  onKiroInstanceAccountUpdate: (callback: (info: { id: string; credentials: Record<string, unknown> }) => void) => () => void
+  onKiroInstanceAccountUpdate: (callback: (info: { id: string; credentials: Record<string, unknown>; profileArn?: string }) => void) => () => void
   startPortalLogin: (sessionId: string, privateMode: boolean, expectedProvider?: 'Google' | 'Github' | 'BuilderId' | 'Enterprise') => Promise<LoginResult>
   pollPortalLogin: (sessionId: string) => Promise<LoginResult>
   cancelPortalLogin: (sessionId: string) => Promise<{ success: boolean }>

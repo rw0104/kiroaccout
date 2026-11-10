@@ -17,7 +17,7 @@ export interface AppUpdateState {
   installRequiresRestart?: boolean
 }
 export interface UpdateActionResult { success: boolean; state: AppUpdateState; error?: string }
-export type UpdatePreparationErrorCode = 'save-rejected' | 'save-timeout' | 'window-unavailable' | 'save-pending'
+export type UpdatePreparationErrorCode = 'save-rejected' | 'save-timeout' | 'window-unavailable' | 'save-pending' | 'workspace-stop-failed'
 export class UpdatePreparationError extends Error {
   readonly code: UpdatePreparationErrorCode
 
@@ -35,6 +35,7 @@ function preparationErrorMessage(error: unknown): string {
       case 'save-timeout': return '更新前未收到保存确认，请稍后重试；应用不会自动退出'
       case 'window-unavailable': return '更新前保存窗口不可用，请重新打开主窗口后重试；应用不会自动退出'
       case 'save-pending': return '更新前账户保存正在进行，请稍后重试；应用不会自动退出'
+      case 'workspace-stop-failed': return '更新前未能确认独立 Crew 工作区已停止，请先停止工作区后重试；应用不会自动退出'
     }
   }
   return '更新前账户保存失败，请重试；应用不会自动退出'

@@ -48,7 +48,7 @@ async function componentHarness(file, states) {
       if (name.endsWith('/updateClient')) return {}
       if (name.endsWith('.png')) return 'synthetic-logo.png'
       if (name.endsWith('/button')) return { Button: button }
-      if (name.endsWith('/progress')) return { Progress: () => null }
+      if (name.endsWith('/progress')) return { Progress: ({ indicatorClassName: _indicator, value: _value, ...props }) => jsx.jsx('div', props) }
       if (name.endsWith('/ui')) return new Proxy({}, { get: (_, key) => key === 'Button' ? button : props => jsx.jsx('div', props) })
       throw new Error(`Unexpected renderer dependency: ${name}`)
     }
@@ -99,6 +99,7 @@ test('installation failure offers manual downloads alongside controlled retry', 
     status: 'error', errorStage: 'install', currentVersion: '1.8.1', version: '1.8.2', error: '保存失败'
   }, null])
   const buttons = buttonsIn(update.tree)
+  assert.match(update.html, /安装未完成/)
   const manual = buttons.find(button => hasLabel(button, '手动下载安装包'))
   assert.ok(manual)
   assert.ok(buttons.find(button => hasLabel(button, '确认重启并安装')), 'The save/install retry remains available')
@@ -135,4 +136,60 @@ test('versioned release note arrays retain each version and independently format
     { note: '<p>更多 &lt;文本&gt;</p>' },
     { version: 'ignored', note: null }
   ]), '1.8.3\n更新\n\n修复保存\n\n1.8.2\n## 维护\n- 修复账户\n\n更多 <文本>')
+})
+
+test('update presentation separates current and target versions and keeps only the content region scrollable', async () => {
+  const update = await componentHarness('UpdateDialog.tsx', [true, {
+    status: 'available', currentVersion: '1.10.2', version: '1.10.3', releaseNotes: '## 修复\n\n- 连接保持稳定'
+  }, null])
+  assert.match(update.html, /当前版本/)
+  assert.match(update.html, /新版本/)
+  assert.match(update.html, /data-testid="app-update-header"/)
+  assert.match(update.html, /data-testid="app-update-body"[^>]*class="[^"]*overflow-y-auto/)
+  assert.match(update.html, /data-testid="app-update-footer"/)
+  assert.match(update.html, /bg-card/)
+  assert.match(update.html, /bg-black\/50/)
+  assert.doesNotMatch(update.html, /backdrop-filter|background-color:|opacity:/)
+})
+
+test('release notes render safe headings, paragraphs and lists without mounting remote HTML', async () => {
+  const update = await componentHarness('UpdateDialog.tsx', [true, {
+    status: 'available', currentVersion: '1.10.2', version: '1.10.3',
+    releaseNotes: '<h2>连接与账户</h2><p>保留已有登录。</p><ul><li>恢复模型目录</li><li>改进保存</li></ul><script>unsafe()</script><img src="https://example.invalid/private.png"/>'
+  }, null])
+  assert.match(update.html, /<h4[^>]*>连接与账户<\/h4>/)
+  assert.match(update.html, /<p[^>]*>保留已有登录。<\/p>/)
+  assert.match(update.html, /<ul[^>]*>/)
+  assert.match(update.html, /<li[^>]*>恢复模型目录<\/li>/)
+  assert.doesNotMatch(update.html, /unsafe\(\)|example\.invalid|<script|<img/)
+})
+
+test('Markdown notes receive readable structure while inline code and emphasis stay escaped React content', async () => {
+  const update = await componentHarness('UpdateDialog.tsx', [true, {
+    status: 'downloaded', currentVersion: '1.10.2', version: '1.10.3',
+    releaseNotes: '## 更新内容\n\n- **账户连接**更加稳定\n- 保留 `profile_arn`\n\n常规说明。'
+  }, null])
+  assert.match(update.html, /<h4[^>]*>更新内容<\/h4>/)
+  assert.match(update.html, /<strong[^>]*>账户连接<\/strong>/)
+  assert.match(update.html, /<code[^>]*>profile_arn<\/code>/)
+  assert.doesNotMatch(update.html, /## 更新内容|\*\*账户连接\*\*/)
+})
+
+test('download progress has accessible numeric state and completion does not replace the install confirmation', async () => {
+  const downloading = await componentHarness('UpdateDialog.tsx', [true, {
+    status: 'downloading', currentVersion: '1.10.2', version: '1.10.3',
+    progress: { percent: 96.5, transferred: 101187584, total: 104857600, bytesPerSecond: 2097152 }
+  }, null])
+  assert.match(downloading.html, /role="progressbar"/)
+  assert.match(downloading.html, /aria-valuenow="96.5"/)
+  assert.match(downloading.html, /96\.5%/)
+  assert.match(downloading.html, /下载会继续/)
+  const downloaded = await componentHarness('UpdateDialog.tsx', [true, {
+    status: 'downloaded', currentVersion: '1.10.2', version: '1.10.3'
+  }, null])
+  assert.ok(buttonsIn(downloaded.tree).find(button => hasLabel(button, '确认重启并安装')))
+  const installing = await componentHarness('UpdateDialog.tsx', [true, {
+    status: 'installing', currentVersion: '1.10.2', version: '1.10.3'
+  }, null])
+  assert.equal(buttonsIn(installing.tree).find(button => hasLabel(button, '稍后')).props.disabled, true)
 })

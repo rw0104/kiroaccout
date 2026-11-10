@@ -15,9 +15,22 @@ export interface AccessCredential {
 /** Stable upstream subject belongs to the manager boundary, never to client token payloads. */
 export interface ManagerAccessSnapshot extends AccessCredential {
   principalId: string
+  /** Local metadata diagnosis only; never included in a client credential payload. */
+  validationIssue?: ClientAccessValidationIssue
   /** A transient manager query/transport failure pauses projection without revoking it. */
   temporarilyUnavailable?: boolean
 }
+
+export type ClientAccessValidationIssue =
+  | 'provider-unsupported' | 'auth-method-mismatch' | 'metadata-conflict'
+  | 'profile-missing' | 'profile-invalid' | 'region-missing' | 'region-invalid'
+  | 'start-url-missing' | 'start-url-invalid'
+
+const validationIssues = new Set<ClientAccessValidationIssue>([
+  'provider-unsupported', 'auth-method-mismatch', 'metadata-conflict',
+  'profile-missing', 'profile-invalid', 'region-missing', 'region-invalid',
+  'start-url-missing', 'start-url-invalid'
+])
 
 export interface ClientAccessProjectionBinding {
   revision: string
@@ -50,6 +63,7 @@ export interface ClientAccessProjectionResult {
   /** A failed metadata save must not conceal that the target already changed. */
   targetCommitted: boolean
   reason?: ClientAccessProjectionReason
+  validationIssue?: ClientAccessValidationIssue
   targetWriteUncertain?: boolean
   targetConfigurationChanged?: boolean
 }
@@ -88,10 +102,12 @@ export interface ClientAccessProjectionDependencies {
 /** Adapters may use this class to report their own failed target CAS. */
 export class ClientAccessProjectionError extends Error {
   readonly code: ClientAccessProjectionReason
-  constructor(code: ClientAccessProjectionReason) {
+  readonly validationIssue?: ClientAccessValidationIssue
+  constructor(code: ClientAccessProjectionReason, validationIssue?: ClientAccessValidationIssue) {
     super(code)
     this.name = 'ClientAccessProjectionError'
     this.code = code
+    if (code === 'credential-unusable' && validationIssue && validationIssues.has(validationIssue)) this.validationIssue = validationIssue
   }
 }
 
@@ -106,15 +122,19 @@ const bindingValid = (value: ClientAccessProjectionBinding): boolean => requestV
   (value.status === 'active' || value.status === 'needs-attention') && Number.isFinite(value.updatedAt)
 
 /** Whitelist fields: even an accidental richer account object cannot leak refresh secrets. */
-function copyAccess(value: AccessCredential | undefined): AccessCredential | undefined {
+function copyAccess(value: (AccessCredential & { validationIssue?: ClientAccessValidationIssue }) | undefined): AccessCredential | undefined {
   if (!value) return undefined
-  if (!nonempty(value.accessToken, 512 * 1024) || !Number.isFinite(value.expiresAt) ||
-      !nonempty(value.provider, 128) || value.authMethod !== undefined && !nonempty(value.authMethod, 128) ||
-      value.profileArn !== undefined && !nonempty(value.profileArn, 4096) ||
-      value.region !== undefined && !/^[a-z]{2}(?:-[a-z]+){1,3}-\d+$/.test(value.region) ||
-      value.startUrl !== undefined && !nonempty(value.startUrl, 2048)) {
+  if (value.validationIssue !== undefined) throw new ClientAccessProjectionError('credential-unusable', value.validationIssue)
+  if (!nonempty(value.accessToken, 512 * 1024) || !Number.isFinite(value.expiresAt)) {
     throw new ClientAccessProjectionError('credential-unusable')
   }
+  if (!nonempty(value.provider, 128)) throw new ClientAccessProjectionError('credential-unusable', 'provider-unsupported')
+  if (value.authMethod !== undefined && !nonempty(value.authMethod, 128)) throw new ClientAccessProjectionError('credential-unusable', 'auth-method-mismatch')
+  if (value.profileArn !== undefined && !nonempty(value.profileArn, 4096)) throw new ClientAccessProjectionError('credential-unusable', 'profile-invalid')
+  if (value.region !== undefined && (typeof value.region !== 'string' || !/^[a-z]{2}(?:-[a-z]+){1,3}-\d+$/.test(value.region))) {
+    throw new ClientAccessProjectionError('credential-unusable', 'region-invalid')
+  }
+  if (value.startUrl !== undefined && !nonempty(value.startUrl, 2048)) throw new ClientAccessProjectionError('credential-unusable', 'start-url-invalid')
   return {
     accessToken: value.accessToken, expiresAt: value.expiresAt, provider: value.provider,
     ...(value.authMethod === undefined ? {} : { authMethod: value.authMethod }),
@@ -127,9 +147,23 @@ function copyAccess(value: AccessCredential | undefined): AccessCredential | und
 /** Shared whitelist for read-only capability validation and actual projection. */
 export const projectableClientAccess = copyAccess
 
+/** Common provider requirements; target-specific storage requirements stay in each adapter. */
+export function validateClientAccessIdentity(access: Readonly<AccessCredential>): void {
+  if (!['Google', 'Github', 'BuilderId', 'Enterprise'].includes(access.provider)) {
+    throw new ClientAccessProjectionError('credential-unusable', 'provider-unsupported')
+  }
+  const social = access.provider === 'Google' || access.provider === 'Github'
+  if (access.authMethod !== undefined && access.authMethod !== (social ? 'social' : 'IdC')) {
+    throw new ClientAccessProjectionError('credential-unusable', 'auth-method-mismatch')
+  }
+  if (access.provider !== 'BuilderId' && (access.profileArn === undefined || typeof access.profileArn === 'string' && !access.profileArn.trim())) {
+    throw new ClientAccessProjectionError('credential-unusable', 'profile-missing')
+  }
+}
+
 /** Deliberately independent of mutable manager record IDs and rotating refresh/access tokens. */
-export function accessPrincipalFingerprint(value: Pick<ManagerAccessSnapshot, 'principalId' | 'provider' | 'profileArn'> | undefined): string | undefined {
-  if (!value || !nonempty(value.principalId, 4096) || !nonempty(value.provider, 128) || /[\r\n]/.test(value.principalId)) return undefined
+export function accessPrincipalFingerprint(value: Pick<ManagerAccessSnapshot, 'principalId' | 'provider' | 'profileArn' | 'validationIssue'> | undefined): string | undefined {
+  if (!value || value.validationIssue !== undefined || !nonempty(value.principalId, 4096) || !nonempty(value.provider, 128) || /[\r\n]/.test(value.principalId)) return undefined
   return createHash('sha256').update(JSON.stringify(['kiro-principal-v1', value.provider, value.principalId,
     ...(value.provider === 'Enterprise' ? [value.profileArn ?? null] : [])])).digest('hex')
 }
@@ -171,6 +205,7 @@ export class ClientAccessProjectionService {
   private currentSnapshot(accountId: string, expectedPrincipal?: string): { access: AccessCredential; principalFingerprint: string } {
     const snapshot = this.deps.account(accountId)
     if (!snapshot) throw new ClientAccessProjectionError('account-unavailable')
+    if (snapshot.validationIssue !== undefined) throw new ClientAccessProjectionError('credential-unusable', snapshot.validationIssue)
     const principal = accessPrincipalFingerprint(snapshot)
     if (!principal) throw new ClientAccessProjectionError('principal-unavailable')
     // A subject change always revokes the old binding, even while the new record
@@ -245,6 +280,7 @@ export class ClientAccessProjectionService {
         throw new ClientAccessProjectionError('principal-changed')
       }
       const access = Object.freeze(current.access)
+      adapter.validate?.(access)
       const signature = fingerprint(access, principal)
       const targetRevision = await adapter.readRevision()
       if (!nonempty(targetRevision, 8192)) throw new ClientAccessProjectionError('target-read-failed')
@@ -288,6 +324,7 @@ export class ClientAccessProjectionService {
         ['target-changed', 'binding-changed', 'account-unavailable', 'principal-unavailable', 'principal-changed', 'credential-unusable', 'credential-changed', 'runtime-unavailable', 'domain-mismatch'].includes(reason)
           ? 'needs-attention' : 'failed'
       return { ...this.result(request, status, reason, targetCommitted),
+        ...(error instanceof ClientAccessProjectionError && error.validationIssue ? { validationIssue: error.validationIssue } : {}),
         ...(uncertain ? { targetWriteUncertain: true } : {}), ...(configured ? { targetConfigurationChanged: true } : {}) }
     }
   }

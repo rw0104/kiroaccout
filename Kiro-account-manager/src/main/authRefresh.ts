@@ -6,6 +6,8 @@ export interface AuthRefreshResult {
   accessToken?: string
   refreshToken?: string
   expiresIn?: number
+  /** Authenticated Social response metadata; absent means keep the stored profile. */
+  profileArn?: string
   error?: string
   errorCode?: 'invalid-input' | 'invalid-response' | 'http' | 'timeout' | 'network' | 'busy'
   failureKind?: 'temporary' | 'reauth-required' | 'uncertain'
@@ -43,6 +45,14 @@ interface RefreshEntry {
 const nonempty = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 const failure = (errorCode: AuthRefreshResult['errorCode'], error: string, failureKind: AuthRefreshResult['failureKind'] = 'reauth-required'): AuthRefreshResult => ({ success: false, errorCode, error, failureKind })
+
+/** An invalid optional profile must not discard an already completed token rotation. */
+export function normalizeRefreshProfileArn(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length > 4096) return undefined
+  const profile = value.trim()
+  return /^arn:(?:aws|aws-us-gov|aws-cn):(?:kiro|codewhisperer|q):[a-z]{2}(?:-[a-z]+){1,3}-\d+:\d{12}:profile\/[A-Za-z0-9_-]+$/.test(profile)
+    ? profile : undefined
+}
 
 // These codes establish that no connection was made, so no refresh POST was sent.
 // Socket resets, generic timeouts and unknown errors may hide a completed rotation.
@@ -223,7 +233,11 @@ export class TokenRefreshService {
             data.refreshToken !== undefined && !nonempty(data.refreshToken)) {
           return failure('invalid-response', '刷新响应缺少有效凭证或有效期，请重新授权或同步最新凭证', 'uncertain')
         }
-        return { success: true, accessToken: data.accessToken, refreshToken: data.refreshToken as string | undefined || input.refreshToken, expiresIn: data.expiresIn }
+        // Crew's Social refresh preserves the authenticated response profile, or
+        // the stored profile when omitted. OIDC responses cannot supply this field.
+        const profileArn = social ? normalizeRefreshProfileArn(data.profileArn) : undefined
+        return { success: true, accessToken: data.accessToken, refreshToken: data.refreshToken as string | undefined || input.refreshToken,
+          expiresIn: data.expiresIn, ...(profileArn ? { profileArn } : {}) }
       } catch (error) {
         if (!timedOut && !responseReceived && failedBeforeConnection(error)) {
           return failure('network', '无法建立刷新连接，请检查网络或代理后重试', 'temporary')

@@ -232,8 +232,14 @@ test('near-expiry source access blocks without starting a second manager refresh
 })
 
 test('real CLI schema validation blocks incomplete Enterprise details before any target read or write', async () => {
-  for (const patch of [{ startUrl: undefined }, { startUrl: '' }, { startUrl: 'https://view.awsapps.com/start' },
-    { startUrl: 'https://awsapps.com.attacker.invalid/start' }, { profileArn: '' }, { profileArn: undefined }]) {
+  for (const { patch, issue } of [
+    { patch: { startUrl: undefined }, issue: 'start-url-missing' },
+    { patch: { startUrl: '' }, issue: 'start-url-invalid' },
+    { patch: { startUrl: 'https://view.awsapps.com/start' }, issue: 'start-url-invalid' },
+    { patch: { startUrl: 'https://awsapps.com.attacker.invalid/start' }, issue: 'start-url-invalid' },
+    { patch: { profileArn: '' }, issue: 'profile-invalid' },
+    { patch: { profileArn: undefined }, issue: 'profile-missing' }
+  ]) {
     const f = fixture()
     Object.assign(f.managerAccount, { provider: 'Enterprise', authMethod: 'IdC', region: 'us-east-1',
       startUrl: 'https://synthetic-team.awsapps.com/start', profileArn: 'SYNTHETIC_ENTERPRISE_PROFILE' }, patch)
@@ -249,7 +255,7 @@ test('real CLI schema validation blocks incomplete Enterprise details before any
     assert.ok(snapshot.targets.every(item => item.status === 'blocked'))
     const result = await f.service.execute(request)
     assert.equal(result.status, 'blocked')
-    assert.equal(result.errorCode, 'CLIENT_NOT_READY')
+    assert.equal(result.errorCode, issue)
     assert.equal(result.credentialWrite, 'not-started')
     assert.equal(f.counters.targetReads, 0)
     assert.equal(f.counters.writes, 0)

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test, { type TestContext } from 'node:test'
+import { createHash } from 'node:crypto'
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -12,6 +13,7 @@ const idcKey = 'kirocli:odic:token'
 const legacyKey = 'codewhisperer:odic:token'
 const registrationKey = 'kirocli:odic:device-registration'
 const runtimeMarkerKey = 'kirocli:auth:last-forced-refresh-at'
+const profileStateKey = 'api.codewhisperer.profile'
 const supportedKeys = [socialKey, idcKey, legacyKey, registrationKey]
 const nativeRegistration = JSON.stringify({ client_id: 'SYNTHETIC_NATIVE_ID', client_secret: 'SYNTHETIC_NATIVE_SECRET', oauth_flow: 'Pkce', region: 'us-east-1' })
 const principalA = 'synthetic-stable-user-a'
@@ -62,6 +64,22 @@ function mutate(path: string, action: (db: DatabaseSync) => void): void {
   try { action(db) } finally { db.close() }
 }
 
+function seedState(path: string, profile?: string | Uint8Array): void {
+  mutate(path, db => {
+    db.exec('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value BLOB)')
+    db.prepare('INSERT OR REPLACE INTO state VALUES (?, ?)').run('synthetic.unrelated', 'SYNTHETIC_KEEP_STATE')
+    if (profile !== undefined) db.prepare('INSERT OR REPLACE INTO state VALUES (?, ?)').run(profileStateKey, profile)
+  })
+}
+
+function stateProfile(path: string): unknown {
+  const db = new DatabaseSync(path, { readOnly: true })
+  try {
+    const row = db.prepare('SELECT value FROM state WHERE key = ?').get(profileStateKey)
+    return row ? JSON.parse(typeof row.value === 'string' ? row.value : Buffer.from(row.value as Uint8Array).toString('utf8')) : undefined
+  } finally { db.close() }
+}
+
 function projectionFixture(t: TestContext, credential: AccessCredential = access()): {
   dir: string
   path: string
@@ -101,22 +119,139 @@ function nativeSerialization(path: string, key: string, generation: string): Rec
   return native
 }
 
-test('social payload includes its required provider and only the verified access schema', () => {
+test('social payload uses the native CLI v3 lowercase provider while preserving its snake_case profile field', () => {
   for (const provider of ['Github', 'Google']) {
     const credential = access({ provider })
     const payload = cliAccessPayload(Object.freeze(credential))
     assert.equal(payload.key, socialKey)
     assert.deepEqual(JSON.parse(payload.value), {
       access_token: credential.accessToken, expires_at: new Date(credential.expiresAt).toISOString(),
-      provider, profile_arn: credential.profileArn
+      provider: provider.toLowerCase(), profile_arn: credential.profileArn
     })
     assert.equal(payload.value.includes('refresh'), false)
     assert.equal(payload.value.includes('client_secret'), false)
     assert.equal(payload.value.includes('oauth_flow'), false)
+    assert.equal(Object.hasOwn(JSON.parse(payload.value), 'profileArn'), false)
   }
   for (const provider of ['', 'github', 'Unknown']) assert.throws(() => cliAccessPayload(access({ provider })), isError('credential-unusable'))
   assert.throws(() => cliAccessPayload(access({ profileArn: undefined })), isError('credential-unusable'))
   assert.throws(() => cliAccessPayload(access({ authMethod: 'IdC' })), isError('credential-unusable'))
+})
+
+test('an old uppercase Social binding pauses without writes and explicit reselection repairs the native v3 schema', async t => {
+  for (const pauseFirst of [false, true]) {
+    // Use a nonzero millisecond value so this old-format fixture does not need the
+    // separate UTC-fraction normalization already covered below.
+    const credential = access({ expiresAt: Math.ceil(Date.now() / 1000) * 1000 + 3_600_123 })
+    const f = projectionFixture(t, credential)
+    seed(f.path)
+    seedState(f.path, JSON.stringify({ arn: 'SYNTHETIC_ORPHANED_PROFILE', profile_name: 'SYNTHETIC_OLD_NAME' }))
+    const legacyRevision = (): string => {
+      const legacyRows = rows(f.path).map(([key, raw]) => {
+        const value = JSON.parse(raw)
+        return [key, Object.keys(value).sort().map(name => [name, value[name]])]
+      })
+      return createHash('sha256').update('cli-access-v1\0').update(JSON.stringify({ table: true, rows: legacyRows })).digest('hex')
+    }
+    const oldAdapter = {
+      authDomainId: f.adapter.authDomainId,
+      validate: f.adapter.validate,
+      readRevision: async () => legacyRevision(),
+      write: async (value: Readonly<AccessCredential>, expected: string, assertCurrent: () => void) => {
+        assert.equal(legacyRevision(), expected)
+        assertCurrent()
+        const legacyPayload = JSON.parse(cliAccessPayload(value).value)
+        legacyPayload.provider = value.provider
+        mutate(f.path, db => db.prepare('INSERT OR REPLACE INTO auth_kv VALUES (?, ?)').run(socialKey, JSON.stringify(legacyPayload)))
+        return legacyRevision()
+      }
+    }
+    const oldService = new ClientAccessProjectionService({ account: id => f.accounts.get(id), adapter: () => oldAdapter,
+      readBindings: () => [...f.bindings.values()], writeBinding: (binding, expected) => {
+        if (f.bindings.get(binding.authDomainId)?.revision !== expected) return false
+        f.bindings.set(binding.authDomainId, binding); return true
+      } })
+    assert.equal((await oldService.execute(f.request)).status, 'projected')
+    oldService.close()
+    const original = rows(f.path)
+    assert.equal(JSON.parse(original[0][1]).provider, 'Github')
+    const sourceBefore = JSON.stringify(f.accounts.get('account-a'))
+    if (pauseFirst) {
+      const [paused] = await f.service.tick()
+      assert.equal(paused.status, 'needs-attention')
+      assert.equal(paused.reason, 'target-changed')
+      assert.deepEqual(rows(f.path), original, 'background sync must not migrate or take over a legacy target')
+    }
+    const reselected = await f.service.execute(f.request)
+    assert.equal(reselected.status, 'projected')
+    const repaired = JSON.parse(rows(f.path)[0][1])
+    assert.equal(repaired.provider, 'github')
+    assert.equal(repaired.profile_arn, credential.profileArn)
+    assert.equal((stateProfile(f.path) as { arn: string }).arn, credential.profileArn)
+    assert.equal(repaired.refresh_token, undefined)
+    assert.equal(repaired.client_secret, undefined)
+    assert.equal(f.bindings.get(f.adapter.authDomainId)?.status, 'active')
+    assert.equal(JSON.stringify(f.accounts.get('account-a')), sourceBefore)
+    assert.equal((await f.service.tick())[0].status, 'unchanged')
+  }
+})
+
+test('native CLI profile metadata is committed with tokens, preserves unrelated state, and clears on Builder ID without a profile', async t => {
+  const f = fixture(t)
+  const adapter = createCliAccessAdapter({ databasePath: f.path, authDomainId: 'synthetic-auth' })
+  await adapter.write(access(), await adapter.readRevision(), guard, context)
+  assert.deepEqual(stateProfile(f.path), { arn: 'SYNTHETIC_PROFILE', profile_name: 'Social_Default_Profile' })
+  seedState(f.path, Buffer.from(JSON.stringify({ arn: 'SYNTHETIC_OTHER_PROFILE', profile_name: 'SYNTHETIC_OTHER_NAME' })))
+  const selected = access({ provider: 'Google', profileArn: 'SYNTHETIC_SELECTED_PROFILE' })
+  const selectedRevision = await adapter.readRevision()
+  mutate(f.path, db => db.prepare('UPDATE state SET value = ? WHERE key = ?').run('SYNTHETIC_EXTERNAL_SETTING', 'synthetic.unrelated'))
+  await adapter.write(selected, selectedRevision, guard, contextFor(selected))
+  assert.deepEqual(stateProfile(f.path), { arn: selected.profileArn, profile_name: 'Social_Default_Profile' })
+  const builder = access({ provider: 'BuilderId', authMethod: 'IdC', region: 'us-east-1', profileArn: undefined })
+  await adapter.write(builder, await adapter.readRevision(), guard, contextFor(builder))
+  assert.equal(stateProfile(f.path), undefined)
+  const db = new DatabaseSync(f.path, { readOnly: true })
+  try {
+    assert.equal(db.prepare('SELECT value FROM state WHERE key = ?').get('synthetic.unrelated')!.value, 'SYNTHETIC_EXTERNAL_SETTING')
+    assert.match(db.prepare("SELECT sql FROM sqlite_master WHERE name='state'").get()!.sql as string, /value BLOB/)
+  } finally { db.close() }
+  assert.equal(rows(f.path)[0][0], idcKey)
+})
+
+test('profile-only external edits, insertions and deletion participate in the same target CAS', async t => {
+  for (const change of ['edit', 'insert', 'delete'] as const) {
+    const f = fixture(t)
+    seed(f.path, [[socialKey, JSON.stringify({ access_token: 'SYNTHETIC_OLD_ACCESS' })]])
+    seedState(f.path, change === 'insert' ? undefined : JSON.stringify({ arn: 'SYNTHETIC_OLD_PROFILE', profile_name: '' }))
+    const adapter = createCliAccessAdapter({ databasePath: f.path, authDomainId: 'synthetic-auth' })
+    const revision = await adapter.readRevision()
+    mutate(f.path, db => change === 'delete'
+      ? db.prepare('DELETE FROM state WHERE key = ?').run(profileStateKey)
+      : db.prepare('INSERT OR REPLACE INTO state VALUES (?, ?)').run(profileStateKey, JSON.stringify({ arn: 'SYNTHETIC_EXTERNAL_PROFILE', profile_name: '' })))
+    const currentRows = rows(f.path), currentProfile = stateProfile(f.path)
+    await assert.rejects(adapter.write(access(), revision, guard, context), isError('target-changed'))
+    assert.deepEqual(rows(f.path), currentRows)
+    assert.deepEqual(stateProfile(f.path), currentProfile)
+  }
+})
+
+test('an orphan profile is covered even when auth_kv does not exist, and a profile write failure rolls back tokens', async t => {
+  const f = fixture(t)
+  mkdirSync(dirname(f.path), { recursive: true })
+  mutate(f.path, db => db.exec('CREATE TABLE state (key TEXT PRIMARY KEY, value BLOB)'))
+  seedState(f.path, JSON.stringify({ arn: 'SYNTHETIC_ORPHAN', profile_name: '' }))
+  const adapter = createCliAccessAdapter({ databasePath: f.path, authDomainId: 'synthetic-auth' })
+  const orphanRevision = await adapter.readRevision()
+  seedState(f.path, JSON.stringify({ arn: 'SYNTHETIC_EXTERNAL_ORPHAN', profile_name: '' }))
+  await assert.rejects(adapter.write(access(), orphanRevision, guard, context), isError('target-changed'))
+  await adapter.write(access(), await adapter.readRevision(), guard, context)
+  const originalRows = rows(f.path), originalProfile = stateProfile(f.path)
+  mutate(f.path, db => db.exec(`CREATE TRIGGER fail_profile BEFORE INSERT ON state
+    WHEN NEW.key = 'api.codewhisperer.profile' BEGIN SELECT RAISE(ABORT, 'SYNTHETIC_STORAGE_FAILURE'); END`))
+  const next = access({ accessToken: 'SYNTHETIC_NEXT_ACCESS', profileArn: 'SYNTHETIC_NEXT_PROFILE' })
+  await assert.rejects(adapter.write(next, await adapter.readRevision(), guard, contextFor(next)), isError('target-write-failed'))
+  assert.deepEqual(rows(f.path), originalRows)
+  assert.deepEqual(stateProfile(f.path), originalProfile)
 })
 
 test('IdC payload requires region and serializes a local oauth_flow tag without refresh or client registration', () => {

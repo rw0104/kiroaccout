@@ -2,11 +2,12 @@ import { createHash } from 'node:crypto'
 import { closeSync, lstatSync, mkdirSync, openSync } from 'node:fs'
 import { dirname, isAbsolute } from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
-import { ClientAccessProjectionError, type AccessCredential, type ClientAccessProjectionAdapter } from './clientAccessProjection'
+import { ClientAccessProjectionError, projectableClientAccess, validateClientAccessIdentity, type AccessCredential, type ClientAccessProjectionAdapter } from './clientAccessProjection'
 
 const tokenKeys = ['kirocli:social:token', 'kirocli:odic:token', 'codewhisperer:odic:token'] as const
 const registrationKey = 'kirocli:odic:device-registration'
 const runtimeMarkerKey = 'kirocli:auth:last-forced-refresh-at'
+const profileStateKey = 'api.codewhisperer.profile'
 const supportedKeys = new Set<string>([...tokenKeys, registrationKey, runtimeMarkerKey])
 
 function normalizeUtcExpiry(value: unknown): unknown {
@@ -45,9 +46,26 @@ function existsFile(filename: string): boolean {
   } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error }
 }
 
+function profileStateSnapshot(db: DatabaseSync): { table: boolean; profile: unknown } {
+  const table = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='state'").get()
+  if (!table) return { table: false, profile: null }
+  const row = db.prepare('SELECT value FROM state WHERE key = ?').get(profileStateKey)
+  if (!row) return { table: true, profile: null }
+  const value = row.value
+  if (typeof value === 'string' && value.length <= 1024 * 1024) return { table: true, profile: ['text', value] }
+  if (value instanceof Uint8Array && value.byteLength <= 1024 * 1024) {
+    return { table: true, profile: ['blob', Buffer.from(value).toString('base64')] }
+  }
+  if (value === null) return { table: true, profile: ['null'] }
+  throw new Error('unsupported-profile-state')
+}
+
 function snapshot(db: DatabaseSync): string {
+  // Native list-models/usage resolve AuthProfile from state independently of
+  // the v3 bridge's token.profile_arn. It is part of the same account CAS.
+  const profileState = profileStateSnapshot(db)
   const table = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='auth_kv'").get()
-  if (!table) return JSON.stringify({ table: false, rows: [] })
+  if (!table) return JSON.stringify({ table: false, rows: [], profileState })
   const rows = db.prepare('SELECT key, value FROM auth_kv ORDER BY key').all()
   if (rows.length > 256 || rows.some(row => typeof row.key !== 'string' || typeof row.value !== 'string' || row.value.length > 1024 * 1024)) {
     throw new Error('unsupported-auth-store')
@@ -55,36 +73,44 @@ function snapshot(db: DatabaseSync): string {
   // A newer, higher-priority auth scheme must never silently win over this projection.
   if (rows.some(row => !supportedKeys.has(row.key as string))) throw new Error('unsupported-auth-entry')
   // The CLI updates this timestamp itself; it is not a login/credential change.
-  return JSON.stringify({ table: true, rows: rows.filter(row => row.key !== runtimeMarkerKey).map(row => [row.key, authenticationValue(row.key as string, row.value as string)]) })
+  return JSON.stringify({ table: true, rows: rows.filter(row => row.key !== runtimeMarkerKey).map(row => [row.key, authenticationValue(row.key as string, row.value as string)]), profileState })
 }
 
-const absent = (): string => createHash('sha256').update('cli-access-v1\0absent').digest('hex')
-const digest = (value: string): string => createHash('sha256').update('cli-access-v1\0').update(value).digest('hex')
+// v1 could bind a Social record whose title-case provider the native v3 bridge
+// cannot deserialize. Keep old bindings from returning "unchanged": background
+// sync pauses at the revision boundary; explicit reselection writes the new schema.
+const absent = (): string => createHash('sha256').update('cli-access-v2\0absent').digest('hex')
+const digest = (value: string): string => createHash('sha256').update('cli-access-v2\0').update(value).digest('hex')
 
 /** Native CLI 3.1 access-only schema, verified without refresh tokens or registrations. */
 export function cliAccessPayload(access: Readonly<AccessCredential>): { key: string; value: string } {
-  if (Object.keys(access).some(key => !['accessToken', 'expiresAt', 'provider', 'authMethod', 'profileArn', 'region', 'startUrl'].includes(key)) ||
-      typeof access.accessToken !== 'string' || !access.accessToken || !Number.isFinite(access.expiresAt) ||
-      !['Github', 'Google', 'BuilderId', 'Enterprise'].includes(access.provider)) throw new ClientAccessProjectionError('credential-unusable')
-  const social = access.provider === 'Google' || access.provider === 'Github'
-  if (access.authMethod !== undefined && access.authMethod !== (social ? 'social' : 'IdC') ||
-      access.provider !== 'BuilderId' && !access.profileArn ||
-      !social && (!access.region || !/^[a-z]{2}(?:-[a-z]+){1,3}-\d+$/.test(access.region))) {
+  if (Object.keys(access).some(key => !['accessToken', 'expiresAt', 'provider', 'authMethod', 'profileArn', 'region', 'startUrl'].includes(key))) {
     throw new ClientAccessProjectionError('credential-unusable')
   }
+  validateClientAccessIdentity(access)
+  const social = access.provider === 'Google' || access.provider === 'Github'
+  if (!social && (access.region === undefined || typeof access.region === 'string' && !access.region.trim())) {
+    throw new ClientAccessProjectionError('credential-unusable', 'region-missing')
+  }
   if (access.provider === 'Enterprise') {
+    if (access.startUrl === undefined || typeof access.startUrl === 'string' && !access.startUrl.trim()) {
+      throw new ClientAccessProjectionError('credential-unusable', 'start-url-missing')
+    }
     try {
-      if (!access.startUrl || access.startUrl.length > 2048) throw new Error()
+      if (typeof access.startUrl !== 'string' || access.startUrl.length > 2048) throw new Error()
       const issuer = new URL(access.startUrl)
       if (issuer.protocol !== 'https:' || issuer.username || issuer.password || issuer.port || issuer.search || issuer.hash ||
           !/(^|\.)awsapps\.com$/.test(issuer.hostname) || !/^\/(?:start\/?|directory\/[a-zA-Z0-9-]+\/?)$/.test(issuer.pathname) ||
           issuer.href.replace(/\/$/, '') === 'https://view.awsapps.com/start') throw new Error()
-    } catch { throw new ClientAccessProjectionError('credential-unusable') }
+    } catch { throw new ClientAccessProjectionError('credential-unusable', 'start-url-invalid') }
   }
+  projectableClientAccess({ ...access, startUrl: access.provider === 'Enterprise' ? access.startUrl : undefined })
   const value = {
     access_token: access.accessToken,
     expires_at: new Date(access.expiresAt).toISOString(),
-    ...(social ? { provider: access.provider } : {
+    // CLI's Social token enum is lowercase. Manager/Crew identity labels remain
+    // canonical title case; translating here must not change the source identity.
+    ...(social ? { provider: access.provider.toLowerCase() } : {
       region: access.region,
       // Required local CLI serde discriminator, not a claim about the manager's grant.
       // No refresh token, client credentials or registration are supplied by this adapter.
@@ -141,12 +167,13 @@ export function createCliAccessAdapter(options: { databasePath: string; authDoma
         db = new DatabaseSync(filename, { timeout: 1000 })
         db.exec('BEGIN IMMEDIATE')
         const observed = snapshot(db)
-        if (present && digest(observed) !== expectedRevision || !present && observed !== JSON.stringify({ table: false, rows: [] })) {
+        if (present && digest(observed) !== expectedRevision || !present && observed !== JSON.stringify({ table: false, rows: [], profileState: { table: false, profile: null } })) {
           throw new ClientAccessProjectionError('target-changed')
         }
         assertCurrent()
         if (access.expiresAt <= Date.now() + 180_000) throw new ClientAccessProjectionError('credential-unusable')
         db.exec('CREATE TABLE IF NOT EXISTS auth_kv (key TEXT PRIMARY KEY, value TEXT)')
+        db.exec('CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value BLOB)')
         let value = payload.value
         if (context?.sameAccount) {
           const previous = db.prepare('SELECT value FROM auth_kv WHERE key = ?').get(payload.key)
@@ -160,6 +187,17 @@ export function createCliAccessAdapter(options: { databasePath: string; authDoma
         const remove = db.prepare('DELETE FROM auth_kv WHERE key = ?')
         for (const key of tokenKeys) remove.run(key)
         db.prepare('INSERT OR REPLACE INTO auth_kv (key, value) VALUES (?, ?)').run(payload.key, value)
+        if (access.profileArn) {
+          // Current CLI accepts this AuthProfile shape; the personal label is
+          // its own login label. No upstream organization name is invented.
+          const profile = { arn: access.profileArn,
+            profile_name: access.provider === 'Google' || access.provider === 'Github' ? 'Social_Default_Profile' : '' }
+          db.prepare('INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)').run(profileStateKey, JSON.stringify(profile))
+        } else {
+          // Switching to an identity without an explicit profile must not leave
+          // the previous account's profile available to the native API client.
+          db.prepare('DELETE FROM state WHERE key = ?').run(profileStateKey)
+        }
         const revision = digest(snapshot(db))
         db.exec('COMMIT'); committed = true
         return revision

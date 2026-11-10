@@ -1,5 +1,5 @@
 import type { ClientSwitchCapability, ClientSwitchRequest, ClientSwitchResult, ClientSwitchSnapshot, ExternalClientTarget } from '../shared/clientSwitch'
-import { ClientAccessProjectionService, accessPrincipalFingerprint, projectableClientAccess, type ManagerAccessSnapshot, type ClientAccessProjectionBinding, type ClientAccessProjectionAdapter } from './clientAccessProjection'
+import { ClientAccessProjectionService, ClientAccessProjectionError, accessPrincipalFingerprint, projectableClientAccess, type ClientAccessValidationIssue, type ManagerAccessSnapshot, type ClientAccessProjectionBinding, type ClientAccessProjectionAdapter } from './clientAccessProjection'
 
 export interface ClientSwitchRuntime {
   id: string
@@ -27,6 +27,41 @@ const validId = (value: unknown): value is string => typeof value === 'string' &
 const validRequest = (value: ClientSwitchRequest): boolean => !!value && validId(value.operationId) && validId(value.accountId) &&
   targets.includes(value.target) && (value.runtimeId === undefined || validId(value.runtimeId)) &&
   (value.expectedRuntimeRevision === undefined || validId(value.expectedRuntimeRevision))
+
+const accessIssueMessages: Record<ClientAccessValidationIssue, { message: string; messageEn: string }> = {
+  'provider-unsupported': { message: '账号登录提供商无法识别或不受此客户端支持，请核对导入资料或重新授权。',
+    messageEn: 'The account provider is unrecognized or unsupported by this client. Check the imported details or authorize again.' },
+  'auth-method-mismatch': { message: '账号认证方式与登录提供商不一致，请核对导入资料或重新授权。',
+    messageEn: 'The authentication method does not match the account provider. Check the imported details or authorize again.' },
+  'metadata-conflict': { message: '账号身份资料存在冲突，无法安全选择 profile 或登录身份。请重新导入一致的资料或重新授权。',
+    messageEn: 'The account identity metadata conflicts. Import consistent details or authorize again before selecting a profile or identity.' },
+  'profile-missing': { message: '账号缺少登录返回的 profile 信息，请重新导入完整资料或重新授权后重试。',
+    messageEn: 'The account is missing the profile returned by sign-in. Import complete details or authorize again.' },
+  'profile-invalid': { message: '账号 profile 信息格式无效，请重新导入完整资料或重新授权后重试。',
+    messageEn: 'The account profile metadata is invalid. Import complete details or authorize again.' },
+  'region-missing': { message: '账号缺少此客户端所需的区域信息，请核对原登录资料后重试。',
+    messageEn: 'The account is missing the region required by this client. Check the original sign-in details.' },
+  'region-invalid': { message: '账号区域格式无效，请核对原登录资料中的区域后重试。',
+    messageEn: 'The account region has an invalid format. Check the region in the original sign-in details.' },
+  'start-url-missing': { message: '企业账号缺少组织登录地址，请重新导入完整的企业登录资料。',
+    messageEn: 'The enterprise account is missing its organization sign-in URL. Import complete enterprise sign-in details.' },
+  'start-url-invalid': { message: '企业账号的组织登录地址无效，请核对原企业登录地址后重试。',
+    messageEn: 'The enterprise organization sign-in URL is invalid. Check the original enterprise sign-in URL.' }
+}
+
+/** Only known local categories cross IPC; arbitrary adapter messages never do. */
+function accessDiagnostic(error: unknown, provider?: string): { errorCode: string; message: string; messageEn: string } {
+  const issue = error instanceof ClientAccessProjectionError && error.code === 'credential-unusable' ? error.validationIssue : undefined
+  if (issue && Object.hasOwn(accessIssueMessages, issue)) {
+    if ((issue === 'start-url-missing' || issue === 'start-url-invalid') && provider !== 'Enterprise') {
+      return { errorCode: issue, message: '账号包含无效的登录地址资料，请重新导入与此登录方式一致的资料。',
+        messageEn: 'The account contains invalid sign-in URL metadata. Import details consistent with this sign-in method.' }
+    }
+    return { errorCode: issue, ...accessIssueMessages[issue] }
+  }
+  return { errorCode: 'credential-unusable', message: '账号访问资料未通过客户端校验，请重新导入完整资料或重新授权后重试。',
+    messageEn: 'The account access details failed client validation. Import complete details or authorize again.' }
+}
 
 /** Public IPC results contain state only, never authentication payloads. */
 export class ClientSwitchService {
@@ -69,6 +104,8 @@ export class ClientSwitchService {
       const base = { target, runtimeId: runtime.id, revision: runtime.revision, version: runtime.version,
         connected: !!principal && binding?.status === 'active' && binding.accountId === accountId &&
           binding.runtimeId === runtime.id && binding.principalFingerprint === principal }
+      if (access?.validationIssue !== undefined) return { ...base, status: 'blocked',
+        ...accessDiagnostic(new ClientAccessProjectionError('credential-unusable', access.validationIssue), access.provider) }
       if (access?.temporarilyUnavailable) return { ...base, status: 'blocked',
         message: '管理器账号状态暂时不可用；现有同步绑定已保留，待原刷新或状态检查恢复后会自动继续。',
         messageEn: 'The manager account is temporarily unavailable. Its sync binding is retained and resumes after the existing refresh or status check recovers.' }
@@ -78,9 +115,8 @@ export class ClientSwitchService {
       }
       if (!principal) return { ...base, status: 'blocked', message: '无法确认账号的稳定身份，请完成账号信息校验或重新授权后重试。',
         messageEn: 'The stable account identity is unavailable. Verify the account information or authorize it, then retry.' }
-      try { runtime.adapter.validate?.(projectableClientAccess(access)!) } catch {
-        return { ...base, status: 'blocked', message: '账号访问资料不完整或与客户端不兼容，请核对提供商、区域、组织登录地址和 profile 信息。',
-          messageEn: 'Account access details are incomplete or incompatible. Check provider, region, organization sign-in URL, and profile.' }
+      try { runtime.adapter.validate?.(projectableClientAccess(access)!) } catch (error) {
+        return { ...base, status: 'blocked', ...accessDiagnostic(error, access.provider) }
       }
       let bindingCurrent = base.connected
       if (bindingCurrent) {
@@ -131,7 +167,7 @@ export class ClientSwitchService {
       const principal = accessPrincipalFingerprint(this.deps.account(request.accountId))
       const snapshot = await this.inspect(request.accountId)
       const capability = snapshot.targets.find(item => item.target === request.target)!
-      if (capability.status !== 'ready') return this.result(request, capability.message, capability.messageEn || 'Client not ready.', 'CLIENT_NOT_READY')
+      if (capability.status !== 'ready') return this.result(request, capability.message, capability.messageEn || 'Client not ready.', capability.errorCode || 'CLIENT_NOT_READY')
       const runtime = await this.deps.runtime(request.target)
       if (!runtime || runtime.id !== capability.runtimeId || runtime.revision !== capability.revision ||
           request.runtimeId !== undefined && request.runtimeId !== runtime.id ||
@@ -163,6 +199,10 @@ export class ClientSwitchService {
           '客户端连接设置已更新，但凭证替换未完成。请重新检测；管理器登录未更改。',
           'Client connection settings were updated, but access was not replaced. Inspect again; the manager sign-in was not changed.',
           projected.reason || 'TARGET_WRITE_FAILED', projected.targetCommitted)
+        if (!projected.targetCommitted && projected.validationIssue) {
+          const diagnostic = accessDiagnostic(new ClientAccessProjectionError('credential-unusable', projected.validationIssue), this.deps.account(request.accountId)?.provider)
+          return this.result(request, diagnostic.message, diagnostic.messageEn, diagnostic.errorCode)
+        }
         return this.result(request, projected.targetCommitted
           ? '客户端凭证已写入，但同步绑定未保存。请重新检测，未回滚管理器凭证。'
           : '客户端状态或访问凭证发生变化，未完成替换。管理器登录与刷新未更改。',

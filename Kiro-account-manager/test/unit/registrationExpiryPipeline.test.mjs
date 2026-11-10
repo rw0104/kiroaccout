@@ -422,3 +422,143 @@ test('store import of an unknown local account retains the registration deadline
   assert.equal(inputs[0].clientSecretExpiresAt, expiry)
   assert.equal([...state.accounts.values()][0].credentials.clientSecretExpiresAt, expiry)
 })
+
+const profile = 'arn:aws:codewhisperer:us-east-1:000000000000:profile/SYNTHETIC_PROFILE'
+const organization = 'https://synthetic.awsapps.com/start'
+const localIdentity = (provider) => ({
+  ...local,
+  provider,
+  authMethod: provider === 'Google' || provider === 'Github' ? 'social' : 'IdC',
+  profileArn: `  ${profile}  `,
+  startUrl: `  ${organization}  `
+})
+
+async function savedAndReloaded(row) {
+  const ast = tree('renderer/src/store/accounts.ts')
+  const actions = ['addAccount', 'loadFromStorage'].map(name => find(ast,
+    node => ts.isPropertyAssignment(node) && node.name?.getText(ast) === name))
+  let saved
+  const state = { accounts: new Map(), groups: new Map(), tags: new Map(), proxyPool: new Map() }
+  const context = vm.createContext({
+    Date: Clock,
+    normalizeAccountSubscription,
+    uuidv4: () => 'synthetic-account',
+    generateRandomMachineId: () => 'synthetic-machine',
+    DEFAULT_PROXY_POOL_CONFIG: {},
+    queueMicrotask() {},
+    console: { log() {}, error() {} },
+    set: update => Object.assign(state, typeof update === 'function' ? update(state) : update),
+    get: () => ({ ...state, applyTheme() {}, startAutoSave() {}, saveToStorage() {
+      saved = JSON.parse(JSON.stringify(context.snapshot(state)))
+    } }),
+    window: { api: { getAppVersion: async () => 'synthetic', loadAccounts: async () => saved } }
+  })
+  vm.runInContext(compile(`${fn(ast, 'accountStorageSnapshot')}\nglobalThis.snapshot = accountStorageSnapshot; globalThis.actions = {${actions.join(',')}}`), context)
+  context.actions.addAccount(row)
+  state.accounts.clear()
+  await context.actions.loadFromStorage()
+  return state.accounts.get('synthetic-account')
+}
+
+test('single credential add persists the profile returned by verification through actual store save and reload', async () => {
+  for (const provider of ['Google', 'Github', 'Enterprise']) {
+    const dialog = dialogHarness('AddAccountDialog', {
+      verifyAccountCredentials: async input => ({ ...verified(input), data: { ...verified(input).data, profileArn: ` ${profile} ` } })
+    })
+    dialog.render()
+    for (const [key, value] of Object.entries(localIdentity(provider))) {
+      if (['refreshToken', 'clientId', 'clientSecret', 'region', 'provider', 'authMethod'].includes(key)) dialog.set(key, value)
+    }
+    await dialog.render().handleOidcAdd()
+    assert.equal(dialog.added.length, 1)
+    const reloaded = await savedAndReloaded(dialog.added[0])
+    assert.equal(reloaded.credentials.profileArn, profile)
+    assert.equal(reloaded.profileArn, profile)
+  }
+})
+
+test('local dialog import carries profile and organization metadata through verification and persistence by provider', async () => {
+  for (const provider of ['Google', 'Github', 'Enterprise', 'IAM_SSO']) {
+    const inputs = []
+    const dialog = dialogHarness('AddAccountDialog', {
+      loadKiroCredentials: preloadMethod('loadKiroCredentials', async () => ({ success: true, data: localIdentity(provider) })),
+      verifyAccountCredentials: preloadMethod('verifyAccountCredentials', async (_channel, input) => {
+        inputs.push(input)
+        return verified(input)
+      })
+    })
+    await dialog.render().handleImportFromLocal()
+    await dialog.render().handleOidcAdd()
+    assert.equal(inputs[0].profileArn, profile)
+    const expectedStartUrl = provider === 'Enterprise' || provider === 'IAM_SSO' ? organization : undefined
+    assert.equal(inputs[0].startUrl, expectedStartUrl)
+    assert.equal(dialog.added.length, 1)
+    const reloaded = await savedAndReloaded(dialog.added[0])
+    assert.equal(reloaded.credentials.profileArn, profile)
+    assert.equal(reloaded.profileArn, profile)
+    assert.equal(reloaded.credentials.startUrl, expectedStartUrl)
+  }
+})
+
+test('editing imported identity fields never attaches the previous identity profile or organization', async () => {
+  for (const changed of ['refreshToken', 'provider', 'authMethod', 'region', 'clientId', 'clientSecret']) {
+    const inputs = []
+    const dialog = dialogHarness('AddAccountDialog', {
+      loadKiroCredentials: async () => ({ success: true, data: localIdentity('Enterprise') }),
+      verifyAccountCredentials: async input => { inputs.push(input); return verified(input) }
+    })
+    await dialog.render().handleImportFromLocal()
+    dialog.set(changed, `SYNTHETIC_CHANGED_${changed}`)
+    await dialog.render().handleOidcAdd()
+    assert.equal(inputs[0].profileArn, undefined)
+    assert.equal(inputs[0].startUrl, undefined)
+    assert.equal(dialog.added[0].credentials.profileArn, undefined)
+    assert.equal(dialog.added[0].credentials.startUrl, undefined)
+  }
+})
+
+test('local dialog profile resolution uses a nonempty verified value and otherwise retains only supplied metadata', async () => {
+  for (const [inputProfile, responseProfile, expected] of [
+    [profile, '   ', profile],
+    [profile, ` ${profile}_VERIFIED `, `${profile}_VERIFIED`],
+    ['   ', undefined, undefined],
+    [undefined, undefined, undefined]
+  ]) {
+    const dialog = dialogHarness('AddAccountDialog', {
+      loadKiroCredentials: async () => ({ success: true, data: { ...localIdentity('Google'), profileArn: inputProfile } }),
+      verifyAccountCredentials: async input => ({ ...verified(input), data: { ...verified(input).data, profileArn: responseProfile } })
+    })
+    await dialog.render().handleImportFromLocal()
+    await dialog.render().handleOidcAdd()
+    assert.equal(dialog.added.length, 1)
+    assert.equal(dialog.added[0].credentials.profileArn, expected)
+    assert.equal(dialog.added[0].profileArn, expected)
+  }
+})
+
+test('store local import preserves profile and only enterprise organization data after verification', async () => {
+  const ast = tree('renderer/src/store/accounts.ts')
+  for (const provider of ['Google', 'Github', 'Enterprise', 'IAM_SSO']) {
+    const inputs = []
+    const state = { accounts: new Map(), saveToStorage() {} }
+    const context = vm.createContext({
+      Date: Clock, normalizeAccountSubscription,
+      console: { log() {}, warn() {} },
+      window: { api: {
+        getLocalActiveAccount: async () => ({ success: true, data: { refreshToken: local.refreshToken } }),
+        loadKiroCredentials: async () => ({ success: true, data: localIdentity(provider) }),
+        verifyAccountCredentials: async input => { inputs.push(input); return verified(input) }
+      } }
+    })
+    vm.runInContext(compile(`${fn(ast, 'syncLocalSsoAccountAsync')}\nglobalThis.run = syncLocalSsoAccountAsync`), context)
+    await context.run(() => state, update => Object.assign(state, typeof update === 'function' ? update(state) : update))
+    assert.equal(inputs[0].profileArn, profile)
+    const expectedStartUrl = provider === 'Enterprise' || provider === 'IAM_SSO' ? organization : undefined
+    assert.equal(inputs[0].startUrl, expectedStartUrl)
+    const added = [...state.accounts.values()][0]
+    const reloaded = await savedAndReloaded(added)
+    assert.equal(reloaded.credentials.profileArn, profile)
+    assert.equal(reloaded.profileArn, profile)
+    assert.equal(reloaded.credentials.startUrl, expectedStartUrl)
+  }
+})

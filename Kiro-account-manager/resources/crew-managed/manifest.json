@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "upstream": {
+    "name": "KiroCrew",
+    "version": "0.12.0",
+    "commit": "f315771db6a95704d129c7b722340a676d6bb8a4",
+    "url": "https://github.com/kirodotdev/KiroCrew",
+    "license": "Apache-2.0"
+  },
+  "files": [
+    {
+      "path": "patches/kiro_crew/acp/session_handle_mcp.py",
+      "module": "kiro_crew.acp.session_handle_mcp",
+      "sha256": "c19df6fd7ba9ce77c6e61810431e2c65041888154dfc7ceaac7caffc11c6650b",
+      "originalNormalizedSha256": "2aff03f769d888b058513e586153f0fddae4dc616c79d554072a194a86399ae4"
+    },
+    {
+      "path": "patches/kiro_crew/acp/session_handle_model_selection.py",
+      "module": "kiro_crew.acp.session_handle_model_selection",
+      "sha256": "26e0cb5498c624e1fdeeb05d866f3f4a8ba38510925f2c2b4ed92461d9714fe9",
+      "originalNormalizedSha256": "b9dd87646eab436be5cd36099eb21527ad3ceda1a1be03c1c1fa93449c22e698"
+    },
+    {
+      "path": "patches/kiro_crew/acp/session_handle_updates.py",
+      "module": "kiro_crew.acp.session_handle_updates",
+      "sha256": "494dec449bda39a6b34da0fe929bc93193cdaada1b46e7880281804293290bb8",
+      "originalNormalizedSha256": "674075e2b8c4afdbdba6999856abeb6d52f7d7349440bb03095f0e55dcfcf786"
+    },
+    {
+      "path": "patches/kiro_crew/agent_sdk/kas_model_catalog.py",
+      "module": "kiro_crew.agent_sdk.kas_model_catalog",
+      "sha256": "84b9d2664d01356308d4815d58b2773728f856fb600aa96f6d6d7a76300cde84",
+      "originalNormalizedSha256": "21f6632c11cc6e4fdc6fb90efdb2a0148b119ec45152390838bbea886719374a"
+    },
+    {
+      "path": "patches/kiro_crew/dashboard/server.py",
+      "module": "kiro_crew.dashboard.server",
+      "sha256": "a58fe027e363b4f71c72383aeb590173582a14663491bb680515fce297372aa9",
+      "originalNormalizedSha256": "46ceda1a3ef77d3ef36908a9cc309d1720cfbcd4e3bdab6c0c30ad0ca6a77322"
+    },
+    {
+      "path": "patches/kiro_crew/dashboard/server_runtime/api_entrypoint.py",
+      "module": "kiro_crew.dashboard.server_runtime.api_entrypoint",
+      "sha256": "d6006ef307512ed9f1423c617808c3f2617551d183d1de607ef0f13a9a33a1cf",
+      "originalNormalizedSha256": "af55a35ce002503cbf569051e39237b4e2bd6e55202fd5a7e7baa2b6f9a11e27"
+    },
+    {
+      "path": "patches/kiro_crew/dashboard/server_runtime/model_catalog_events.py",
+      "module": "kiro_crew.dashboard.server_runtime.model_catalog_events",
+      "sha256": "49d1b36c29ccaa9a30a427ed80b22ea7feb268f04bdd6195df3333e36e3ac644",
+      "originalNormalizedSha256": null
+    }
+  ],
+  "frontend": {
+    "asset": "useWebSocket-DK9hitwq.js",
+    "originalSha256": "112662b7b36ca7b472ca83c01a55412be3262ab39f9974caa92e46d56a812a66",
+    "path": "frontend/useWebSocket-DK9hitwq.js",
+    "sha256": "61d2e7631569629d7d6e41549485b6ec32552a191505c0ef6e43280973633f71",
+    "sourcePath": "frontend/useWebSocket.ts",
+    "sourceSha256": "843c8353881c22bdfb09385ea87bdd6f435dd176576643807897f04359f90b57"
+  },
+  "supportFiles": [
+    {
+      "path": "launcher.py",
+      "sha256": "128e6433f78b4a7fd31b76ec69968dadfa5bcccf87b79ab23b5b8405869dd3a2"
+    },
+    {
+      "path": "overlay.py",
+      "sha256": "c6359f7e1bfc4d084b3693a022c8df3df6179a9ec8c6d9f1ddb0affdbd23c2ba"
+    },
+    {
+      "path": "LICENSE.KiroCrew",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    {
+      "path": "NOTICE.KiroCrew",
+      "sha256": "cefd3e3dcf528b5c2225ff46c487286a1ef6aa605d498baab6fee777e331519f"
+    }
+  ]
+}

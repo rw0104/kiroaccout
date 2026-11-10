@@ -56,6 +56,10 @@ import { ClientAccessProjectionService, type ManagerAccessSnapshot, type ClientA
 import { ClientSwitchService } from './clientSwitch'
 import { ClientRuntimeRegistry, type ClientRuntimeConfig } from './clientRuntimes'
 import { registerClientSwitchIpc } from './ipc/clientSwitch'
+import { ManagedCrewService } from './managedCrew'
+import { createManagedCrewRuntime } from './managedCrewProcess'
+import { ManagedCrewWindowController } from './managedCrewWindow'
+import { registerManagedCrewIpc } from './ipc/managedCrew'
 import { trackWindowVisibility } from './windowVisibility'
 import { filterAvailableModels, toAccountModel } from '../shared/modelCatalog'
 import { KiroModelPreferencesService, ModelPreferencesError, type ModelPreferenceAccount } from './kiroModelPreferences'
@@ -85,6 +89,9 @@ let appUpdateController: AppUpdateController | null = null
 let updateInstallSave: { requestId: string; senderId: number; timer: ReturnType<typeof setTimeout>; resolve: () => void; reject: (code: UpdatePreparationErrorCode) => void } | null = null
 let updatePoolWasRunning = false
 let updateQuitRequested = false
+let managedCrewService: ManagedCrewService | undefined
+let managedQuitReady = false
+let managedQuitPending: Promise<void> | undefined
 nativeAutoUpdater.on('before-quit-for-update', () => { updateQuitRequested = true })
 
 function publishUpdateState(state: AppUpdateState): void {
@@ -121,7 +128,11 @@ function setupAutoUpdater(): void {
     enabled: app.isPackaged && process.platform === 'win32',
     currentVersion: app.getVersion(),
     notify: publishUpdateState,
-    prepareInstall: prepareUpdateInstall,
+    prepareInstall: async () => {
+      await prepareUpdateInstall()
+      try { await managedCrewService?.suspendAndStop(); managedQuitReady = true }
+      catch { throw new UpdatePreparationError('workspace-stop-failed') }
+    },
     beforeInstall: () => {
       updatePoolWasRunning = !!mainPoolRefreshTimer
       stopMainPoolTokenRefresh()
@@ -129,6 +140,8 @@ function setupAutoUpdater(): void {
     },
     installFailed: () => {
       isQuitting = false
+      managedQuitReady = false
+      managedCrewService?.resume()
       if (updatePoolWasRunning) startMainPoolTokenRefresh()
       updatePoolWasRunning = false
     }
@@ -1285,20 +1298,31 @@ function getClientProjectionAccess(accountId: string): ManagerAccessSnapshot | u
   const credentials = account.credentials
   if (account.id !== accountId || !credentials || account.status === 'banned') return undefined
   if (typeof account.userId !== 'string' || !account.userId.trim()) return undefined
-  if (account.profileArn && credentials.profileArn && account.profileArn !== credentials.profileArn) return undefined
   try { instanceAccountOwnership.assertAvailable({ accountId }) } catch { return undefined }
-  const identity = resolveIdentity({ provider: credentials.provider, idp: account.idp,
+  const identity = resolveIdentity({ provider: credentials.provider, idp: account.idp, authMethod: credentials.authMethod,
     hasClientCredentials: !!(credentials.clientId && credentials.clientSecret) })
-  if (!identity.ok || typeof credentials.accessToken !== 'string' || typeof credentials.expiresAt !== 'number') return undefined
-  const profileArn = typeof credentials.profileArn === 'string' ? credentials.profileArn : account.profileArn
+  if (typeof credentials.accessToken !== 'string' || typeof credentials.expiresAt !== 'number') return undefined
+  // Empty legacy copies must not shadow a saved profile. Two actual identities
+  // still conflict; propagate only a safe diagnostic, never choose one to write.
+  const savedProfile = typeof account.profileArn === 'string' ? account.profileArn.trim() : undefined
+  const credentialProfile = typeof credentials.profileArn === 'string' ? credentials.profileArn.trim() : undefined
+  const profileArn = credentialProfile || savedProfile
+  const validationIssue: ManagerAccessSnapshot['validationIssue'] = !identity.ok
+    ? identity.code === 'provider_auth_method_conflict' || identity.code === 'unsupported_auth_method'
+      ? 'auth-method-mismatch' : 'provider-unsupported'
+    : [account.profileArn, credentials.profileArn].some(value => value !== undefined && value !== null && typeof value !== 'string')
+      ? 'profile-invalid'
+    : savedProfile && credentialProfile && savedProfile !== credentialProfile ? 'metadata-conflict' : undefined
   return {
     principalId: account.userId,
+    ...(validationIssue ? { validationIssue } : {}),
     ...(account.status === 'error' ? { temporarilyUnavailable: true } : {}),
     accessToken: credentials.accessToken, expiresAt: credentials.expiresAt,
-    provider: identity.provider, authMethod: identity.authMethod,
+    provider: identity.ok ? identity.provider : '',
+    ...(identity.ok ? { authMethod: identity.authMethod } : {}),
     ...(profileArn ? { profileArn } : {}),
     ...(typeof credentials.region === 'string' ? { region: credentials.region } : {}),
-    ...(identity.provider === 'Enterprise' && typeof credentials.startUrl === 'string' ? { startUrl: credentials.startUrl } : {})
+    ...(identity.ok && identity.provider === 'Enterprise' && typeof credentials.startUrl === 'string' ? { startUrl: credentials.startUrl } : {})
   }
 }
 
@@ -1360,6 +1384,60 @@ function setupClientSwitching(): void {
   clientProjectionTimer = setInterval(() => { void tick().catch(() => {}) }, 15_000)
   clientProjectionTimer.unref?.()
   void tick().catch(() => {})
+  setupManagedCrew()
+}
+
+/** Separate configuration, binding, data home and window; legacy Crew is untouched. */
+function setupManagedCrew(): void {
+  const root = join(app.getPath('userData'), 'managed-crew/workspace-v1')
+  const unpacked = (path: string): string => path.replace(/app\.asar([/\\])/, 'app.asar.unpacked$1')
+  const helperPath = unpacked(join(__dirname, '../../resources/client-switch/crew-access.py'))
+  const resources = unpacked(join(__dirname, '../../resources/crew-managed'))
+  const registry = new ClientRuntimeRegistry({
+    helperPath, env: { ...process.env, KIROCREW_HOME: join(root, 'data') },
+    readConfig: () => {
+      const executablePath = store?.get('managedCrewExecutable')
+      return typeof executablePath === 'string' ? { executablePath, dataHome: join(root, 'data') } : undefined
+    },
+    writeConfig: (_target, config) => {
+      if (!store) throw new Error('Store unavailable')
+      store.set('managedCrewExecutable', config.executablePath)
+    }
+  })
+  const windows = new ManagedCrewWindowController(options => new BrowserWindow(options))
+  const readBinding = (): ClientAccessProjectionBinding | undefined => {
+    const value = store?.get('managedCrewBinding')
+    return value && typeof value === 'object' && !Array.isArray(value) ? value as ClientAccessProjectionBinding : undefined
+  }
+  const service = new ManagedCrewService({
+    account: getClientProjectionAccess,
+    runtime: async () => {
+      const installation = await registry.crewInstallation()
+      return installation ? createManagedCrewRuntime({ root, resources, accessHelper: helperPath, installation }) : undefined
+    },
+    readBinding,
+    writeBinding: (binding, expected) => {
+      if (!store || readBinding()?.revision !== expected) return false
+      store.set('managedCrewBinding', binding)
+      return true
+    },
+    beginOperation: accountId => instanceAccountOwnership.beginOperation({ accountId }),
+    openWindow: (url, onClosed) => windows.open(url, onClosed), closeWindow: () => windows.close(),
+    platformSupported: () => process.platform === 'win32'
+  })
+  managedCrewService = service
+  registerManagedCrewIpc({ ipc: ipcMain, service,
+    trusted: event => requireTrustedMainWindow(event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined),
+    chooseExecutable: async () => {
+      if (process.platform !== 'win32' || !mainWindow) return { success: false, message: '独立 Crew 当前仅支持 Windows。' }
+      if (service.busy) return { success: false, message: '请先停止独立工作区，再更换安装位置。' }
+      const selected = await dialog.showOpenDialog(mainWindow, { title: '选择官方 KiroCrew.exe', properties: ['openFile'], filters: [{ name: 'Kiro Crew', extensions: ['exe'] }] })
+      if (selected.canceled || selected.filePaths.length !== 1) return { success: false, canceled: true }
+      if (service.busy) return { success: false, message: '工作区状态已变化，请停止后重试。' }
+      try { await registry.configure('crew', selected.filePaths[0]); return { success: true } }
+      catch { return { success: false, message: '此安装未通过官方 Crew 0.12.0 的兼容性检查。' } }
+    }
+  })
 }
 
 const modelPreferences = new KiroModelPreferencesService({
@@ -3125,6 +3203,7 @@ app.whenReady().then(async () => {
       const newAccess = refreshResult.accessToken
       const newRefresh = refreshResult.refreshToken || refreshToken
       const expiresIn = refreshResult.expiresIn ?? 3600
+      const refreshedSocialProfileArn = authMethod === 'social' ? refreshResult.profileArn : undefined
 
       // bug B 修复：仅当该账号是 Kiro IDE 当前激活账号时，同步写入磁盘 token 文件
       // 判定优先级（任一命中即视为"是当前激活账号"）：
@@ -3139,7 +3218,7 @@ app.whenReady().then(async () => {
         const matchByLastSwitch = !!account.id && lastSwitchedAccountId === account.id
         if (matchByRefresh || matchByLastSwitch) {
           const resolvedProfileArn = resolveProfileArnForWrite({
-            profileArn: account.profileArn,
+            profileArn: refreshedSocialProfileArn || account.profileArn || account.credentials?.profileArn,
             authMethod,
             provider,
             region
@@ -3198,7 +3277,7 @@ app.whenReady().then(async () => {
             console.warn('[Refresh] Failed to fetch Enterprise profileArn:', e)
           }
         }
-        // BuilderId/Social 不调 API，不需要返回 profileArn（反代自愈时用 resolveProfileArn 兜底）
+        // Personal identities do not need the enterprise profile lookup.
       }
 
       return {
@@ -3207,8 +3286,8 @@ app.whenReady().then(async () => {
           accessToken: newAccess,
           refreshToken: newRefresh,
           expiresIn,
-          // Enterprise 自动获取的 profileArn（renderer 需要存储到账号数据）
-          profileArn: resolvedEnterpriseArn || undefined,
+          // Persist authenticated Social response metadata alongside the rotation.
+          profileArn: refreshedSocialProfileArn || resolvedEnterpriseArn || undefined,
           // 让 renderer 决定是否给用户显示"已同步到 IDE"的反馈
           syncedToIde,
           syncSkipReason
@@ -3474,6 +3553,7 @@ app.whenReady().then(async () => {
       accessToken: string
       refreshToken?: string
       expiresIn?: number
+      profileArn?: string
     }, userInfo?: UserInfoResponse) => {
       console.log(`[Kiro API] Usage [${account?.email || userInfo?.email || 'unknown'}]`, result)
 
@@ -3555,6 +3635,7 @@ app.whenReady().then(async () => {
           newCredentials: newCredentials ? {
             accessToken: newCredentials.accessToken,
             refreshToken: newCredentials.refreshToken,
+            ...(newCredentials.profileArn ? { profileArn: newCredentials.profileArn } : {}),
             expiresAt: newCredentials.expiresIn 
               ? Date.now() + newCredentials.expiresIn * 1000 
               : undefined
@@ -3643,7 +3724,8 @@ app.whenReady().then(async () => {
             const rotatedCredentials = {
               accessToken: refreshResult.accessToken,
               refreshToken: refreshResult.refreshToken,
-              expiresIn: refreshResult.expiresIn
+              expiresIn: refreshResult.expiresIn,
+              ...(authMethod === 'social' && refreshResult.profileArn ? { profileArn: refreshResult.profileArn } : {})
             }
             try {
               // 用新 token 并行调用 GetUserInfo 和 getUsageAndLimits
@@ -3654,7 +3736,7 @@ app.whenReady().then(async () => {
                   }
                   return undefined
                 }),
-                getUsageAndLimits(refreshResult.accessToken, idp, account.profileArn || account.credentials?.profileArn, accountMachineId, region)
+                getUsageAndLimits(refreshResult.accessToken, idp, rotatedCredentials.profileArn || account.profileArn || account.credentials?.profileArn, accountMachineId, region)
               ])
 
               // 返回结果并包含新凭证
@@ -3668,6 +3750,7 @@ app.whenReady().then(async () => {
                 data: { status: 'error', newCredentials: {
                   accessToken: rotatedCredentials.accessToken,
                   refreshToken: rotatedCredentials.refreshToken,
+                  ...(rotatedCredentials.profileArn ? { profileArn: rotatedCredentials.profileArn } : {}),
                   expiresAt: rotatedCredentials.expiresIn ? Date.now() + rotatedCredentials.expiresIn * 1000 : undefined
                 } },
                 error: { message: retryError instanceof Error ? retryError.message : '刷新后的账户查询失败' }
@@ -3741,6 +3824,7 @@ app.whenReady().then(async () => {
             let newAccessToken = accessToken
             let newRefreshToken = refreshToken
             let newExpiresIn: number | undefined
+            let refreshedSocialProfileArn: string | undefined
 
             // 只有需要刷新 Token 时才刷新
             if (needsTokenRefresh) {
@@ -3778,6 +3862,7 @@ app.whenReady().then(async () => {
               newAccessToken = refreshResult.accessToken || accessToken
               newRefreshToken = refreshResult.refreshToken || refreshToken
               newExpiresIn = refreshResult.expiresIn
+              refreshedSocialProfileArn = authMethod === 'social' ? refreshResult.profileArn : undefined
 
               // 仅当该账号是 Kiro IDE 当前激活账号时，同步新 token 到磁盘 token 文件。
               // 否则 IDE 在 ~50min 后会用磁盘上"被自动刷新作废"的旧 refreshToken 调 OIDC → 401 → logoutAndForget。
@@ -3789,7 +3874,7 @@ app.whenReady().then(async () => {
                   const matchByLastSwitch = lastSwitchedAccountId === account.id
                   if (matchByRefresh || matchByLastSwitch) {
                     const resolvedProfileArn = resolveProfileArnForWrite({
-                      profileArn: diskToken?.profileArn,
+                      profileArn: refreshedSocialProfileArn || diskToken?.profileArn,
                       authMethod,
                       provider,
                       region
@@ -3922,7 +4007,7 @@ app.whenReady().then(async () => {
                   }
                 }
                 console.log(`[BackgroundRefresh] Account ${account.id} machineId: ${account.machineId || 'undefined'}`)
-                const rawUsage = await getUsageAndLimits(newAccessToken, idp, account.profileArn || account.credentials?.profileArn, account.machineId, region) as UsageResponse
+                const rawUsage = await getUsageAndLimits(newAccessToken, idp, refreshedSocialProfileArn || account.profileArn || account.credentials?.profileArn, account.machineId, region) as UsageResponse
                 
                 // 解析使用量数据
                 const creditUsage = rawUsage.usageBreakdownList?.find(b => b.resourceType === 'CREDIT')
@@ -4012,7 +4097,7 @@ app.whenReady().then(async () => {
                 accessToken: newAccessToken,
                 refreshToken: newRefreshToken,
                 expiresIn: newExpiresIn,
-                profileArn: resolvedBgProfileArn || undefined,
+                profileArn: refreshedSocialProfileArn || resolvedBgProfileArn || undefined,
                 usage: parsedUsage,
                 subscription: subscriptionData,
                 userInfo: syncInfo ? userInfoData : undefined,
@@ -4422,6 +4507,7 @@ app.whenReady().then(async () => {
     accessToken?: string
     expiresIn?: number
     profileArn?: string
+    startUrl?: string
     refreshToken: string
     clientId: string
     clientSecret: string
@@ -4505,7 +4591,8 @@ app.whenReady().then(async () => {
         userInfo?: { email?: string; userId?: string }
       }
       
-      const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, normalized.credential.profileArn, undefined, region) as UsageResponse
+      const verifiedProfileArn = (authMethod === 'social' ? refreshResult.profileArn : undefined) || normalized.credential.profileArn
+      const usageResult = await getUsageAndLimits(refreshResult.accessToken, idp, verifiedProfileArn, undefined, region) as UsageResponse
       
       // 解析用户信息
       const email = usageResult.userInfo?.email || ''
@@ -4563,7 +4650,7 @@ app.whenReady().then(async () => {
           refreshToken: refreshResult.refreshToken || refreshToken,
           expiresIn: refreshResult.expiresIn,
           clientSecretExpiresAt: normalized.credential.clientSecretExpiresAt,
-          profileArn: enterpriseProfileArn || normalized.credential.profileArn,
+          profileArn: enterpriseProfileArn || verifiedProfileArn,
           subscriptionType,
           subscriptionTitle,
           subscription: {
@@ -4656,6 +4743,8 @@ app.whenReady().then(async () => {
         region?: string
         authMethod?: string
         provider?: string
+        profileArn?: string
+        startUrl?: string
       }
       
       try {
@@ -4665,17 +4754,41 @@ app.whenReady().then(async () => {
         return { success: false, error: '找不到 kiro-auth-token.json 文件，请先在 Kiro IDE 中登录' }
       }
       
-      if (!tokenData.refreshToken) {
+      if (!tokenData || Array.isArray(tokenData) || typeof tokenData !== 'object' ||
+          typeof tokenData.refreshToken !== 'string' || !tokenData.refreshToken.trim()) {
         return { success: false, error: 'kiro-auth-token.json 中缺少 refreshToken' }
       }
-      
-      // 确定 clientIdHash：优先使用文件中的，否则计算默认值
-      let clientIdHash = tokenData.clientIdHash
+
+      let identity = resolveIdentity({ provider: tokenData.provider, authMethod: tokenData.authMethod })
+      // Legacy caches with no identity may still be identified by a valid IdC
+      // registration below. Explicit conflicts and incomplete Social identities cannot.
+      if (!identity.ok && (identity.code !== 'missing_provider' ||
+          typeof tokenData.authMethod === 'string' && tokenData.authMethod.trim())) {
+        return { success: false, error: identity.message }
+      }
+      const profileArn = typeof tokenData.profileArn === 'string' ? tokenData.profileArn.trim() : ''
+      const startUrl = identity.ok && (identity.provider === 'Enterprise' || identity.provider === 'IAM_SSO') &&
+        typeof tokenData.startUrl === 'string' ? tokenData.startUrl.trim() : ''
+      const metadata = {
+        accessToken: typeof tokenData.accessToken === 'string' ? tokenData.accessToken : '',
+        refreshToken: tokenData.refreshToken,
+        region: typeof tokenData.region === 'string' && tokenData.region.trim() ? tokenData.region.trim() : 'us-east-1',
+        ...(profileArn ? { profileArn } : {}),
+        ...(startUrl ? { startUrl } : {})
+      }
+      if (identity.ok && identity.authMethod === 'social') {
+        // Social has no IdC registration: do not read another account's client
+        // secret or attach its registration deadline to this import.
+        return { success: true, data: { ...metadata, clientId: '', clientSecret: '',
+          authMethod: identity.authMethod, provider: identity.provider } }
+      }
+
+      // Explicit registration identity wins; enterprise fallback uses its saved URL.
+      let clientIdHash = typeof tokenData.clientIdHash === 'string' ? tokenData.clientIdHash.trim() : ''
       if (!clientIdHash) {
         // 使用标准的 startUrl 计算 hash（与 Kiro 客户端一致）
-        const startUrl = 'https://view.awsapps.com/start'
         clientIdHash = crypto.createHash('sha1')
-          .update(JSON.stringify({ startUrl }))
+          .update(JSON.stringify({ startUrl: startUrl || 'https://view.awsapps.com/start' }))
           .digest('hex')
         console.log('[Kiro Credentials] Calculated clientIdHash:', clientIdHash)
       }
@@ -4719,34 +4832,32 @@ app.whenReady().then(async () => {
         }
       }
       
-      // 社交登录不需要 clientId/clientSecret
-      const isSocialAuth = tokenData.authMethod === 'social'
-      
-      if (!isSocialAuth && (!clientData || !clientData.clientId || !clientData.clientSecret)) {
+      if (!clientData || typeof clientData.clientId !== 'string' || !clientData.clientId.trim() ||
+          typeof clientData.clientSecret !== 'string' || !clientData.clientSecret.trim()) {
         return { success: false, error: '找不到客户端注册文件，请确保已在 Kiro IDE 中完成登录' }
       }
-      
-      console.log(`[Kiro Credentials] Successfully loaded credentials (authMethod: ${tokenData.authMethod || 'IdC'})`)
+      identity = resolveIdentity({ provider: tokenData.provider, authMethod: tokenData.authMethod, hasClientCredentials: true })
+      if (!identity.ok) return { success: false, error: identity.message }
+
+      console.log(`[Kiro Credentials] Successfully loaded credentials (authMethod: ${identity.authMethod})`)
       
       return {
         success: true,
         data: {
-          accessToken: tokenData.accessToken || '',
-          refreshToken: tokenData.refreshToken,
-          clientId: clientData?.clientId || '',
-          clientSecret: clientData?.clientSecret || '',
+          ...metadata,
+          clientId: clientData.clientId,
+          clientSecret: clientData.clientSecret,
           clientSecretExpiresAt: (() => {
             const milliseconds = normalizeTimestamp(clientData?.clientSecretExpiresAt ?? clientData?.expiresAt)
             return milliseconds === undefined ? undefined : Math.floor(milliseconds / 1000)
           })(),
-          region: tokenData.region || 'us-east-1',
-          authMethod: tokenData.authMethod || 'IdC',
-          provider: tokenData.provider || 'BuilderId'
+          authMethod: identity.authMethod,
+          provider: identity.provider
         }
       }
-    } catch (error) {
-      console.error('[Kiro Credentials] Error:', error)
-      return { success: false, error: error instanceof Error ? error.message : '未知错误' }
+    } catch {
+      console.error('[Kiro Credentials] Local credential import failed')
+      return { success: false, error: '无法读取本地登录资料，请确认已在 Kiro IDE 中完成登录' }
     }
   })
 
@@ -6740,6 +6851,21 @@ app.on('before-quit', (event) => {
     event.preventDefault()
     return
   }
+  if (typeof managedCrewService !== 'undefined' && managedCrewService && !managedQuitReady) {
+    event.preventDefault()
+    if (!managedQuitPending) {
+      managedQuitPending = managedCrewService.suspendAndStop().then(() => {
+        managedQuitReady = true
+        app.quit()
+      }).catch(() => {
+        isQuitting = false
+        managedQuitReady = false
+        managedCrewService?.resume()
+        dialog.showErrorBox('独立 Crew 尚未停止', '请先在对应账号中停止独立 Crew 工作区，然后重试退出；其它客户端未被停止。')
+      }).finally(() => { managedQuitPending = undefined })
+    }
+    return
+  }
   updateQuitRequested = false
   appUpdateController?.dispose()
   if (updateInstallSave) {
@@ -6754,6 +6880,7 @@ app.on('will-quit', async (event) => {
   // 防止重复处理
   if (clientProjectionTimer) clearInterval(clientProjectionTimer)
   clientAccessProjection?.close()
+  managedCrewService?.dispose()
   if (isQuitting) return
   
   // 停止主进程池 token 刷新调度器

@@ -327,7 +327,19 @@ function App(): React.JSX.Element {
   useEffect(() => window.api.onKiroInstanceAccountUpdate(info => {
     const account = useAccountsStore.getState().accounts.get(info.id)
     if (!account) return
-    updateAccount(info.id, { credentials: { ...account.credentials, ...info.credentials } })
+    const { profileArn: receivedCredentialProfile, ...credentials } = info.credentials
+    const receivedProfile = typeof info.profileArn === 'string' ? info.profileArn.trim() : ''
+    const credentialProfile = typeof receivedCredentialProfile === 'string' ? receivedCredentialProfile.trim() : ''
+    const profileArn = receivedProfile || credentialProfile
+    const credentialProfileArn = credentialProfile || receivedProfile
+    updateAccount(info.id, {
+      ...(profileArn ? { profileArn } : {}),
+      credentials: {
+        ...account.credentials,
+        ...credentials,
+        ...(credentialProfileArn ? { profileArn: credentialProfileArn } : {})
+      }
+    })
   }), [updateAccount])
 
   const renderPage = () => {

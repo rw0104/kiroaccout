@@ -4,6 +4,7 @@ import { AlertCircle, CheckCircle2, Loader2, Monitor, RefreshCw, Terminal, Users
 import { Button } from '../ui'
 import { cn } from '@/lib/utils'
 import type { ClientSwitchApi, ClientSwitchCapability, ClientSwitchTarget } from '../../../../shared/clientSwitch'
+import type { ManagedCrewApi, ManagedCrewState } from '../../../../shared/managedCrew'
 
 interface ClientSwitchDialogProps {
   accountId: string
@@ -11,29 +12,34 @@ interface ClientSwitchDialogProps {
   isCurrentAccount: boolean
   isEn: boolean
   api: ClientSwitchApi
+  managedApi?: ManagedCrewApi
   onSwitchIde: () => Promise<{ success: boolean; error?: string }>
   onClose: () => void
 }
 
+type DialogTarget = ClientSwitchTarget | 'crew-managed'
 const targets = ['ide', 'crew', 'cli'] as const
-const clientNames: Record<ClientSwitchTarget, string> = { ide: 'Kiro IDE', crew: 'Kiro Crew', cli: 'Kiro CLI' }
-const clientIcons = { ide: Monitor, crew: Users, cli: Terminal }
+const clientNames: Record<DialogTarget, string> = { ide: 'Kiro IDE', crew: 'Kiro Crew', 'crew-managed': 'Kiro Crew', cli: 'Kiro CLI' }
+const clientIcons = { ide: Monitor, crew: Users, 'crew-managed': Users, cli: Terminal }
 
 /** A selection or inspection never starts a credential write. Only submit does. */
-export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, isEn, api, onSwitchIde, onClose }: ClientSwitchDialogProps): React.ReactNode {
+export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, isEn, api, managedApi, onSwitchIde, onClose }: ClientSwitchDialogProps): React.ReactNode {
   const titleId = useId()
   const accountLabelId = useId()
-  const [target, setTarget] = useState<ClientSwitchTarget>('ide')
+  const [target, setTarget] = useState<DialogTarget>('ide')
   const [capabilities, setCapabilities] = useState<ClientSwitchCapability[]>([])
+  const [managedState, setManagedState] = useState<ManagedCrewState | null>(null)
+  const [managedInspectError, setManagedInspectError] = useState(false)
   const [inspecting, setInspecting] = useState(true)
   const [inspectError, setInspectError] = useState(false)
   const [busy, setBusy] = useState(false)
-  const [activity, setActivity] = useState<'switch' | 'authorize' | 'configure' | 'disconnect' | null>(null)
+  const [activity, setActivity] = useState<'switch' | 'authorize' | 'configure' | 'disconnect' | 'workspace-start' | 'workspace-open' | 'workspace-stop' | null>(null)
   const [canceling, setCanceling] = useState(false)
   const [result, setResult] = useState<{ success: boolean; message: string } | null>(null)
   const panelRef = useRef<HTMLDivElement>(null)
   const initialRadioRef = useRef<HTMLInputElement>(null)
   const apiRef = useRef(api)
+  const managedApiRef = useRef(managedApi)
   const closeRef = useRef(onClose)
   const busyRef = useRef(false)
   const cancelingRef = useRef(false)
@@ -42,19 +48,29 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
   const inspectSequence = useRef(0)
   const operationSequence = useRef(0)
   apiRef.current = api
+  managedApiRef.current = managedApi ?? (typeof window === 'undefined' ? undefined : window.api?.managedCrew)
 
   const inspect = useCallback(async () => {
     const sequence = ++inspectSequence.current
     setInspecting(true)
     setInspectError(false)
+    setManagedInspectError(false)
     try {
-      const snapshot = await apiRef.current.inspect(accountId)
+      const [existing, workspace] = await Promise.allSettled([
+        apiRef.current.inspect(accountId),
+        managedApiRef.current?.inspect(accountId) ?? Promise.resolve(undefined)
+      ])
       if (!mountedRef.current || sequence !== inspectSequence.current) return
-      setCapabilities(snapshot.targets)
+      if (existing.status === 'fulfilled') setCapabilities(existing.value.targets)
+      else { setCapabilities([]); setInspectError(true) }
+      if (workspace.status === 'fulfilled') setManagedState(workspace.value ?? null)
+      else { setManagedState(null); setManagedInspectError(true) }
     } catch {
       if (!mountedRef.current || sequence !== inspectSequence.current) return
       setCapabilities([])
       setInspectError(true)
+      setManagedState(null)
+      setManagedInspectError(true)
     } finally {
       if (mountedRef.current && sequence === inspectSequence.current) setInspecting(false)
     }
@@ -64,6 +80,7 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
     mountedRef.current = true
     setTarget('ide')
     setResult(null)
+    setManagedState(null)
     busyRef.current = false
     setBusy(false)
     setActivity(null)
@@ -116,7 +133,12 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
   }, [])
 
   const capability = capabilities.find(item => item.target === target)
-  const canSubmit = !busy && (target === 'ide' || (!inspecting && capability?.status === 'ready'))
+  const isManaged = target === 'crew-managed'
+  const isCrew = target === 'crew-managed' || target === 'crew'
+  const canOpenManaged = managedState?.selectedAccount === true && managedState.canOpen
+  const canSubmit = !busy && (target === 'ide' || (!inspecting && (isManaged
+    ? !!managedApiRef.current && (managedState?.canStart === true || canOpenManaged)
+    : capability?.status === 'ready')))
   const sharedAuthentication = capability?.sharedTargets && capability.sharedTargets.length > 1
 
   const requestClose = async (): Promise<void> => {
@@ -151,7 +173,9 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
     setActivity('configure')
     setResult(null)
     try {
-      const response = await apiRef.current.chooseExecutable(target)
+      const response = target === 'crew-managed'
+        ? await managedApiRef.current!.chooseExecutable()
+        : await apiRef.current.chooseExecutable(target)
       if (!mountedRef.current || sequence !== operationSequence.current) return
       if (!response.success && !response.canceled) setResult({ success: false, message: response.message || (isEn ? 'Could not configure this client.' : '客户端配置未完成。') })
       if (response.success) void inspect()
@@ -166,7 +190,7 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
   }
 
   const authorize = async (): Promise<void> => {
-    if (target === 'ide' || busyRef.current || capability?.status !== 'needs-login') return
+    if (target === 'ide' || target === 'crew-managed' || busyRef.current || capability?.status !== 'needs-login') return
     const sequence = ++operationSequence.current
     const operationId = crypto.randomUUID()
     authorizationRef.current = operationId
@@ -192,7 +216,7 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
   }
 
   const disconnect = async (): Promise<void> => {
-    if (target === 'ide' || busyRef.current || inspecting || !capability?.connected) return
+    if (target === 'ide' || target === 'crew-managed' || busyRef.current || inspecting || !capability?.connected) return
     const sequence = ++operationSequence.current
     busyRef.current = true
     setBusy(true)
@@ -222,6 +246,30 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
     }
   }
 
+  const stopWorkspace = async (): Promise<void> => {
+    if (!isManaged || busyRef.current || inspecting || !managedApiRef.current || !managedState?.canStop || !managedState.selectedAccount) return
+    const sequence = ++operationSequence.current
+    busyRef.current = true
+    setBusy(true)
+    setActivity('workspace-stop')
+    setResult(null)
+    try {
+      const response = await managedApiRef.current.stop({ accountId, operationId: crypto.randomUUID() })
+      if (!mountedRef.current || sequence !== operationSequence.current) return
+      setManagedState(response.state)
+      setResult({ success: response.success, message: isEn ? response.state.messageEn || response.state.message : response.state.message })
+      void inspect()
+    } catch {
+      if (mountedRef.current && sequence === operationSequence.current) setResult({ success: false,
+        message: isEn ? 'The independent workspace could not be stopped. Check its state and retry.' : '独立工作区未能停止，请检查状态后重试。' })
+    } finally {
+      if (sequence === operationSequence.current) {
+        busyRef.current = false
+        if (mountedRef.current) { setBusy(false); setActivity(null) }
+      }
+    }
+  }
+
   const submit = async (event: React.FormEvent): Promise<void> => {
     event.preventDefault()
     event.stopPropagation()
@@ -229,7 +277,7 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
     const sequence = ++operationSequence.current
     busyRef.current = true
     setBusy(true)
-    setActivity('switch')
+    setActivity(isManaged ? canOpenManaged ? 'workspace-open' : 'workspace-start' : 'switch')
     setResult(null)
     try {
       if (target === 'ide') {
@@ -237,6 +285,15 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
         if (!mountedRef.current || sequence !== operationSequence.current) return
         if (response.success) onClose()
         else setResult({ success: false, message: response.error || (isEn ? 'The account could not be switched. Please try again.' : '账号切换未完成，请重试。') })
+      } else if (target === 'crew-managed') {
+        const workspaceApi = managedApiRef.current
+        if (!workspaceApi) throw new Error('Workspace unavailable')
+        const request = { accountId, operationId: crypto.randomUUID() }
+        const response = canOpenManaged ? await workspaceApi.open(request) : await workspaceApi.start(request)
+        if (!mountedRef.current || sequence !== operationSequence.current) return
+        setManagedState(response.state)
+        setResult({ success: response.success, message: isEn ? response.state.messageEn || response.state.message : response.state.message })
+        void inspect()
       } else {
         const response = await apiRef.current.execute({
           operationId: crypto.randomUUID(),
@@ -293,19 +350,20 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
               {targets.map(client => {
                 const Icon = clientIcons[client]
                 const item = capabilities.find(entry => entry.target === client)
+                const selected = client === 'crew' ? isCrew : target === client
                 const description = client === 'ide'
                   ? (isEn ? 'Use the existing IDE account switch.' : '按现有方式切换 IDE 账号。')
                   : client === 'crew'
-                    ? (isEn ? 'Switch the Kiro account used by Crew.' : '切换此 Crew 使用的 Kiro 账号。')
+                    ? (isEn ? 'Open an independent workspace or switch an existing Crew client.' : '打开独立工作区，或切换已有 Crew 客户端的账号。')
                     : (isEn ? 'Switch the account used by the local CLI.' : '切换本机 CLI 使用的账号。')
-                const detail = client === 'ide' ? '' : inspecting
+                const detail = client === 'ide' || client === 'crew' ? '' : inspecting
                   ? (isEn ? 'Checking client…' : '正在检测客户端…')
                   : item ? (isEn ? item.messageEn || item.message : item.message)
                     : (isEn ? 'Client information is unavailable.' : '暂时无法获取客户端信息。')
                 return (
                   <label key={client} className={cn(
                     'flex cursor-pointer items-start gap-3 rounded-xl border p-3 transition-colors',
-                    target === client ? 'border-primary bg-primary/5' : 'border-border hover:bg-muted/40',
+                    selected ? 'border-primary bg-primary/5' : 'border-border hover:bg-muted/40',
                     busy && 'cursor-wait opacity-70'
                   )}>
                     <input
@@ -313,8 +371,9 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
                       type="radio"
                       name={titleId}
                       value={client}
-                      checked={target === client}
-                      onChange={() => { setTarget(client); setResult(null) }}
+                      data-client-target={client}
+                      checked={selected}
+                      onChange={() => { setTarget(client === 'crew' ? 'crew-managed' : client); setResult(null) }}
                       className="mt-1 h-4 w-4 shrink-0 accent-primary"
                     />
                     <Icon className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
@@ -331,7 +390,34 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
                 )
               })}
             </fieldset>
-            {target !== 'ide' && (
+            {isCrew && <fieldset data-testid="crew-mode-picker" disabled={busy} className="space-y-3">
+              <legend className="mb-2 text-xs font-medium">{isEn ? 'How to use Crew' : 'Crew 使用方式'}</legend>
+              <div className="grid grid-cols-2 gap-2">
+                {(['crew-managed', 'crew'] as const).map(mode => <label key={mode} className={cn(
+                  'flex min-w-0 cursor-pointer flex-wrap items-center gap-2 rounded-lg border px-3 py-2.5 text-xs',
+                  target === mode ? 'border-primary bg-primary/5' : 'border-border hover:bg-muted/40',
+                  busy && 'cursor-wait opacity-70'
+                )}>
+                  <input type="radio" name={`${titleId}-crew-mode`} value={mode} data-crew-mode={mode}
+                    checked={target === mode} onChange={() => { if (!busyRef.current) { setTarget(mode); setResult(null) } }}
+                    className="h-4 w-4 shrink-0 accent-primary" />
+                  <span>{mode === 'crew-managed' ? (isEn ? 'Independent workspace' : '独立工作区') : (isEn ? 'Existing client' : '现有客户端')}</span>
+                  {mode === 'crew-managed' && <span className="rounded bg-primary/10 px-1 py-0.5 text-[10px] text-primary">{isEn ? 'Recommended' : '推荐'}</span>}
+                </label>)}
+              </div>
+              <p className="text-xs leading-relaxed text-muted-foreground">{isManaged
+                ? (isEn ? 'Start Crew with independent data and the model-menu fix. Existing client sign-in is preserved.' : '使用独立数据启动 Crew，并修复模型菜单；保留现有客户端登录。')
+                : (isEn ? 'Only switch the account in your existing Crew client. This does not start it.' : '仅切换已有 Crew 客户端的账号，不会启动客户端。')}</p>
+              <p className="break-words text-xs" role="status">{inspecting
+                ? (isEn ? 'Checking client…' : '正在检测客户端…')
+                : isManaged
+                  ? managedInspectError ? (isEn ? 'Workspace detection failed. Refresh to retry.' : '独立工作区检测失败，请重新检测。')
+                    : managedState ? (isEn ? managedState.messageEn || managedState.message : managedState.message)
+                      : (isEn ? 'The independent workspace is unavailable.' : '独立工作区暂不可用。')
+                  : capability ? (isEn ? capability.messageEn || capability.message : capability.message)
+                    : (isEn ? 'Client information is unavailable.' : '暂时无法获取客户端信息。')}</p>
+            </fieldset>}
+            {target !== 'ide' && target !== 'crew-managed' && (
               <div className="flex flex-wrap items-center justify-end gap-2">
                 {capability?.connected && (
                   <Button type="button" variant="outline" size="sm" disabled={busy || inspecting} onClick={() => void disconnect()}>
@@ -348,6 +434,22 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
                 )}
               </div>
             )}
+            {isManaged && <>
+              <p className="rounded-lg bg-muted/50 p-3 text-xs text-muted-foreground" role="note">
+                {isEn ? 'Keep the manager running to synchronize short-lived access. The workspace keeps its own data and leaves the official installation and existing sign-in unchanged.' : '请保持管理器运行以同步短期凭证。工作区使用独立数据，保留官方安装和现有登录。'}
+              </p>
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                {managedState?.canStop && managedState.selectedAccount && <Button type="button" variant="outline" size="sm" disabled={busy || inspecting} onClick={() => void stopWorkspace()}>
+                  {isEn ? 'Stop workspace' : '停止工作区'}
+                </Button>}
+                <Button type="button" variant="ghost" size="sm" disabled={busy || inspecting || !managedApiRef.current} onClick={() => void chooseExecutable()}>
+                  {isEn ? 'Choose installed client' : '选择已安装客户端'}
+                </Button>
+                <Button type="button" variant="ghost" size="sm" disabled={busy || inspecting} onClick={() => void inspect()}>
+                  <RefreshCw className="h-3 w-3" />{isEn ? 'Refresh workspace' : '重新检测工作区'}
+                </Button>
+              </div>
+            </>}
             {activity === 'authorize' && (
               <p className="flex items-start gap-2 rounded-lg bg-muted/50 p-3 text-xs text-muted-foreground" role="status">
                 <Loader2 className="h-4 w-4 shrink-0 animate-spin" />
@@ -361,7 +463,7 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
                   : (isEn ? 'Crew and the local CLI share this sign-in. Switching will affect both clients.' : 'Crew 与本地 CLI 共用此登录信息，本次切换会同时影响两者。')}
               </p>
             )}
-            {inspectError && (
+            {inspectError && !isManaged && (
               <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground" role="status">
                 <span>{isEn ? 'Client detection failed. IDE switching is still available.' : '客户端检测失败，仍可使用原 IDE 切号。'}</span>
                 <Button type="button" variant="ghost" size="sm" onClick={() => void inspect()} disabled={busy || inspecting}>
@@ -382,7 +484,13 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
             </Button>
             <Button type="submit" disabled={!canSubmit}>
               {busy && <Loader2 className="h-4 w-4 animate-spin" />}
-              {busy ? (activity === 'authorize' ? (isEn ? 'Authorizing…' : '正在授权…') : activity === 'configure' ? (isEn ? 'Configuring…' : '正在配置…') : activity === 'disconnect' ? (isEn ? 'Disconnecting…' : '正在停止同步…') : (isEn ? 'Switching…' : '正在切换…')) : (isEn ? 'Switch account' : '切换账号')}
+              {busy ? (activity === 'authorize' ? (isEn ? 'Authorizing…' : '正在授权…') : activity === 'configure' ? (isEn ? 'Configuring…' : '正在配置…') : activity === 'disconnect' ? (isEn ? 'Disconnecting…' : '正在停止同步…')
+                : activity === 'workspace-start' ? (isEn ? 'Starting workspace…' : '正在启动工作区…')
+                : activity === 'workspace-open' ? (isEn ? 'Opening workspace…' : '正在打开工作区…')
+                : activity === 'workspace-stop' ? (isEn ? 'Stopping workspace…' : '正在停止工作区…')
+                : (isEn ? 'Switching…' : '正在切换…'))
+                : isManaged ? canOpenManaged ? (isEn ? 'Open workspace' : '打开工作区') : (isEn ? 'Start and open' : '启动并打开')
+                : (isEn ? 'Switch account' : '切换账号')}
             </Button>
           </div>
         </form>

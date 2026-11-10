@@ -2,13 +2,17 @@
 
 Electron application source. See the [project README](../README.md), [stable download](https://github.com/rw0104/kiroaccout/releases/latest) and [all releases](https://github.com/rw0104/kiroaccout/releases).
 
-This source targets **1.10.2 · Windows / macOS / Linux**. Release availability and assets are listed in Releases. Account binding and rotation protection have synthetic-data regression coverage; login and refresh with two real bound accounts have not been validated. See the release notes for this version's validation scope.
+This source targets **1.10.3 · Windows / macOS / Linux**. Release availability and assets are listed in Releases. Account binding and rotation protection have synthetic-data regression coverage; login and refresh with two real bound accounts have not been validated. See the release notes for this version's validation scope.
 
 Migration recovery: if changed legacy data blocks startup after upgrading, choose the recovery option to back up both generations and use the existing secure store. Legacy accounts and credentials are not merged automatically. Keep the entire data directory and its key for later comparison.
 
 Use Add Account → Online Login → Sign in on Kiro website for portal login. For exports, select all or selected accounts, then Backup JSON or Credential JSON. Credentials are excluded by default; that export cannot restore login. Explicitly opt in to include credentials when needed and keep the resulting plain-text file private.
 
 The account power button now opens an IDE / Crew / CLI picker, defaulting to IDE each time. IDE switching and sign-out retain their existing behavior. New Windows connections support official CLI 3.1.0 and Crew 0.12.0. They project short-lived access only, without sharing the manager's refresh token or changing its refresh settings. Keep the manager running; access can pause if its existing refresh is disabled or not ready. Disconnect stops synchronization and lets the client's existing access expire naturally. Stop the new CLI connection before using legacy CLI/Both switching. Crew uses its official bundled engine; conflicting local overrides are preserved and refused.
+
+The client picker has one **Kiro Crew** entry. On Windows it defaults to **Independent workspace**, which starts a manager-owned workspace using the installed official Crew 0.12.0. Choose **Start and open** to use its asynchronous model catalog compatibility fix. Select **Existing client** only to switch the account in your existing Crew; that mode does not start it. The official installation, default Crew data and original Crew connection stay unchanged. Use **Open workspace** or **Stop workspace** while it runs; stop before selecting another account. Exiting the manager also stops the workspace it started. This connection receives short-lived access only and depends on the manager's existing refresh flow.
+
+After upgrading to 1.10.3, close the CLI and explicitly reconnect an older CLI binding once to adopt the repaired Social provider and profile storage. Existing external sign-in changes are not silently overwritten.
 
 Security update: HTTPS proxy traffic verifies destination certificates, remote images are restricted to public addresses, and inference keys cannot use HTTP admin endpoints. Account data migrates to an OS-protected encrypted store on first launch. Unlock your OS keychain before starting; migrate between computers using an explicit credential export.
 
@@ -26,4 +30,4 @@ If missing or expired cache data or a changed IDE account prevents synchronizati
 
 The instance page provides observed state, graceful stop and restart. Unsaved changes can prevent closure; no automatic force kill is performed. Removing a configuration preserves profile files. Old RC Windows-user configurations are inactive and must be recreated. Network, proxy, certificates, the Windows identity and DPAPI remain shared; this is not a security sandbox. A separate install directory or ZIP does not isolate the account manager itself.
 
-[1.10.2 notes](../docs/releases/v1.10.2.md) · [AGPL-3.0](../LICENSE) · [Source attribution](../docs/NOTICE.md) · [中文](README_CN.md)
+[1.10.3 notes](../docs/releases/v1.10.3.md) · [AGPL-3.0](../LICENSE) · [Source attribution](../docs/NOTICE.md) · [中文](README_CN.md)

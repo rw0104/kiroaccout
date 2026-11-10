@@ -12,6 +12,13 @@ import { createCrewAccessAdapter } from './crewAccessAdapter'
 const exec = promisify(execFile)
 export interface ClientRuntimeConfig { executablePath: string; dataHome?: string }
 export interface ClientRuntimeProbe { valid: boolean; publisher: string; version: string }
+export interface CrewInstallationInfo {
+  executablePath: string
+  pythonExecutable: string
+  bundleDirectory: string
+  revision: string
+  version: string
+}
 export interface ClientRuntimeDependencies {
   readConfig(target: ExternalClientTarget): ClientRuntimeConfig | undefined
   writeConfig(target: ExternalClientTarget, config: ClientRuntimeConfig): void
@@ -212,6 +219,16 @@ export class ClientRuntimeRegistry {
       return undefined
     }
     return undefined
+  }
+
+  /** Read-only installation metadata; no authentication or process startup. */
+  async crewInstallation(): Promise<CrewInstallationInfo | undefined> {
+    const runtime = await this.get('crew')
+    const cached = this.cache.get('crew')
+    if (!runtime || !cached || cached.runtime !== runtime || !this.adapter(runtime.id)) return undefined
+    const backend = join(dirname(cached.executablePath), 'resources/backend-dist')
+    return { executablePath: cached.executablePath, pythonExecutable: join(backend, 'kirocrew-backend/python.exe'),
+      bundleDirectory: join(backend, 'kas'), revision: runtime.revision, version: runtime.version }
   }
 
   private async resolve(target: ExternalClientTarget, ticket: ConfigurationTicket): Promise<ClientSwitchRuntime | undefined> {

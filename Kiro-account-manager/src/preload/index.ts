@@ -1,5 +1,6 @@
 import type { AccountModelInfo } from '../shared/modelCatalog'
 import type { ClientSwitchApi } from '../shared/clientSwitch'
+import type { ManagedCrewApi } from '../shared/managedCrew'
 import type { ModelPreferencesResult, ModelPreferencesWrite } from '../shared/modelPreferences'
 import type { LogPage } from '../shared/logHistory'
 import type { WindowVisibilityState } from '../shared/windowVisibility'
@@ -19,6 +20,13 @@ import { electronAPI } from '@electron-toolkit/preload'
 
 // Custom APIs for renderer
 const api = {
+  managedCrew: {
+    inspect: accountId => ipcRenderer.invoke('managed-crew:inspect', accountId),
+    start: request => ipcRenderer.invoke('managed-crew:start', request),
+    open: request => ipcRenderer.invoke('managed-crew:open', request),
+    stop: request => ipcRenderer.invoke('managed-crew:stop', request),
+    chooseExecutable: () => ipcRenderer.invoke('managed-crew:choose-executable')
+  } satisfies ManagedCrewApi,
   clientSwitch: {
     inspect: accountId => ipcRenderer.invoke('client-switch:inspect', accountId),
     execute: request => ipcRenderer.invoke('client-switch:execute', request),
@@ -238,6 +246,7 @@ const api = {
     accessToken?: string
     expiresIn?: number
     profileArn?: string
+    startUrl?: string
     refreshToken: string
     clientId: string
     clientSecret: string
@@ -254,6 +263,7 @@ const api = {
       refreshToken: string
       expiresIn?: number
       clientSecretExpiresAt?: number
+      profileArn?: string
       subscriptionType: string
       subscriptionTitle: string
       usage: { current: number; limit: number }
@@ -288,9 +298,11 @@ const api = {
       clientId: string
       clientSecret: string
       clientSecretExpiresAt?: number
+      profileArn?: string
+      startUrl?: string
       region: string
       authMethod: string  // 'IdC' 或 'social'
-      provider: string    // 'BuilderId', 'Github', 'Google'
+      provider: string    // 'BuilderId', 'Enterprise', 'IAM_SSO', 'Github', 'Google'
     }
     error?: string
   }> => {
@@ -331,8 +343,8 @@ const api = {
     discover: () => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.discover),
     chooseExecutable: () => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.chooseExecutable)
   } satisfies KiroInstancesApi,
-  onKiroInstanceAccountUpdate: (callback: (info: { id: string; credentials: Record<string, unknown> }) => void): (() => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, info: { id: string; credentials: Record<string, unknown> }) => callback(info)
+  onKiroInstanceAccountUpdate: (callback: (info: { id: string; credentials: Record<string, unknown>; profileArn?: string }) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, info: { id: string; credentials: Record<string, unknown>; profileArn?: string }) => callback(info)
     ipcRenderer.on('kiro-instance-account-update', listener)
     return () => ipcRenderer.removeListener('kiro-instance-account-update', listener)
   },

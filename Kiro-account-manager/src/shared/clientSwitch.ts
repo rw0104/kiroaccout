@@ -7,6 +7,8 @@ export interface ClientSwitchCapability {
   status: 'ready' | 'blocked' | 'needs-login' | 'not-installed'
   message: string
   messageEn?: string
+  /** Whitelisted local preflight category; never contains account metadata. */
+  errorCode?: string
   runtimeId?: string
   revision?: string
   sharedTargets?: ExternalClientTarget[]

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useMemo } from 'react'
 import { Button, Card, CardContent, CardHeader, CardTitle, Input, Label, Select } from '../ui'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
-import type { SubscriptionType } from '@/types/account'
+import type { AccountCredentials, IdpType, SubscriptionType } from '@/types/account'
 import { X, Loader2, Download, Copy, Check, ExternalLink, Info, EyeOff } from 'lucide-react'
 import { parseAccountImportText } from '../../../../shared/accountImport'
 import type { ImportOutcome } from '../../../../shared/accountImport'
@@ -114,6 +114,16 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
     clientSecret: string
     region: string
     clientSecretExpiresAt?: number
+  } | null>(null)
+  const importedIdentityRef = useRef<{
+    refreshToken: string
+    clientId: string
+    clientSecret: string
+    region: string
+    authMethod: string
+    provider: string
+    profileArn?: string
+    startUrl?: string
   } | null>(null)
 
   // SSO Token 导入
@@ -536,6 +546,18 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           region: result.data.region,
           clientSecretExpiresAt: result.data.clientSecretExpiresAt
         }
+        importedIdentityRef.current = {
+          refreshToken: result.data.refreshToken,
+          clientId: result.data.clientId,
+          clientSecret: result.data.clientSecret,
+          region: result.data.region,
+          authMethod: result.data.authMethod || 'IdC',
+          provider: result.data.provider || 'BuilderId',
+          profileArn: result.data.profileArn?.trim() || undefined,
+          startUrl: result.data.provider === 'Enterprise' || result.data.provider === 'IAM_SSO'
+            ? result.data.startUrl?.trim() || undefined
+            : undefined
+        }
         setAuthMethod(result.data.authMethod as 'IdC' | 'social' || 'IdC')
         setProvider(result.data.provider || 'BuilderId')
         setError(null)
@@ -740,6 +762,15 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         importedRegistration.region === region
           ? importedRegistration.clientSecretExpiresAt
           : undefined
+      // Hidden imported metadata must follow the identity it came from. Editing
+      // a token, provider, region or registration invalidates that association.
+      const importedIdentity = importedIdentityRef.current
+      const matchingIdentity = importedIdentity?.refreshToken === refreshToken &&
+        importedIdentity.clientId === clientId && importedIdentity.clientSecret === clientSecret &&
+        importedIdentity.region === region && importedIdentity.authMethod === authMethod &&
+        importedIdentity.provider === provider ? importedIdentity : undefined
+      const profileArn = matchingIdentity?.profileArn
+      const startUrl = matchingIdentity?.startUrl
       const result = await window.api.verifyAccountCredentials({
         refreshToken,
         clientId,
@@ -747,12 +778,15 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         clientSecretExpiresAt,
         region,
         authMethod,
-        provider
+        provider,
+        profileArn,
+        startUrl
       })
 
       if (result.success && result.data) {
         const { email, userId } = result.data
         const providerName = provider || 'BuilderId'
+        const verifiedProfileArn = result.data.profileArn?.trim() || profileArn
         
         // 检查账户是否已存在
         if (isAccountExists(email, userId, providerName)) {
@@ -766,7 +800,8 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           email,
           userId,
           nickname: email ? email.split('@')[0] : undefined,
-          idp: providerName as 'BuilderId' | 'Github' | 'Google',
+          idp: providerName as IdpType,
+          profileArn: verifiedProfileArn,
           groupId: selectedGroupId,
           credentials: {
             accessToken: result.data.accessToken,
@@ -776,9 +811,11 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             clientSecret,
             clientSecretExpiresAt: result.data.clientSecretExpiresAt ?? clientSecretExpiresAt,
             region,
+            startUrl,
+            profileArn: verifiedProfileArn,
             expiresAt: result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000,
             authMethod,
-            provider: (provider || 'BuilderId') as 'BuilderId' | 'Github' | 'Google'
+            provider: providerName as AccountCredentials['provider']
           },
           subscription: {
             type: result.data.subscriptionType as SubscriptionType,
@@ -827,6 +864,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
 
   const resetForm = () => {
     importedRegistrationRef.current = null
+    importedIdentityRef.current = null
     setImportMode('login')
     setRefreshToken('')
     setClientId('')

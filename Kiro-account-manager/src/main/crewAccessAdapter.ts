@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { execFileSync, type ExecFileSyncOptionsWithStringEncoding } from 'node:child_process'
 import { lstatSync, readFileSync } from 'node:fs'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
-import { ClientAccessProjectionError, type AccessCredential, type ClientAccessProjectionAdapter } from './clientAccessProjection'
+import { ClientAccessProjectionError, projectableClientAccess, validateClientAccessIdentity, type AccessCredential, type ClientAccessProjectionAdapter } from './clientAccessProjection'
 
 const revisionFiles = ['kas/.vault/secrets.enc', 'kas/.vault/.vault_key', 'kas/signed-in', 'kas/signed-out'] as const
 const maxFileBytes = 16 * 1024 * 1024
@@ -94,18 +94,11 @@ export function readCrewAccessRevision(dataHome: string): string {
 
 function cleanAccess(access: Readonly<AccessCredential>): AccessCredential {
   const keys = Object.keys(access)
-  if (keys.some(key => !['accessToken', 'expiresAt', 'provider', 'authMethod', 'profileArn', 'region', 'startUrl'].includes(key)) ||
-      typeof access.accessToken !== 'string' || !access.accessToken.trim() || access.accessToken.length > 512 * 1024 ||
-      !Number.isFinite(access.expiresAt) || !['Google', 'Github', 'BuilderId', 'Enterprise'].includes(access.provider) ||
-      access.authMethod !== undefined && !['social', 'IdC'].includes(access.authMethod) ||
-      access.region !== undefined && (typeof access.region !== 'string' || !/^[a-z]{2}(?:-[a-z]+){1,3}-\d+$/.test(access.region)) ||
-      access.startUrl !== undefined && (typeof access.startUrl !== 'string' || access.startUrl.length > 2048) ||
-      access.profileArn !== undefined && (typeof access.profileArn !== 'string' || !access.profileArn || access.profileArn.length > 4096) ||
-      access.provider !== 'BuilderId' && !access.profileArn) {
+  if (keys.some(key => !['accessToken', 'expiresAt', 'provider', 'authMethod', 'profileArn', 'region', 'startUrl'].includes(key))) {
     throw new ClientAccessProjectionError('credential-unusable')
   }
-  const social = access.provider === 'Google' || access.provider === 'Github'
-  if (access.authMethod !== undefined && access.authMethod !== (social ? 'social' : 'IdC')) throw new ClientAccessProjectionError('credential-unusable')
+  validateClientAccessIdentity(access)
+  projectableClientAccess(access)
   return { accessToken: access.accessToken, expiresAt: access.expiresAt, provider: access.provider,
     ...(access.authMethod ? { authMethod: access.authMethod } : {}), ...(access.profileArn ? { profileArn: access.profileArn } : {}),
     ...(access.region ? { region: access.region } : {}) }

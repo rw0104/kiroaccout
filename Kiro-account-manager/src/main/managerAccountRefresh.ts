@@ -1,13 +1,18 @@
+import { normalizeProvider, resolveIdentity } from '../shared/authIdentity'
+import { normalizeRefreshProfileArn } from './authRefresh'
+
 export interface ManagerTokenRotationResult {
   success: boolean
   accessToken?: string
   refreshToken?: string
   expiresIn?: number
+  profileArn?: string
 }
 
 export interface ManagerTokenRotationUpdate {
   id: string
   credentials: Record<string, unknown>
+  profileArn?: string
 }
 
 const record = (value: unknown): value is Record<string, unknown> => {
@@ -42,15 +47,24 @@ export function applyManagerTokenRotation(
   for (const [id, account] of Object.entries(data.accounts)) {
     if (!record(account) || !record(account.credentials) ||
         account.credentials.refreshToken !== expectedRefreshToken) continue
+    const identity = resolveIdentity({ provider: account.credentials.provider,
+      authMethod: account.credentials.authMethod, idp: account.idp })
+    const idp = normalizeProvider(account.idp)
+    // Only a consistent Social identity can recover metadata from this response.
+    // An enterprise or contradictory alias must not inherit a personal profile.
+    const profileArn = identity.ok && identity.authMethod === 'social' &&
+      (idp === undefined || idp === identity.provider)
+      ? normalizeRefreshProfileArn(result.profileArn) : undefined
     const credentials = {
       ...account.credentials,
       accessToken: result.accessToken,
       refreshToken: result.refreshToken?.trim() ? result.refreshToken : expectedRefreshToken,
-      expiresAt
+      expiresAt,
+      ...(profileArn ? { profileArn } : {})
     }
     accounts ??= { ...data.accounts }
-    accounts[id] = { ...account, credentials }
-    updates.push({ id, credentials })
+    accounts[id] = { ...account, credentials, ...(profileArn ? { profileArn } : {}) }
+    updates.push({ id, credentials, ...(profileArn ? { profileArn } : {}) })
   }
   return accounts ? { data: { ...data, accounts }, updates } : unchanged
 }

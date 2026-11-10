@@ -14,7 +14,7 @@ const properties = []
 const helpers = []
 function visit(node) {
   if (ts.isPropertyAssignment(node) && names.includes(node.name?.getText(tree))) properties.push(node.getText(tree))
-  if (ts.isFunctionDeclaration(node) && ['credentialVersion', 'credentialResultDisposition', 'isDeferredAccountOperation', 'accountOperationCountsAfter', 'enqueueAccountPersistence', 'accountStorageSnapshot'].includes(node.name?.text)) helpers.push(node.getText(tree).replace(/^export /, ''))
+  if (ts.isFunctionDeclaration(node) && ['credentialVersion', 'credentialResultDisposition', 'isDeferredAccountOperation', 'accountOperationCountsAfter', 'enqueueAccountPersistence', 'accountStorageSnapshot', 'receivedProfileArn'].includes(node.name?.text)) helpers.push(node.getText(tree).replace(/^export /, ''))
   ts.forEachChild(node, visit)
 }
 visit(tree)
@@ -48,6 +48,68 @@ function fixture(api = {}) {
 }
 const success = (accessToken = 'SYNTHETIC_ACCESS_1', refreshToken = 'SYNTHETIC_REFRESH_1') => ({ success: true, data: { accessToken, refreshToken, expiresIn: 3600 } })
 const expected = { expectedRefreshToken: 'SYNTHETIC_REFRESH_0', expectedAccessToken: 'SYNTHETIC_ACCESS_0' }
+
+const oldProfile = 'arn:aws:codewhisperer:us-east-1:000000000000:profile/SYNTHETIC_OLD'
+const newProfile = 'arn:aws:codewhisperer:us-east-1:000000000000:profile/SYNTHETIC_NEW'
+function withProfile(accountValue, profile = oldProfile) {
+  return { ...accountValue, idp: 'Google', profileArn: profile, credentials: { ...accountValue.credentials, provider: 'Google', authMethod: 'social', profileArn: profile } }
+}
+function profileResponse(kind, profileArn) {
+  const data = { ...success().data, profileArn, expiresAt: 67890 }
+  return kind === 'manual' || kind === 'background'
+    ? { success: true, data }
+    : { success: kind !== 'check-error', data: { status: 'active', newCredentials: data }, error: { message: 'Synthetic follow-up failure' } }
+}
+async function applyProfileResult(ctx, kind, response) {
+  if (kind === 'background') ctx.actions.applyBackgroundRefreshResults([{ id: 'synthetic', ...expected, ...response }])
+  else await ctx.actions[kind === 'manual' ? 'refreshAccountToken' : 'checkAccountStatus']('synthetic')
+}
+
+test('all refresh result entry points persist a nonempty returned Social profile alongside its credential generation', async () => {
+  for (const kind of ['manual', 'background', 'check-success', 'check-error']) {
+    const response = profileResponse(kind, ` ${newProfile} `)
+    const ctx = fixture({ refreshAccountToken: async () => response, checkAccountStatus: async () => response })
+    ctx.replace(withProfile(account()))
+    await applyProfileResult(ctx, kind, response)
+    assert.equal(ctx.current().profileArn, newProfile, kind)
+    assert.equal(ctx.current().credentials.profileArn, newProfile, kind)
+    assert.equal(ctx.current().credentials.accessToken, 'SYNTHETIC_ACCESS_1')
+    await ctx.actions.flushSaveImmediately()
+    assert.equal(ctx.writes.at(-1).accounts.synthetic.profileArn, newProfile)
+    assert.equal(ctx.writes.at(-1).accounts.synthetic.credentials.profileArn, newProfile)
+  }
+})
+
+test('omitted, blank and malformed returned profiles preserve both saved fields without hiding a preexisting conflict', async () => {
+  for (const kind of ['manual', 'background', 'check-success', 'check-error']) {
+    for (const profileArn of [undefined, '', '  ', null, 123, {}]) {
+      const response = profileResponse(kind, profileArn)
+      const ctx = fixture({ refreshAccountToken: async () => response, checkAccountStatus: async () => response })
+      const original = withProfile(account())
+      original.profileArn = `${oldProfile}_TOP`
+      ctx.replace(original)
+      await applyProfileResult(ctx, kind, response)
+      assert.equal(ctx.current().profileArn, `${oldProfile}_TOP`, kind)
+      assert.equal(ctx.current().credentials.profileArn, oldProfile, kind)
+    }
+  }
+})
+
+test('stale and duplicate refresh replies cannot restore an older profile over the current generation', async () => {
+  for (const kind of ['manual', 'background', 'check-success', 'check-error']) {
+    for (const duplicate of [false, true]) {
+      const response = profileResponse(kind, oldProfile)
+      const wait = deferred()
+      const ctx = fixture({ refreshAccountToken: () => wait.promise, checkAccountStatus: () => wait.promise })
+      const pending = kind === 'background' ? undefined : applyProfileResult(ctx, kind, response)
+      const current = withProfile(account(duplicate ? 'SYNTHETIC_ACCESS_1' : 'SYNTHETIC_ACCESS_2', duplicate ? 'SYNTHETIC_REFRESH_1' : 'SYNTHETIC_REFRESH_2'), newProfile)
+      ctx.replace(current)
+      if (kind === 'background') await applyProfileResult(ctx, kind, response)
+      else { wait.resolve(response); await pending }
+      assert.equal(ctx.current(), current, kind)
+    }
+  }
+})
 
 test('manual refresh cannot overwrite a newer credential generation that arrives while IPC is pending', async () => {
   for (const refresh of ['SYNTHETIC_REFRESH_2', 'SYNTHETIC_REFRESH_0']) {

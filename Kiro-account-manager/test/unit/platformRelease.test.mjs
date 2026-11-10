@@ -8,6 +8,7 @@ import { spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { releaseArtifactNames, releaseTargets, checksumFilename } from '../../scripts/lib/releaseArtifacts.mjs'
 import { verifyBinaryArchitecture } from '../../scripts/lib/platformResources.mjs'
+import vm from 'node:vm'
 
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const metadata = JSON.parse(readFileSync(join(appRoot, 'package.json'), 'utf8'))
@@ -129,4 +130,33 @@ test('binary inspection rejects a mismatched architecture and truncated native b
   assert.doesNotThrow(() => verifyBinaryArchitecture(macho, 'darwin', 'arm64'))
   assert.throws(() => verifyBinaryArchitecture(macho, 'darwin', 'x64'), /Expected macOS x64/)
   assert.throws(() => verifyBinaryArchitecture(Buffer.alloc(16), 'win32', 'x64'), /truncated/)
+})
+
+test('manual four-platform validation cannot enter the publishing job, including a tag-selected manual run', () => {
+  const require = createRequire(import.meta.url)
+  const workflow = require('js-yaml').load(readFileSync(join(appRoot, '../.github/workflows/build.yml'), 'utf8'))
+  assert.ok(Object.hasOwn(workflow.on, 'workflow_dispatch'))
+  assert.deepEqual(workflow.on.push.tags, ['v*'])
+  assert.deepEqual(workflow.jobs.release.needs, ['version', 'build'])
+  const guard = workflow.jobs.release.if
+  assert.equal(typeof guard, 'string')
+  for (const [event_name, ref_type, expected] of [
+    ['push', 'tag', true], ['push', 'branch', false], ['workflow_dispatch', 'tag', false], ['workflow_dispatch', 'branch', false]
+  ]) {
+    assert.equal(vm.runInNewContext(guard, { github: { event_name, ref_type } }), expected)
+  }
+})
+
+test('release validation binds the current package and lockfile to public notes and the four native build targets', () => {
+  const checked = run('release-version.mjs')
+  assert.equal(checked.status, 0, checked.stderr)
+  const fields = Object.fromEntries(checked.stdout.trim().split(/\r?\n/).map(line => {
+    const split = line.indexOf('=')
+    return [line.slice(0, split), line.slice(split + 1)]
+  }))
+  assert.equal(fields.version, metadata.version)
+  assert.equal(fields.tag, `v${metadata.version}`)
+  assert.deepEqual(JSON.parse(fields.matrix).include.map(({ platform, arch }) => ({ platform, arch })), releaseTargets(metadata.version))
+  const note = readFileSync(join(appRoot, '../docs/releases', `${fields.tag}.md`), 'utf8')
+  assert.doesNotMatch(note, /private-docs|\.local[\\/]|[A-Z]:[\\/]Users[\\/]/)
 })

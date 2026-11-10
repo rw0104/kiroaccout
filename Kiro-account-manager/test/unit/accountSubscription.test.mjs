@@ -88,7 +88,7 @@ const ts = createRequire(import.meta.url)('typescript')
 const source = readFileSync(new URL('../../src/renderer/src/store/accounts.ts', import.meta.url), 'utf8')
 const tree = ts.createSourceFile('accounts.ts', source, ts.ScriptTarget.Latest, true)
 const actionNames = ['addAccount', 'updateAccount', 'getFilteredAccounts', 'getStats', 'loadFromStorage', 'checkAccountStatus', 'applyBackgroundRefreshResults', 'applyBackgroundCheckResults']
-const helperNames = ['credentialVersion', 'credentialResultDisposition', 'isDeferredAccountOperation', 'isBannedAccountError', 'accountOperationCountsAfter']
+const helperNames = ['credentialVersion', 'credentialResultDisposition', 'isDeferredAccountOperation', 'isBannedAccountError', 'accountOperationCountsAfter', 'receivedProfileArn']
 const actions = [], helpers = []
 function visit(node) {
   if (ts.isPropertyAssignment(node) && actionNames.includes(node.name?.getText(tree))) actions.push(node.getText(tree))
