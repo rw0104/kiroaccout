@@ -45,6 +45,60 @@ function enableSourceNameUpdates(ctx) {
   }
 }
 
+test('JSON arrays, mixed whitespace and bracketed card labels submit the same complete OIDC credentials', async () => {
+  const expected = credential()
+  for (const text of [
+    JSON.stringify(expected, null, 8),
+    JSON.stringify([expected], null, 8),
+    'synthetic-label\tpassword  SYNTHETIC_REFRESH\u00a0\u00a0SYNTHETIC_CLIENT\tSYNTHETIC_SECRET',
+    '[synthetic-label]----p[w] with one space----SYNTHETIC_REFRESH----SYNTHETIC_CLIENT----SYNTHETIC_SECRET'
+  ]) {
+    const ctx = fixture()
+    const plan = parseAccountImportText(text)
+    assert.equal(plan.counts.valid, 1)
+    const outcome = await executeCredentialImport(plan, ctx.deps)
+    assert.equal(outcome.added, plan.counts.valid)
+    assert.equal(ctx.calls.length, 1)
+    assert.equal(ctx.calls[0].provider, 'BuilderId')
+    assert.equal(ctx.calls[0].authMethod, 'IdC')
+    for (const field of ['refreshToken', 'clientId', 'clientSecret']) {
+      assert.equal(ctx.calls[0][field], expected[field])
+    }
+    assert.equal(ctx.saves, 1)
+    assert.ok(isOutcomeBalanced(outcome))
+  }
+})
+
+test('token-only JSON never verifies or persists until the required identity fields are supplied', async () => {
+  const tokens = { accessToken: 'SYNTHETIC_ACCESS_ONLY', refreshToken: 'SYNTHETIC_REFRESH_ONLY' }
+  for (const input of [tokens, [tokens], { ...tokens, provider: 'BuilderId' }, [{ ...tokens, authMethod: 'OIDC' }]]) {
+    for (const indent of [undefined, 8]) {
+      const ctx = fixture()
+      const plan = parseAccountImportText(JSON.stringify(input, null, indent))
+      assert.equal(plan.ok, true)
+      assert.equal(plan.format, 'json')
+      const outcome = await executeCredentialImport(plan, ctx.deps)
+      assert.equal(outcome.invalid, 1)
+      assert.equal(outcome.added, 0)
+      assert.equal(ctx.calls.length, 0)
+      assert.equal(ctx.stored.length, 0)
+      assert.equal(ctx.saves, 0)
+      assert.ok(isOutcomeBalanced(outcome))
+    }
+  }
+  for (const provider of ['Google', 'Github']) {
+    const ctx = fixture()
+    const outcome = await executeCredentialImport(parseAccountImportText(JSON.stringify([{ ...tokens, provider }], null, 8)), ctx.deps)
+    assert.equal(outcome.added, 1)
+    assert.equal(ctx.calls.length, 1)
+    assert.equal(ctx.calls[0].provider, provider)
+    assert.equal(ctx.calls[0].authMethod, 'social')
+    assert.equal(ctx.calls[0].clientId, undefined)
+    assert.equal(ctx.calls[0].clientSecret, undefined)
+    assert.equal(ctx.saves, 1)
+  }
+})
+
 test('verified email and nickname remain authoritative while the original account is retained for search', async () => {
   const ctx = fixture()
   const plan = parseAccountImportText(JSON.stringify(credential({ email: 'synthetic-import-name' })))

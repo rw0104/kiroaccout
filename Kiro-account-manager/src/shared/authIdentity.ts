@@ -170,5 +170,9 @@ export function resolveIdentity(input: IdentityInput): IdentityResult {
     warnings.push('未指定 provider/authMethod，根据 clientId/clientSecret 按 Builder ID (IdC) 处理')
     return { ok: true, provider: 'BuilderId', authMethod: 'IdC', inferred: true, warnings }
   }
-  return { ok: false, code: 'missing_provider', message: '缺少可识别的 provider 或完整 OIDC clientId/clientSecret，无法判断认证方式' }
+  return {
+    ok: false,
+    code: 'missing_provider',
+    message: '无法判断认证方式：Google/Github 凭证请填写 provider=Google 或 provider=Github；Builder ID/OIDC 凭证请补齐 clientId 和 clientSecret（企业账号还需明确填写 provider）'
+  }
 }

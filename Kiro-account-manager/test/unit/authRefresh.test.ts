@@ -1,5 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
+import { fetch as undiciFetch } from 'undici'
 import { TokenRefreshService } from '../../src/main/authRefresh'
 
 const credential = { kind: 'IdC' as const, refreshToken: 'SYNTHETIC_REFRESH', clientId: 'SYNTHETIC_CLIENT', clientSecret: 'SYNTHETIC_SECRET', region: 'us-east-1' }
@@ -282,4 +284,94 @@ test('refresh failures distinguish temporary responses, permanent credentials an
   assert.equal((await service.refresh(credential)).failureKind, 'uncertain')
   assert.equal((await service.refresh(credential)).failureKind, 'uncertain')
   assert.equal(calls, 1)
+})
+
+test('connection setup failures allow a later explicit refresh without automatically replaying the POST', async () => {
+  const setupError = (code: string) => Object.assign(new Error('SYNTHETIC_PRIVATE_CONNECTION'), { code })
+  for (const cause of [
+    ...['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'UND_ERR_CONNECT_TIMEOUT'].map(setupError),
+    new AggregateError([setupError('ECONNREFUSED'), setupError('ENOTFOUND')])
+  ]) {
+    let calls = 0
+    const service = new TokenRefreshService(dependencies(async () => {
+      calls++
+      if (calls === 1) throw new TypeError('fetch failed', { cause })
+      return response(good)
+    }))
+    const failed = await service.refresh(credential)
+    assert.equal(failed.errorCode, 'network')
+    assert.equal(failed.failureKind, 'temporary')
+    assert.doesNotMatch(JSON.stringify(failed), /SYNTHETIC_PRIVATE_CONNECTION/)
+    assert.equal(calls, 1, 'the first attempt never automatically retries')
+    assert.equal((await service.refresh(credential)).success, true)
+    assert.equal(calls, 2, 'the next explicit call can recover in the same process')
+  }
+})
+
+test('real fetch connection refusal recovers in the same service after the local listener returns', async () => {
+  for (const fetcher of [fetch, undiciFetch]) {
+    let delivered = 0
+    const server = createServer((request, reply) => {
+      delivered++
+      request.resume()
+      reply.writeHead(200, { 'Content-Type': 'application/json', Connection: 'close' })
+      reply.end(JSON.stringify(good))
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    assert.ok(address && typeof address === 'object')
+    const port = address.port
+    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+    let calls = 0
+    const service = new TokenRefreshService(dependencies(async (_url, init) => {
+      calls++
+      return await fetcher(`http://127.0.0.1:${port}/token`, init)
+    }))
+    const failed = await service.refresh(credential)
+    assert.equal(calls, 1)
+    assert.equal(delivered, 0)
+    await new Promise<void>(resolve => server.listen(port, '127.0.0.1', resolve))
+    try {
+      const recovered = await service.refresh(credential)
+      assert.equal(failed.failureKind, 'temporary')
+      assert.equal(recovered.success, true)
+      assert.equal(calls, 2)
+      assert.equal(delivered, 1)
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()))
+    }
+  }
+})
+
+test('unknown failures, mixed connection outcomes and response read failures remain uncertain', async () => {
+  const setup = Object.assign(new Error('SYNTHETIC_PRIVATE'), { code: 'ENOTFOUND' })
+  const socket = Object.assign(new Error('SYNTHETIC_PRIVATE'), { code: 'ECONNRESET' })
+  const cyclic: { cause?: unknown } = {}
+  cyclic.cause = cyclic
+  for (const error of [new Error('SYNTHETIC_PRIVATE'), socket,
+    ...['ETIMEDOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_SOCKET'].map(code => Object.assign(new Error(), { code })),
+    new AggregateError([setup, socket]), new AggregateError([]), cyclic,
+    Object.assign(new AggregateError([setup]), { code: 'ECONNRESET' }),
+    Object.assign(new Error(), { code: 'ECONNRESET', cause: setup })]) {
+    let calls = 0
+    const service = new TokenRefreshService(dependencies(async () => { calls++; throw new TypeError('fetch failed', { cause: error }) }))
+    assert.equal((await service.refresh(credential)).failureKind, 'uncertain')
+    assert.equal((await service.refresh(credential)).failureKind, 'uncertain')
+    assert.equal(calls, 1)
+  }
+  for (const status of [200, 503]) {
+    let calls = 0
+    const service = new TokenRefreshService(dependencies(async () => {
+      calls++
+      return { ok: status === 200, status, json: async () => { throw setup } }
+    }))
+    const first = await service.refresh(credential)
+    if (status === 200) {
+      assert.equal(first.failureKind, 'uncertain', 'receiving headers proves the request was sent')
+      assert.equal((await service.refresh(credential)).failureKind, 'uncertain')
+      assert.equal(calls, 1)
+    } else {
+      assert.equal(first.failureKind, 'temporary', 'a confirmed HTTP 503 keeps its existing classification')
+    }
+  }
 })

@@ -118,7 +118,7 @@ export function preprocessImportText(text: string): { ok: true; text: string } |
 }
 
 /**
- * 卡密行分隔：优先 `----`，其次 Tab，最后连续空格。
+ * 卡密行分隔：优先 `----`；否则支持混用 Tab 与连续水平空格。
  * 连续 N 个连字符视为 ⌊N/4⌋ 个分隔符（中间为空字段），余下 N%4 个连字符归入前一字段。
  * 这样导出端以 `----` 连接空 clientId/clientSecret 生成的 `RT------------Github` 能还原为 6 个字段
  * （旧实现把整段连字符当成 1 个分隔符，Github 会落到 clientId 位置，见分析文档 F-09）。
@@ -139,8 +139,9 @@ export function splitCredentialLine(line: string): string[] {
     parts.push(line.slice(last))
     return parts
   }
-  if (line.includes('\t')) return line.split('\t')
-  return line.split(/\s{2,}/)
+  // Spaces around a Tab are padding, not additional separators. Match exactly
+  // one Tab at a time so adjacent/padded Tabs retain empty client slots.
+  return line.split(/[^\S\t\r\n]*\t[^\S\t\r\n]*|[^\S\t\r\n]{2,}/)
 }
 
 function hasLineSeparator(line: string): boolean {
@@ -602,7 +603,8 @@ export function planFromLines(text: string): ImportPlan {
 
 /**
  * 解析导入文本（文件内容或粘贴文本）的唯一入口。
- * 以 `{` 或 `[` 开头按 JSON 解析；语法错误直接报告，不降级为卡密格式。
+ * 以 `{` 或 `[` 开头优先按 JSON 解析；只有带方括号标签的完整有效卡密可回退。
+ * JSON 数组/对象语法错误仍直接报告，不按字符串里的分隔符猜测卡密格式。
  */
 export function parseAccountImportText(text: string): ImportPlan {
   const pre = preprocessImportText(text)
@@ -614,6 +616,15 @@ export function parseAccountImportText(text: string): ImportPlan {
     try {
       value = JSON.parse(t)
     } catch {
+      // A card's original account label may itself be bracketed. Require that
+      // exact first-field shape and validate every row before accepting it;
+      // JSON object/array fragments must not be reinterpreted as credentials.
+      const firstLine = t.split(/\r?\n/, 1)[0]
+      const firstField = splitCredentialLine(firstLine)[0]?.trim() ?? ''
+      if (/^\[[^[\]{}"]*\]$/.test(firstField)) {
+        const lines = planFromLines(t)
+        if (lines.ok && lines.counts.total > 0 && lines.counts.invalid === 0) return lines
+      }
       // JSON.parse 的异常可能包含原始输入片段，包括 Token 或邮箱。
       return failPlan('json_syntax', 'JSON 语法错误：请检查引号、逗号及括号是否完整', 'json')
     }

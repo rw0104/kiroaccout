@@ -44,6 +44,23 @@ const nonempty = (value: unknown): value is string => typeof value === 'string' 
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 const failure = (errorCode: AuthRefreshResult['errorCode'], error: string, failureKind: AuthRefreshResult['failureKind'] = 'reauth-required'): AuthRefreshResult => ({ success: false, errorCode, error, failureKind })
 
+// These codes establish that no connection was made, so no refresh POST was sent.
+// Socket resets, generic timeouts and unknown errors may hide a completed rotation.
+const connectionSetupCodes = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'UND_ERR_CONNECT_TIMEOUT'])
+function failedBeforeConnection(error: unknown, depth = 0): boolean {
+  if (!error || typeof error !== 'object' || depth >= 8) return false
+  const detail = error as { code?: unknown; cause?: unknown; errors?: unknown }
+  if (detail.code !== undefined && (typeof detail.code !== 'string' || !connectionSetupCodes.has(detail.code))) return false
+  // Node may aggregate IPv4/IPv6 failures. Every attempt must be known to be unsent.
+  if (detail.errors !== undefined) {
+    return Array.isArray(detail.errors) && detail.errors.length > 0 &&
+      detail.errors.every(item => failedBeforeConnection(item, depth + 1))
+  }
+  if (detail.code !== undefined) return true
+  // Fetch wraps transport errors in a TypeError; inspect structured causes only.
+  return failedBeforeConnection(detail.cause, depth + 1)
+}
+
 /** One refresh per credential across manual refresh, verification and background jobs.
  * Successful rotation is briefly replayed so a late caller cannot consume the old token twice.
  * POSTs are never automatically retried: a lost response may already have rotated the token.
@@ -162,6 +179,7 @@ export class TokenRefreshService {
   private async perform(input: AuthRefreshInput, region: string): Promise<AuthRefreshResult> {
     const controller = new AbortController()
     let timedOut = false
+    let responseReceived = false
     let timer: ReturnType<typeof setTimeout> | undefined
     const deadline = new Promise<AuthRefreshResult>(resolve => {
       timer = setTimeout(() => {
@@ -182,6 +200,7 @@ export class TokenRefreshService {
         const response = await this.deps.fetch(url, {
           method: 'POST', headers, body: JSON.stringify(payload), signal: controller.signal, redirect: 'error'
         }, input.proxyUrl)
+        responseReceived = true
         if (!response.ok) {
           // Do not return server bodies, URLs, tokens or transport exception text to the UI.
           const data = await response.json().catch(() => ({}))
@@ -205,7 +224,10 @@ export class TokenRefreshService {
           return failure('invalid-response', '刷新响应缺少有效凭证或有效期，请重新授权或同步最新凭证', 'uncertain')
         }
         return { success: true, accessToken: data.accessToken, refreshToken: data.refreshToken as string | undefined || input.refreshToken, expiresIn: data.expiresIn }
-      } catch {
+      } catch (error) {
+        if (!timedOut && !responseReceived && failedBeforeConnection(error)) {
+          return failure('network', '无法建立刷新连接，请检查网络或代理后重试', 'temporary')
+        }
         return timedOut ? failure('timeout', '刷新请求超时，结果尚不确定，请重新授权或同步最新凭证', 'uncertain')
           : failure('network', '刷新连接失败，结果尚不确定，请重新授权或同步最新凭证', 'uncertain')
       }

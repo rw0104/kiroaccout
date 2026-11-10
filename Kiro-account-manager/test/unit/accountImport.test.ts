@@ -93,6 +93,43 @@ test('missing identity never silently defaults to Google', () => {
   }
 })
 
+test('token-only objects and arrays parse as JSON but require explicit authentication identity', () => {
+  const tokens = { accessToken: 'FAKE_ACCESS_ONLY', refreshToken: 'FAKE_REFRESH_ONLY' }
+  for (const input of [tokens, [tokens]]) {
+    for (const indent of [undefined, 8]) {
+      const plan = parseAccountImportText(JSON.stringify(input, null, indent))
+      assert.equal(plan.ok, true)
+      assert.equal(plan.format, 'json')
+      assert.deepEqual(plan.counts, { total: 1, valid: 0, invalid: 1, duplicate: 0 })
+      assert.equal(plan.records[0].credential, undefined)
+      assert.deepEqual(plan.records[0].issues.map(issue => issue.code), ['missing_provider'])
+      const message = plan.records[0].issues[0].message
+      assert.match(message, /provider=Google/)
+      assert.match(message, /provider=Github/)
+      assert.match(message, /clientId.*clientSecret/)
+      assert.ok(!message.includes(tokens.accessToken) && !message.includes(tokens.refreshToken))
+    }
+  }
+})
+
+test('token-only JSON becomes valid with a Social provider while IdC still requires both client fields', () => {
+  const tokens = { accessToken: 'FAKE_ACCESS_ONLY', refreshToken: 'FAKE_REFRESH_ONLY' }
+  for (const provider of ['Google', 'Github']) {
+    const plan = parseAccountImportText(JSON.stringify([{ ...tokens, provider }], null, 8))
+    assert.equal(plan.counts.valid, 1)
+    assert.equal(plan.records[0].credential?.provider, provider)
+    assert.equal(plan.records[0].credential?.authMethod, 'social')
+    assert.equal(plan.records[0].credential?.clientId, undefined)
+    assert.equal(plan.records[0].credential?.clientSecret, undefined)
+  }
+  for (const identity of [{ provider: 'BuilderId' }, { authMethod: 'OIDC' }]) {
+    const plan = parseAccountImportText(JSON.stringify([{ ...tokens, ...identity }], null, 8))
+    assert.equal(plan.counts.invalid, 1)
+    assert.equal(plan.records[0].credential, undefined)
+    assert.ok(plan.records[0].issues.some(issue => issue.code === 'missing_field' && issue.field === 'clientId,clientSecret'))
+  }
+})
+
 test('identity errors do not expose arbitrary user input', () => {
   const marker = 'SENSITIVE_SYNTHETIC_VALUE'
   for (const input of [{ provider: marker }, { idp: marker }, { authMethod: marker }]) {
@@ -237,6 +274,18 @@ test('BOM, outer whitespace, and complete Markdown fences are accepted', () => {
   }
 })
 
+test('JSON accepts outer clipboard whitespace without rewriting whitespace inside quoted credentials', () => {
+  for (const space of [' ', '\u00a0', '\u3000']) {
+    const body = JSON.stringify([{ ...bid, refreshToken: `FAKE${space}RT` }])
+    const plan = parseAccountImportText(`${space}${space}${body}${space}${space}`)
+    assert.equal(plan.counts.valid, 1)
+    assert.equal(plan.records[0].credential?.refreshToken, `FAKE${space}RT`)
+    const spacedJson = body.replace('[{', `[{${space}${space}`)
+    if (space === ' ') assert.equal(parseAccountImportText(spacedJson).counts.valid, 1)
+    else assert.equal(parseAccountImportText(spacedJson).error?.code, 'json_syntax')
+  }
+})
+
 test('incomplete fences and invalid JSON are not retried as credential lines', () => {
   assert.equal(parseAccountImportText('```json\n[{"refreshToken":"x"}]').error?.code, 'incomplete_code_fence')
   assert.equal(parseAccountImportText('[{"refreshToken":"x",}]').error?.code, 'json_syntax')
@@ -332,6 +381,64 @@ test('credential-line delimiter preserves empty client slots and token hyphens',
   assert.deepEqual(splitCredentialLine(exported), ['s@example.invalid', 'no_password', 'FAKE_RT_S', '', '', 'Github'])
   assert.equal(parseAccountImportText(exported).records[0].credential?.authMethod, 'social')
   assert.deepEqual(splitCredentialLine('a----tok-----c'), ['a', 'tok-', 'c'])
+})
+
+test('credential lines accept mixed tabs and repeated horizontal spaces without dropping empty tab fields', () => {
+  const fields = ['synthetic-label', 'p[w] with one space', 'FAKE_RT_MIXED', 'FAKE_CLIENT', 'FAKE_SECRET', 'BuilderId']
+  for (const space of [' ', '\u00a0', '\u3000']) {
+    for (const separators of [
+      [space.repeat(2), '\t', space.repeat(4), '\t', space.repeat(2)],
+      ['\t', space.repeat(2), '\t', space.repeat(4), '\t']
+    ]) {
+      const text = fields.map((field, index) => field + (separators[index] || '')).join('')
+      const plan = parseAccountImportText(text)
+      assert.equal(plan.counts.valid, 1)
+      assert.equal(plan.records[0].credential?.password, fields[1])
+      assert.equal(plan.records[0].credential?.refreshToken, fields[2])
+    }
+  }
+  const social = parseAccountImportText('synthetic-label  p[w]\tFAKE_RT_SOCIAL\t\t\tGithub')
+  assert.equal(social.counts.valid, 1)
+  assert.equal(social.records[0].credential?.provider, 'Github')
+  assert.equal(social.records[0].credential?.clientId, undefined)
+  assert.equal(social.records[0].credential?.clientSecret, undefined)
+})
+
+test('spaces padding tab separators do not create extra fields or consume empty tab slots', () => {
+  for (const space of [' ', '\u00a0', '\u3000']) {
+    const padding = space.repeat(2)
+    const fields = ['synthetic-label', 'p[w] with one space', 'FAKE_RT_PADDED', 'FAKE_CLIENT', 'FAKE_SECRET']
+    const plan = parseAccountImportText(fields.join(`${padding}\t${padding}`))
+    assert.equal(plan.counts.valid, 1)
+    assert.equal(plan.records[0].credential?.password, fields[1])
+    assert.equal(plan.records[0].credential?.refreshToken, fields[2])
+    const social = parseAccountImportText(`synthetic-label${padding}p[w]\tFAKE_RT_SOCIAL\t${padding}\t${padding}\tGithub`)
+    assert.equal(social.counts.valid, 1)
+    assert.equal(social.records[0].credential?.provider, 'Github')
+    assert.equal(social.records[0].credential?.clientId, undefined)
+    assert.equal(social.records[0].credential?.clientSecret, undefined)
+  }
+})
+
+test('a complete credential line can start with a bracketed source label', () => {
+  for (const separator of ['----', '\t', '  ', '\u00a0\u00a0', '\u3000\u3000']) {
+    const plan = parseAccountImportText(['[synthetic-label]', 'p[w]', 'FAKE_RT_BRACKET', 'FAKE_CLIENT', 'FAKE_SECRET'].join(separator))
+    assert.equal(plan.format, 'lines')
+    assert.equal(plan.counts.valid, 1)
+    assert.equal(plan.records[0].credential?.email, '[synthetic-label]')
+    assert.equal(plan.records[0].credential?.password, 'p[w]')
+  }
+})
+
+test('malformed JSON arrays never fall back to credential lines based on delimiters inside strings', () => {
+  for (const text of [
+    '[{"refreshToken":"FAKE_RT----piece----piece----piece----piece",}]',
+    '["synthetic-label"]----pw----FAKE_RT----FAKE_CLIENT----FAKE_SECRET',
+    '[synthetic-label]----pw----FAKE_RT',
+    '[synthetic-label]----pw----FAKE_RT----FAKE_CLIENT----FAKE_SECRET\ninvalid sibling'
+  ]) {
+    assert.equal(parseAccountImportText(text).error?.code, 'json_syntax')
+  }
 })
 
 test('timestamps normalize seconds, milliseconds and ISO without inventing validity', () => {
