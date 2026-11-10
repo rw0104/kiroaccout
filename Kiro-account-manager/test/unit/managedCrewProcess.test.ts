@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { spawn, SpawnOptions } from 'node:child_process'
@@ -43,7 +43,9 @@ class FakeChild extends EventEmitter {
 }
 
 function fixture(t: { after(fn: () => void): void }, options: Partial<ManagedCrewProcessOptions> = {}) {
-  const directory = mkdtempSync(join(tmpdir(), 'managed-crew-process-'))
+  // macOS exposes its temporary root through /var -> /private/var. Use the
+  // canonical fixture root so the production anti-link checks keep their force.
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'managed-crew-process-')))
   t.after(() => rmSync(directory, { recursive: true, force: true }))
   const root = join(directory, 'managed-crew/workspace-v1')
   const resources = join(directory, 'resources')
