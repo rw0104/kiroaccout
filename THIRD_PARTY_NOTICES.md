@@ -11,9 +11,3 @@ The current project repository is [rw0104/kiroaccout](https://github.com/rw0104/
 The application uses third-party packages including Electron, React, TypeScript, Zustand, Tailwind CSS, Vite, Lucide and Microsoft jsonc-parser and PeculiarVentures X.509 packages (MIT). Their license notices remain in the distributed packages where applicable; the project's AGPL license does not replace dependency licenses.
 
 Kiro and other product names, logos and service identifiers belong to their respective owners. This project does not claim to be an official Kiro product or to own those marks.
-
-## Kiro Crew compatibility resources
-
-The managed Crew compatibility resources are derived from [KiroCrew v0.12.0](https://github.com/kirodotdev/KiroCrew/tree/f315771db6a95704d129c7b722340a676d6bb8a4), published by kirodotdev under the Apache License, Version 2.0. The upstream copyright and license notices, full Apache-2.0 text, exact source revision and modification notices accompany these files in `resources/crew-managed/` as `LICENSE.KiroCrew`, `NOTICE.KiroCrew` and `manifest.json`.
-
-The compatibility changes repair asynchronously delivered model catalogs and dashboard invalidation. They are loaded only for the manager-owned Crew workspace; this distribution does not replace the official Crew installation. The Apache-2.0 terms continue to apply to those derived resources, and the application's AGPL-3.0 license does not replace them.

@@ -1,6 +1,5 @@
 import type { AccountModelInfo } from '../shared/modelCatalog'
 import type { ClientSwitchApi } from '../shared/clientSwitch'
-import type { ManagedCrewApi } from '../shared/managedCrew'
 import type { ModelPreferencesResult, ModelPreferencesWrite } from '../shared/modelPreferences'
 import type { LogPage } from '../shared/logHistory'
 import type { WindowVisibilityState } from '../shared/windowVisibility'
@@ -20,13 +19,6 @@ import { electronAPI } from '@electron-toolkit/preload'
 
 // Custom APIs for renderer
 const api = {
-  managedCrew: {
-    inspect: accountId => ipcRenderer.invoke('managed-crew:inspect', accountId),
-    start: request => ipcRenderer.invoke('managed-crew:start', request),
-    open: request => ipcRenderer.invoke('managed-crew:open', request),
-    stop: request => ipcRenderer.invoke('managed-crew:stop', request),
-    chooseExecutable: () => ipcRenderer.invoke('managed-crew:choose-executable')
-  } satisfies ManagedCrewApi,
   clientSwitch: {
     inspect: accountId => ipcRenderer.invoke('client-switch:inspect', accountId),
     execute: request => ipcRenderer.invoke('client-switch:execute', request),
