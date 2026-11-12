@@ -5,6 +5,7 @@ import { ProxyAgent, Agent, type Dispatcher } from 'undici'
 import * as tls from 'tls'
 import { isIP } from 'net'
 import { SocksClient } from 'socks'
+import { createHash } from 'crypto'
 
 let _cachedSystemProxy: string | null = null
 let _systemProxyCacheTime = 0
@@ -137,6 +138,79 @@ export interface ProxyTrustOptions {
   // Only the explicitly selected K-Proxy dispatcher receives its local CA.
   // Certificate chains and the original target hostname are always verified.
   targetCa?: string
+}
+
+// Reuse connection pools across account checks, refreshes and Runtime calls.
+// Trust and proxy credentials are part of the key; never share a local CA with
+// an ordinary proxy. Keys are hashes so credentials are not duplicated in them.
+const SHARED_AGENT_LIMIT = 32
+const SHARED_AGENT_TOTAL_LIMIT = 64
+const SHARED_AGENT_IDLE_MS = 5 * 60_000
+const sharedAgents = new Map<string, { agent: Dispatcher; lastUsed: number }>()
+const drainingAgents = new Set<Dispatcher>()
+let sharedAgentTimer: ReturnType<typeof setInterval> | undefined
+
+function retireSharedAgent(key: string): void {
+  const entry = sharedAgents.get(key)
+  if (!entry) return
+  sharedAgents.delete(key)
+  drainingAgents.add(entry.agent)
+  // close() waits for in-flight streams. Eviction must not abort a paid request.
+  void entry.agent.close().catch(() => entry.agent.destroy()).catch(() => {}).finally(() => {
+    drainingAgents.delete(entry.agent)
+  })
+}
+
+function cleanupSharedProxyAgents(): void {
+  const cutoff = Date.now() - SHARED_AGENT_IDLE_MS
+  for (const [key, entry] of sharedAgents) {
+    if (entry.lastUsed <= cutoff) retireSharedAgent(key)
+  }
+  if (sharedAgents.size === 0 && sharedAgentTimer) {
+    clearInterval(sharedAgentTimer)
+    sharedAgentTimer = undefined
+  }
+}
+
+/** Borrow a shared dispatcher; callers must not close/destroy it. */
+export function getSharedProxyAgent(
+  proxyUrl: string | null | undefined,
+  trust: ProxyTrustOptions = {}
+): Dispatcher | undefined {
+  if (!proxyUrl) return undefined
+  cleanupSharedProxyAgents()
+  const key = createHash('sha256').update(JSON.stringify([proxyUrl, trust.targetCa || ''])).digest('hex')
+  const cached = sharedAgents.get(key)
+  if (cached) {
+    sharedAgents.delete(key)
+    cached.lastUsed = Date.now()
+    sharedAgents.set(key, cached)
+    return cached.agent
+  }
+  if (sharedAgents.size + drainingAgents.size >= SHARED_AGENT_TOTAL_LIMIT) {
+    // No request has been dispatched. Do not break an active stream or silently
+    // bypass the selected proxy when too many older pools are still draining.
+    throw Object.assign(new Error('网络代理连接池繁忙，请稍后重试'), { code: 'ERR_PROXY_POOL_CAPACITY' })
+  }
+  const agent = safeCreateProxyAgent(proxyUrl, trust)
+  if (!agent) return undefined
+  while (sharedAgents.size >= SHARED_AGENT_LIMIT) retireSharedAgent(sharedAgents.keys().next().value!)
+  sharedAgents.set(key, { agent, lastUsed: Date.now() })
+  if (!sharedAgentTimer) {
+    sharedAgentTimer = setInterval(cleanupSharedProxyAgents, 30_000)
+    sharedAgentTimer.unref()
+  }
+  return agent
+}
+
+/** Application shutdown only: release both cached pools and draining streams. */
+export async function closeSharedProxyAgents(): Promise<void> {
+  if (sharedAgentTimer) clearInterval(sharedAgentTimer)
+  sharedAgentTimer = undefined
+  const agents = new Set([...Array.from(sharedAgents.values(), entry => entry.agent), ...drainingAgents])
+  sharedAgents.clear()
+  drainingAgents.clear()
+  await Promise.allSettled(Array.from(agents, agent => agent.destroy()))
 }
 
 export function safeCreateProxyAgent(

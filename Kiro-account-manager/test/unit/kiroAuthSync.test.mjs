@@ -126,6 +126,7 @@ function switching({ refreshFailure = false } = {}) {
     Date: class extends Date { static now() { return now } },
     console: { log() {}, warn() {}, error() {} },
     instanceAccountOwnership: { assertAvailable() {} },
+    store: undefined,
     refreshTokenByMethod: async (...args) => {
       refreshes.push(args)
       return refreshFailure
@@ -368,4 +369,24 @@ test('queued handoffs recheck the real registration deadline before touching the
   currentTime = expires - 900000
   await assert.rejects(pending, /重新授权/)
   assert.deepEqual(h.calls, [])
+})
+
+test('queued handoffs recheck the credential generation before touching the cache', async () => {
+  const h = harness()
+  let current = true
+  const pending = h.writeKiroAuthTokenFile(base, () => {
+    if (!current) throw new Error('Synthetic stale generation')
+  })
+  current = false
+  await assert.rejects(pending, /stale generation/)
+  assert.deepEqual(h.calls, [])
+})
+
+test('a generation changed during cache preparation cannot publish stale credentials', async () => {
+  const h = harness()
+  let checks = 0
+  await assert.rejects(h.writeKiroAuthTokenFile(base, () => {
+    if (++checks === 2) throw new Error('Synthetic stale generation')
+  }), /stale generation/)
+  assert.equal(h.files.has(h.KIRO_AUTH_TOKEN_PATH), false)
 })

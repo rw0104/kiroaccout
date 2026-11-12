@@ -10,7 +10,7 @@ import { RequestAdmission, RequestAdmissionError, requiresRequestAdmission } fro
 const ts = createRequire(import.meta.url)('typescript')
 const poolContext = vm.createContext({ exports: {}, console: { log() {}, warn() {} } })
 vm.runInContext(ts.transpileModule(readFileSync(new URL('../../src/main/proxy/accountPool.ts', import.meta.url), 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, poolContext)
-const { AccountPool } = poolContext.exports
+const { AccountPool, upstreamHttpStatus, isCredentialRejection } = poolContext.exports
 const source = ts.createSourceFile('server.ts', readFileSync(new URL('../../src/main/proxy/proxyServer.ts', import.meta.url), 'utf8'), ts.ScriptTarget.Latest, true)
 const declaration = source.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === 'ProxyServer')
 const names = ['handleRequest', 'handleAdminApi', 'validateApiKey', 'safeStringEq', 'getAllowedAccountIds',
@@ -24,7 +24,7 @@ const compiled = ts.transpileModule(`class Subject { ${members} }; globalThis.Su
 function harness(config = {}, options = {}) {
   const calls = [], catalogCalls = [], persisted = [], responseEvents = [], creditsEvents = [], tokenEvents = []
   const usage = { inputTokens: 11, outputTokens: 7, credits: 15 }
-  const context = vm.createContext({ Buffer, crypto, AbortController, console: { log() {}, warn() {}, error() {} },
+  const context = vm.createContext({ Buffer, crypto, AbortController, upstreamHttpStatus, isCredentialRejection, console: { log() {}, warn() {}, error() {} },
     setTimeout, clearTimeout, RequestAdmissionError, requiresRequestAdmission,
     proxyLogger: { debug() {}, info() {}, warn() {} }, ErrorType: { RECOVERABLE: 'recoverable' },
     BodyTooLargeError: class extends Error {}, ProxyServer: { extractSessionHint: () => undefined },

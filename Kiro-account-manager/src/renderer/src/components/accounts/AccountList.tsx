@@ -1,4 +1,5 @@
 import { useRef, useState } from 'react'
+import { useShallow } from 'zustand/react/shallow'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
@@ -27,12 +28,18 @@ export function AccountList({ onAddAccount, onEditAccount }: AccountListProps): 
     tags,
     groups,
     selectedIds,
-    checkAccountStatus
-  } = useAccountsStore()
+    checkAccountStatus,
+    accounts
+  } = useAccountsStore(useShallow(state => ({
+    getFilteredAccounts: state.getFilteredAccounts,
+    tags: state.tags,
+    groups: state.groups,
+    selectedIds: state.selectedIds,
+    checkAccountStatus: state.checkAccountStatus,
+    accounts: state.getFilteredAccounts()
+  })))
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
-
-  const accounts = getFilteredAccounts()
 
   const handleShowDetail = (account: Account) => {
     setDetailAccount(account)

@@ -1,4 +1,5 @@
 import { useRef, useMemo, useState, useEffect } from 'react'
+import { useShallow } from 'zustand/react/shallow'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
@@ -57,8 +58,17 @@ export function AccountGrid({ onAddAccount, onEditAccount }: AccountGridProps): 
     groups,
     selectedIds,
     toggleSelection,
-    checkAccountStatus
-  } = useAccountsStore()
+    checkAccountStatus,
+    accounts
+  } = useAccountsStore(useShallow(state => ({
+    getFilteredAccounts: state.getFilteredAccounts,
+    tags: state.tags,
+    groups: state.groups,
+    selectedIds: state.selectedIds,
+    toggleSelection: state.toggleSelection,
+    checkAccountStatus: state.checkAccountStatus,
+    accounts: state.getFilteredAccounts()
+  })))
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
 
@@ -79,8 +89,6 @@ export function AccountGrid({ onAddAccount, onEditAccount }: AccountGridProps): 
       setIsRefreshing(false)
     }
   }
-
-  const accounts = getFilteredAccounts()
 
   // 将账号按行分组（包含添加按钮作为虚拟项）
   const rows = useMemo(() => {

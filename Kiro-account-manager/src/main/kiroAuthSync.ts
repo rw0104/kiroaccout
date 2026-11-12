@@ -168,22 +168,25 @@ export function validateKiroClientRegistration(
  * - IdC 同时写客户端注册文件 {clientIdHash}.json
  */
 export async function writeKiroAuthTokenFile(
-  input: WriteKiroAuthTokenInput
+  input: WriteKiroAuthTokenInput,
+  assertCurrent?: () => void
 ): Promise<WriteKiroAuthTokenResult> {
   // Validate the complete registration before creating the cache directory or
   // publishing a token. The official IDE rejects registration inside 15 minutes.
   const prepared = { ...input }
   validateKiroClientRegistration(prepared)
-  const task = cacheWriteQueue.then(() =>
-    writePreparedKiroAuthTokenFile(prepared, validateKiroClientRegistration(prepared))
-  )
+  const task = cacheWriteQueue.then(() => {
+    assertCurrent?.()
+    return writePreparedKiroAuthTokenFile(prepared, validateKiroClientRegistration(prepared), assertCurrent)
+  })
   cacheWriteQueue = task.then(() => undefined, () => undefined)
   return task
 }
 
 async function writePreparedKiroAuthTokenFile(
   input: WriteKiroAuthTokenInput,
-  registration: KiroClientRegistration | undefined
+  registration: KiroClientRegistration | undefined,
+  assertCurrent?: () => void
 ): Promise<WriteKiroAuthTokenResult> {
   const clientIdHash = computeClientIdHash(input.startUrl)
   const connection = createKiroConnectionDescriptor(input)
@@ -228,6 +231,7 @@ async function writePreparedKiroAuthTokenFile(
       /* ignore */
     }
   }
+  assertCurrent?.()
   await fs.writeFile(KIRO_AUTH_TOKEN_PATH, JSON.stringify(tokenData, null, 2), {
     mode: 0o600
   })

@@ -27,7 +27,7 @@ import {
   KIRO_AUTH_TOKEN_PATH
 } from './kiroAuthSync'
 import { openaiToKiro } from './proxy/translator'
-import { getSystemProxy, safeCreateProxyAgent } from './proxy/systemProxy'
+import { getSystemProxy, safeCreateProxyAgent, getSharedProxyAgent, closeSharedProxyAgents } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
@@ -69,7 +69,7 @@ import { AppUpdateController, UpdatePreparationError, type UpdatePreparationErro
 import { randomUUID } from 'node:crypto'
 import { TokenRefreshService, type AuthRefreshResult } from './authRefresh'
 import { LoginSessionManager } from './loginSessions'
-import { KIRO_LEGACY_IDENTITY } from '../shared/kiroClientCompatibility'
+import { getKiroSocialUserAgent, KIRO_LEGACY_IDENTITY } from '../shared/kiroClientCompatibility'
 import { SecureStoreError } from './secureStore'
 import { openSecureStoreForStartup, SecureStoreRecoveryCancelled } from './secureStoreRecovery'
 import {
@@ -185,14 +185,14 @@ function getNetworkAgent(): Dispatcher | undefined {
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      const agent = safeCreateProxyAgent(proxyUrl, { targetCa: kproxyService.getCACertPem() || undefined })
+      const agent = getSharedProxyAgent(proxyUrl, { targetCa: kproxyService.getCACertPem() || undefined })
       if (agent) return agent
     }
   }
   const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
-  const envAgent = safeCreateProxyAgent(envProxy)
+  const envAgent = getSharedProxyAgent(envProxy)
   if (envAgent) return envAgent
-  return safeCreateProxyAgent(getSystemProxy())
+  return getSharedProxyAgent(getSystemProxy())
 }
 
 /**
@@ -210,7 +210,7 @@ async function fetchWithAppProxy(
 ): Promise<Response> {
   // 优先尝试账号绑定代理
   if (overrideProxyUrl) {
-    const accountAgent = safeCreateProxyAgent(overrideProxyUrl)
+    const accountAgent = getSharedProxyAgent(overrideProxyUrl)
     if (accountAgent) {
       return await undiciFetch(url, { ...options, dispatcher: accountAgent } as UndiciRequestInit) as unknown as Response
     }
@@ -682,7 +682,7 @@ function openBrowserInPrivateMode(url: string): void {
 const tokenRefreshService = new TokenRefreshService({
   fetch: fetchWithAppProxy,
   socialEndpoint: KIRO_AUTH_ENDPOINT,
-  socialUserAgent: () => getKiroUserAgent(getCurrentMachineId())
+  socialUserAgent: () => getKiroSocialUserAgent(getCurrentMachineId())
 })
 
 async function refreshOidcToken(
@@ -714,6 +714,8 @@ async function refreshTokenByMethod(
   try { release = instanceAccountOwnership.beginOperation({ refreshToken: token }) }
   catch (error) { return { success: false, error: error instanceof InstanceOwnershipError ? error.message : '无法确认账户的刷新归属，请检查账户状态。' } }
   try {
+  const proxyRotationAccounts = proxyServer?.getAccountPool().getAllAccounts()
+    .filter(account => account.refreshToken === token) || []
   let result: OidcRefreshResult
   // 如果是社交登录，使用 Kiro Auth Service 刷新
   if (authMethod === 'social') {
@@ -734,6 +736,17 @@ async function refreshTokenByMethod(
   }
   // Always return an upstream rotation, even if local persistence fails. The
   // renderer can retain and retry saving it; never lose the only current token.
+  if (result.success && result.accessToken && typeof result.expiresIn === 'number' && Number.isFinite(result.expiresIn) && result.expiresIn > 0) {
+    // Background/manual refresh and proxy traffic share credential ownership.
+    // Publish before persistence/IPC: the renderer can be hidden or unmounted,
+    // and a consumed refresh token must not remain in the running account pool.
+    proxyServer?.getAccountPool().applyTokenRotation(token, {
+      accessToken: result.accessToken,
+      refreshToken: result.refreshToken,
+      expiresAt: Date.now() + result.expiresIn * 1000,
+      ...(authMethod === 'social' && result.profileArn ? { profileArn: result.profileArn } : {})
+    }, proxyRotationAccounts)
+  }
   if (result.success && result.accessToken && store) {
     const rotation = applyManagerTokenRotation(store.get('accountData'), token, result)
     if (rotation.updates.length) {
@@ -764,11 +777,6 @@ function generateInvocationId(): string {
 
 // Existing account-service compatibility identity; independent of the IDE release.
 const KIRO_VERSION = KIRO_LEGACY_IDENTITY.account
-
-function getKiroUserAgent(machineId?: string): string {
-  const suffix = machineId ? `KiroIDE-${KIRO_VERSION}-${machineId}` : `KiroIDE-${KIRO_VERSION}`
-  return `aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E ${suffix}`
-}
 
 function getKiroAmzUserAgent(machineId?: string): string {
   const suffix = machineId ? `KiroIDE ${KIRO_VERSION} ${machineId}` : `KiroIDE-${KIRO_VERSION}`
@@ -2906,46 +2914,52 @@ app.whenReady().then(async () => {
     const { proxyUrl, targets } = params || {}
     const agent = proxyUrl ? safeCreateProxyAgent(proxyUrl) : undefined
 
-    const results = await Promise.all((targets || []).map(async (t) => {
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), t.timeoutMs ?? 8000)
-      const start = Date.now()
-      try {
-        const init: UndiciRequestInit = {
-          method: 'GET',
-          signal: controller.signal,
-          headers: { 'User-Agent': 'KiroAccountManager-Diagnose/1.0' }
+    try {
+      const results = await Promise.all((targets || []).map(async (t) => {
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), t.timeoutMs ?? 8000)
+        const start = Date.now()
+        try {
+          const init: UndiciRequestInit = {
+            method: 'GET',
+            signal: controller.signal,
+            headers: { 'User-Agent': 'KiroAccountManager-Diagnose/1.0' }
+          }
+          if (agent) init.dispatcher = agent
+          const resp = await undiciFetch(t.url, init)
+          const latencyMs = Date.now() - start
+          const expected = t.expectStatus
+          const ok = expected ? expected.includes(resp.status) : (resp.status >= 200 && resp.status < 400)
+          // Diagnostics only need headers; release an unread response body too.
+          await resp.body?.cancel()
+          return {
+            id: t.id,
+            label: t.label,
+            url: t.url,
+            success: ok,
+            httpStatus: resp.status,
+            latencyMs,
+            error: ok ? undefined : `HTTP ${resp.status}`
+          }
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : String(err)
+          return {
+            id: t.id,
+            label: t.label,
+            url: t.url,
+            success: false,
+            latencyMs: Date.now() - start,
+            error: controller.signal.aborted ? '超时' : errMsg
+          }
+        } finally {
+          clearTimeout(timer)
         }
-        if (agent) init.dispatcher = agent
-        const resp = await undiciFetch(t.url, init)
-        const latencyMs = Date.now() - start
-        const expected = t.expectStatus
-        const ok = expected ? expected.includes(resp.status) : (resp.status >= 200 && resp.status < 400)
-        return {
-          id: t.id,
-          label: t.label,
-          url: t.url,
-          success: ok,
-          httpStatus: resp.status,
-          latencyMs,
-          error: ok ? undefined : `HTTP ${resp.status}`
-        }
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err)
-        return {
-          id: t.id,
-          label: t.label,
-          url: t.url,
-          success: false,
-          latencyMs: Date.now() - start,
-          error: controller.signal.aborted ? '超时' : errMsg
-        }
-      } finally {
-        clearTimeout(timer)
-      }
-    }))
+      }))
 
-    return { results }
+      return { results }
+    } finally {
+      await agent?.destroy().catch(() => {})
+    }
   })
 
   // ============ 代理池验活 ============
@@ -4863,7 +4877,7 @@ app.whenReady().then(async () => {
 
   // IPC: 切换账号 - 写入凭证到本地 SSO 缓存
   //
-  // 关键设计：切号前必先 refresh 一次，但与旧实现不同——
+  // 复用主进程持久化的当前有效凭证；临近到期或缺少可信到期时间时刷新。
   //   1. (bug A 修复) 把 OIDC 返回的新 refreshToken 也写入磁盘
   //      （旧实现只更新 accessToken，refreshToken 仍是已被服务端 rotate 作废的 v1，
   //       导致 Kiro IDE ~55min 后用 v1 刷新 → 401 → logoutAndForget）
@@ -4905,8 +4919,28 @@ app.whenReady().then(async () => {
       let finalRefreshToken = refreshToken
       let finalExpiresIn = 0
 
-      // 切号前先 refresh，确保磁盘里写的是最新 access + 最新 refresh（rotating）
-      if (refreshToken) {
+      const savedData = accountId ? store?.get('accountData') as {
+        accounts?: Record<string, { status?: string; credentials?: {
+          accessToken?: string; refreshToken?: string; expiresAt?: number
+          authMethod?: string; provider?: string; region?: string; clientId?: string; clientSecret?: string
+        } }>
+      } | undefined : undefined
+      const saved = accountId ? savedData?.accounts?.[accountId] : undefined
+      const current = saved?.credentials
+      if (current && (current.accessToken !== credentials.accessToken || current.refreshToken !== refreshToken)) {
+        return { success: false, error: '账户凭证已变化，请等待同步后重新切换' }
+      }
+      // Never trust a renderer-supplied expiry. Only the durable current generation
+      // can skip network rotation, with enough time for the IDE to take ownership.
+      const canReuse = saved?.status === 'active' && !!current?.accessToken &&
+        Number.isFinite(current.expiresAt) && current.expiresAt! > Date.now() + 5 * 60_000 &&
+        current.authMethod === authMethod && current.provider === provider &&
+        (current.region || 'us-east-1') === region &&
+        (current.clientId || '') === clientId && (current.clientSecret || '') === clientSecret
+      if (canReuse) {
+        preparedExpiresAt = current!.expiresAt!
+        finalExpiresIn = Math.floor((preparedExpiresAt - Date.now()) / 1000)
+      } else {
         console.log(`[Switch Account] Refreshing token before switch (authMethod: ${authMethod})...`)
         const refreshResult = await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod, undefined, credentials.clientSecretExpiresAt)
         if (refreshResult.success && refreshResult.accessToken && refreshResult.expiresIn) {
@@ -4939,6 +4973,14 @@ app.whenReady().then(async () => {
       // bug C 修复：用真实 expiresIn 算 expiresAt
       const expiresAtIso = new Date(preparedExpiresAt!).toISOString()
 
+      const assertReusedCurrent = canReuse ? (): void => {
+        const latest = store?.get('accountData') as typeof savedData
+        const updated = accountId ? latest?.accounts?.[accountId]?.credentials : undefined
+        if (!updated || updated.accessToken !== finalAccessToken || updated.refreshToken !== finalRefreshToken ||
+          updated.expiresAt !== preparedExpiresAt || preparedExpiresAt! <= Date.now() + 30_000) {
+          throw new Error('账户凭证已变化或临近到期，切换已停止，请重试')
+        }
+      } : undefined
       const { tokenPath, clientRegPath } = await writeKiroAuthTokenFile({
         accessToken: finalAccessToken,
         refreshToken: finalRefreshToken,
@@ -4951,7 +4993,7 @@ app.whenReady().then(async () => {
         clientSecret,
         clientSecretExpiresAt: credentials.clientSecretExpiresAt,
         profileArn: resolvedProfileArn
-      })
+      }, assertReusedCurrent)
       console.log('[Switch Account] Token written to:', tokenPath)
       if (clientRegPath) {
         console.log('[Switch Account] Client registration written to:', clientRegPath)
@@ -4964,7 +5006,7 @@ app.whenReady().then(async () => {
         lastWrittenTokenSignature = `${finalAccessToken}|${finalRefreshToken}`
         // 如启用了主动续期，立刻 schedule 下一次（基于刚写入的 expiresAt）
         if (proactiveRenewalEnabled) {
-          scheduleProactiveRenewal(accountId, Date.now() + finalExpiresIn * 1000)
+          scheduleProactiveRenewal(accountId, preparedExpiresAt!)
         }
       }
 
@@ -6885,6 +6927,7 @@ app.on('will-quit', async (event) => {
   
   // 停止主进程池 token 刷新调度器
   stopMainPoolTokenRefresh()
+  const proxyAgentShutdown = closeSharedProxyAgents()
 
   // 防止应用立即退出，先保存数据
   if (lastSavedData && store) {
@@ -6905,6 +6948,7 @@ app.on('will-quit', async (event) => {
       // 退出场景跳过节流，确保备份立即落盘
       await createBackup(lastSavedData)
       await flushBackupNow()
+      await proxyAgentShutdown
       // 强制落盘代理日志（异步节流中的尾巴数据）
       try {
         const { proxyLogStore } = await import('./proxy/logger')

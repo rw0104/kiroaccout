@@ -106,8 +106,10 @@ export async function switchAccountToClients(id: string, target: AccountSwitchTa
       if (!deps.applyCredentials(id, credentials, { accessToken: rotation.accessToken, refreshToken: rotation.refreshToken, expiresAt })) {
         return failure('账户凭证已变化，未覆盖较新的凭证；切换已停止')
       }
-      try { await deps.persist() }
-      catch { return failure('新凭证已保留在当前窗口，但保存失败；请保存成功后再继续切换') }
+      if (credentials.accessToken !== rotation.accessToken || credentials.refreshToken !== rotation.refreshToken || credentials.expiresAt !== expiresAt) {
+        try { await deps.persist() }
+        catch { return failure('新凭证已保留在当前窗口，但保存失败；请保存成功后再继续切换') }
+      }
       // A slow client write can outlive a short access-token lifetime. Preserve
       // the usable refresh generation first, then stop rather than activate it.
       if (expiresAt <= (deps.now ?? Date.now)()) return failure('访问凭证已到期，新刷新凭证已保留；请重新执行切换')
