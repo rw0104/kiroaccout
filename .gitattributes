@@ -1,2 +1,0 @@
-# Managed Crew resources are hash-pinned and must have identical bytes on every build OS.
-Kiro-account-manager/resources/crew-managed/** text eol=lf

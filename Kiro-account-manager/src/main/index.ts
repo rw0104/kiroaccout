@@ -56,10 +56,6 @@ import { ClientAccessProjectionService, type ManagerAccessSnapshot, type ClientA
 import { ClientSwitchService } from './clientSwitch'
 import { ClientRuntimeRegistry, type ClientRuntimeConfig } from './clientRuntimes'
 import { registerClientSwitchIpc } from './ipc/clientSwitch'
-import { ManagedCrewService } from './managedCrew'
-import { createManagedCrewRuntime } from './managedCrewProcess'
-import { ManagedCrewWindowController } from './managedCrewWindow'
-import { registerManagedCrewIpc } from './ipc/managedCrew'
 import { trackWindowVisibility } from './windowVisibility'
 import { filterAvailableModels, toAccountModel } from '../shared/modelCatalog'
 import { KiroModelPreferencesService, ModelPreferencesError, type ModelPreferenceAccount } from './kiroModelPreferences'
@@ -89,9 +85,6 @@ let appUpdateController: AppUpdateController | null = null
 let updateInstallSave: { requestId: string; senderId: number; timer: ReturnType<typeof setTimeout>; resolve: () => void; reject: (code: UpdatePreparationErrorCode) => void } | null = null
 let updatePoolWasRunning = false
 let updateQuitRequested = false
-let managedCrewService: ManagedCrewService | undefined
-let managedQuitReady = false
-let managedQuitPending: Promise<void> | undefined
 nativeAutoUpdater.on('before-quit-for-update', () => { updateQuitRequested = true })
 
 function publishUpdateState(state: AppUpdateState): void {
@@ -128,11 +121,7 @@ function setupAutoUpdater(): void {
     enabled: app.isPackaged && process.platform === 'win32',
     currentVersion: app.getVersion(),
     notify: publishUpdateState,
-    prepareInstall: async () => {
-      await prepareUpdateInstall()
-      try { await managedCrewService?.suspendAndStop(); managedQuitReady = true }
-      catch { throw new UpdatePreparationError('workspace-stop-failed') }
-    },
+    prepareInstall: prepareUpdateInstall,
     beforeInstall: () => {
       updatePoolWasRunning = !!mainPoolRefreshTimer
       stopMainPoolTokenRefresh()
@@ -140,8 +129,6 @@ function setupAutoUpdater(): void {
     },
     installFailed: () => {
       isQuitting = false
-      managedQuitReady = false
-      managedCrewService?.resume()
       if (updatePoolWasRunning) startMainPoolTokenRefresh()
       updatePoolWasRunning = false
     }
@@ -1392,60 +1379,6 @@ function setupClientSwitching(): void {
   clientProjectionTimer = setInterval(() => { void tick().catch(() => {}) }, 15_000)
   clientProjectionTimer.unref?.()
   void tick().catch(() => {})
-  setupManagedCrew()
-}
-
-/** Separate configuration, binding, data home and window; legacy Crew is untouched. */
-function setupManagedCrew(): void {
-  const root = join(app.getPath('userData'), 'managed-crew/workspace-v1')
-  const unpacked = (path: string): string => path.replace(/app\.asar([/\\])/, 'app.asar.unpacked$1')
-  const helperPath = unpacked(join(__dirname, '../../resources/client-switch/crew-access.py'))
-  const resources = unpacked(join(__dirname, '../../resources/crew-managed'))
-  const registry = new ClientRuntimeRegistry({
-    helperPath, env: { ...process.env, KIROCREW_HOME: join(root, 'data') },
-    readConfig: () => {
-      const executablePath = store?.get('managedCrewExecutable')
-      return typeof executablePath === 'string' ? { executablePath, dataHome: join(root, 'data') } : undefined
-    },
-    writeConfig: (_target, config) => {
-      if (!store) throw new Error('Store unavailable')
-      store.set('managedCrewExecutable', config.executablePath)
-    }
-  })
-  const windows = new ManagedCrewWindowController(options => new BrowserWindow(options))
-  const readBinding = (): ClientAccessProjectionBinding | undefined => {
-    const value = store?.get('managedCrewBinding')
-    return value && typeof value === 'object' && !Array.isArray(value) ? value as ClientAccessProjectionBinding : undefined
-  }
-  const service = new ManagedCrewService({
-    account: getClientProjectionAccess,
-    runtime: async () => {
-      const installation = await registry.crewInstallation()
-      return installation ? createManagedCrewRuntime({ root, resources, accessHelper: helperPath, installation }) : undefined
-    },
-    readBinding,
-    writeBinding: (binding, expected) => {
-      if (!store || readBinding()?.revision !== expected) return false
-      store.set('managedCrewBinding', binding)
-      return true
-    },
-    beginOperation: accountId => instanceAccountOwnership.beginOperation({ accountId }),
-    openWindow: (url, onClosed) => windows.open(url, onClosed), closeWindow: () => windows.close(),
-    platformSupported: () => process.platform === 'win32'
-  })
-  managedCrewService = service
-  registerManagedCrewIpc({ ipc: ipcMain, service,
-    trusted: event => requireTrustedMainWindow(event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined),
-    chooseExecutable: async () => {
-      if (process.platform !== 'win32' || !mainWindow) return { success: false, message: '独立 Crew 当前仅支持 Windows。' }
-      if (service.busy) return { success: false, message: '请先停止独立工作区，再更换安装位置。' }
-      const selected = await dialog.showOpenDialog(mainWindow, { title: '选择官方 KiroCrew.exe', properties: ['openFile'], filters: [{ name: 'Kiro Crew', extensions: ['exe'] }] })
-      if (selected.canceled || selected.filePaths.length !== 1) return { success: false, canceled: true }
-      if (service.busy) return { success: false, message: '工作区状态已变化，请停止后重试。' }
-      try { await registry.configure('crew', selected.filePaths[0]); return { success: true } }
-      catch { return { success: false, message: '此安装未通过官方 Crew 0.12.0 的兼容性检查。' } }
-    }
-  })
 }
 
 const modelPreferences = new KiroModelPreferencesService({
@@ -6893,21 +6826,6 @@ app.on('before-quit', (event) => {
     event.preventDefault()
     return
   }
-  if (typeof managedCrewService !== 'undefined' && managedCrewService && !managedQuitReady) {
-    event.preventDefault()
-    if (!managedQuitPending) {
-      managedQuitPending = managedCrewService.suspendAndStop().then(() => {
-        managedQuitReady = true
-        app.quit()
-      }).catch(() => {
-        isQuitting = false
-        managedQuitReady = false
-        managedCrewService?.resume()
-        dialog.showErrorBox('独立 Crew 尚未停止', '请先在对应账号中停止独立 Crew 工作区，然后重试退出；其它客户端未被停止。')
-      }).finally(() => { managedQuitPending = undefined })
-    }
-    return
-  }
   updateQuitRequested = false
   appUpdateController?.dispose()
   if (updateInstallSave) {
@@ -6922,7 +6840,6 @@ app.on('will-quit', async (event) => {
   // 防止重复处理
   if (clientProjectionTimer) clearInterval(clientProjectionTimer)
   clientAccessProjection?.close()
-  managedCrewService?.dispose()
   if (isQuitting) return
   
   // 停止主进程池 token 刷新调度器

@@ -5,6 +5,7 @@ directories:
 files:
   - out/**/*
   - resources/**/*
+  - '!resources/crew-managed/**'
   - '!resources/tls-client-*'
   - package.json
 asarUnpack:

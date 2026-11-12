@@ -2,8 +2,91 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { EventEmitter } from 'node:events'
+import vm from 'node:vm'
 import ts from 'typescript'
 import * as updaterModule from '../../src/main/appUpdater.ts'
+const settleSetup = async () => { for (let i = 0; i < 30; i++) await Promise.resolve() }
+
+// Keep the actual updater wiring covered after removing the managed workspace
+// lifecycle. No optional launcher globals should be needed to save and install.
+function setupFixture(t) {
+  const source = readFileSync(new URL('../../src/main/index.ts', import.meta.url), 'utf8')
+  const tree = ts.createSourceFile('index.ts', source, ts.ScriptTarget.Latest, true)
+  const declaration = name => tree.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name).getText(tree)
+  let ackCallback
+  function visit(node) {
+    if (ts.isCallExpression(node) && node.expression.getText(tree) === 'ipcMain.on' && node.arguments[0]?.text === 'confirm-app-update-save') ackCallback = node.arguments[1].getText(tree)
+    ts.forEachChild(node, visit)
+  }
+  visit(tree)
+  assert.ok(ackCallback)
+  const calls = []
+  let ack, installerFails = false
+  const engine = Object.assign(new EventEmitter(), {
+    setFeedURL: () => {}, autoDownload: true, autoInstallOnAppQuit: true, allowPrerelease: true, allowDowngrade: true, channel: null,
+    checkForUpdates: async () => ({ updateInfo: { version: '1.10.5' } }),
+    downloadUpdate: async () => { engine.emit('update-downloaded', { version: '1.10.5' }) },
+    quitAndInstall: () => { calls.push('installer'); if (installerFails) throw Error('SYNTHETIC_PRIVATE_INSTALL_ERROR') }
+  })
+  const context = vm.createContext({ ...updaterModule,
+    appUpdateController: null, autoUpdater: engine, app: { isPackaged: true, getVersion: () => '1.10.4' },
+    process: { platform: 'win32' }, publishUpdateState: () => {},
+    updateInstallSave: null, updatePoolWasRunning: false, mainPoolRefreshTimer: {}, isQuitting: false,
+    stopMainPoolTokenRefresh: () => calls.push('pool-stop'), startMainPoolTokenRefresh: () => calls.push('pool-resume'),
+    mainWindow: { isDestroyed: () => false, webContents: { id: 7, send: () => calls.push('save-request') } },
+    randomUUID: () => 'synthetic-update-save', setTimeout, clearTimeout,
+    ipcMain: { on: (_event, callback) => { ack = callback } }
+  })
+  vm.runInContext(ts.transpileModule(`${declaration('prepareUpdateInstall')}; ${declaration('setupAutoUpdater')};
+    ipcMain.on('confirm-app-update-save', ${ackCallback}); setupAutoUpdater()`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None }
+  }).outputText, context)
+  const controller = context.appUpdateController
+  t.after(() => controller.dispose())
+  return { calls, context, controller,
+    confirm: success => ack({ sender: { id: 7 } }, { requestId: context.updateInstallSave?.requestId, success }),
+    failInstaller: () => { installerFails = true } }
+}
+
+test('actual updater setup waits for saved accounts then installs without a workspace lifecycle dependency', async t => {
+  const f = setupFixture(t)
+  await f.controller.check(); await f.controller.download()
+  const installing = f.controller.install()
+  await settleSetup()
+  assert.deepEqual(f.calls, ['save-request'])
+  assert.equal(f.context.isQuitting, false)
+  f.confirm(true)
+  assert.equal((await installing).success, true)
+  assert.deepEqual(f.calls, ['save-request', 'pool-stop', 'installer'])
+  assert.equal(f.context.isQuitting, true)
+})
+
+test('actual updater setup preserves save refusal without stopping the pool or invoking an installer', async t => {
+  const f = setupFixture(t)
+  await f.controller.check(); await f.controller.download()
+  const installing = f.controller.install()
+  await settleSetup()
+  f.confirm(false)
+  const result = await installing
+  assert.equal(result.success, false)
+  assert.match(result.error, /账户保存未完成/)
+  assert.deepEqual(f.calls, ['save-request'])
+  assert.equal(f.context.isQuitting, false)
+})
+
+test('actual updater setup restores the refresh scheduler and quit state after installer failure', async t => {
+  const f = setupFixture(t)
+  await f.controller.check(); await f.controller.download(); f.failInstaller()
+  const installing = f.controller.install()
+  await settleSetup()
+  f.confirm(true)
+  const result = await installing
+  assert.equal(result.success, false)
+  assert.deepEqual(f.calls, ['save-request', 'pool-stop', 'installer', 'pool-resume'])
+  assert.equal(f.context.isQuitting, false)
+  assert.equal(f.controller.canQuitForUpdate(), false)
+  assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_PRIVATE/)
+})
 
 // Execute the actual main-process handshake with only windows, IPC and timers mocked.
 // No Electron process, filesystem storage or installer is started.

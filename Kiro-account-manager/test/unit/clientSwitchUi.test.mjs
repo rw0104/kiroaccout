@@ -103,72 +103,34 @@ function find(tree, predicate) {
 const words = tree => typeof tree === 'string' ? tree : Array.isArray(tree) ? tree.map(words).join('') : words(tree?.props?.children ?? '')
 const button = (tree, text) => find(tree, node => node.type === 'Button' && words(node) === text)[0]?.props
 const radio = (tree, target) => find(tree, node => node.type === 'input' && node.props['data-client-target'] === target)[0]?.props
-const crewMode = (tree, target) => find(tree, node => node.type === 'input' && node.props['data-crew-mode'] === target)[0]?.props
-const selectCrew = (view, mode = 'crew') => { radio(view.render(), 'crew').onChange(); crewMode(view.render(), mode).onChange() }
+const selectCrew = view => { radio(view.render(), 'crew').onChange() }
 const submit = tree => find(tree, node => node.type === 'form')[0].props.onSubmit(event())
 
-test('the top-level client picker has one Crew entry and reveals a separate default workspace mode', async () => {
-  const f = managedHarness()
-  f.render(); await drain()
-  let tree = f.render()
+test('Crew selection uses the existing official client directly without workspace modes', async () => {
+  const h = harness()
+  h.render(); await drain()
+  selectCrew(h)
+  const tree = h.render()
   const clients = find(tree, node => node.type === 'input' && node.props.type === 'radio')
   assert.deepEqual(clients.map(node => node.props.value), ['ide', 'crew', 'cli'])
-  radio(tree, 'crew').onChange()
-  tree = f.render()
-  const modeGroup = find(tree, node => node.type === 'fieldset' && node.props['data-testid'] === 'crew-mode-picker')[0]
-  assert.ok(modeGroup)
-  const modes = find(modeGroup, node => node.type === 'input' && node.props.type === 'radio')
-  assert.equal(modes.find(node => node.props.value === 'crew-managed').props.checked, true)
-  assert.equal(button(tree, 'Start and open').disabled, false)
-  assert.equal(f.h.calls.some(call => ['execute', 'chooseExecutable', 'disconnect'].includes(call[0])), false)
-  assert.equal(f.managedCalls.some(call => ['start', 'open', 'stop', 'choose'].includes(call[0])), false)
-})
-
-test('Crew mode changes stay within one client choice and never start or switch an account', async () => {
-  const f = managedHarness()
-  f.render(); await drain()
-  radio(f.render(), 'crew').onChange()
-  let tree = f.render()
-  assert.equal(crewMode(tree, 'crew-managed').checked, true)
   assert.equal(radio(tree, 'crew').checked, true)
-  crewMode(tree, 'crew').onChange()
-  tree = f.render()
-  assert.equal(crewMode(tree, 'crew').checked, true)
-  assert.equal(radio(tree, 'crew').checked, true)
+  assert.equal(button(tree, 'Switch account').disabled, false)
   assert.match(words(tree), /does not start it/)
-  assert.ok(button(tree, 'Switch account'))
-  radio(tree, 'cli').onChange()
-  assert.equal(crewMode(f.render(), 'crew'), undefined)
-  radio(f.render(), 'crew').onChange()
-  assert.equal(crewMode(f.render(), 'crew-managed').checked, true)
-  assert.deepEqual(f.managedCalls, [['inspect', 'account-a']])
-  assert.deepEqual(f.h.calls, [['inspect', 'account-a']])
+  assert.doesNotMatch(words(tree), /workspace/i)
+  assert.deepEqual(h.calls, [['inspect', 'account-a']])
+  await submit(tree)
+  assert.equal(h.calls.find(call => call[0] === 'execute')[1].target, 'crew')
 })
 
-test('an unavailable workspace stays blocked until the existing client mode is explicitly selected', async () => {
-  const f = managedHarness({ inspect: async () => { throw Error('SYNTHETIC_PRIVATE_PATH') } })
-  f.render(); await drain()
-  radio(f.render(), 'crew').onChange()
-  assert.equal(button(f.render(), 'Start and open').disabled, true)
-  assert.doesNotMatch(words(f.render()), /crew state|SYNTHETIC_PRIVATE_PATH/)
-  crewMode(f.render(), 'crew').onChange()
-  assert.equal(button(f.render(), 'Switch account').disabled, false)
-  assert.match(words(f.render()), /crew state/)
-  assert.equal(f.h.calls.some(call => call[0] === 'execute'), false)
-})
-
-test('busy Crew operations disable the mode picker and ignore a stale mode-change handler', async () => {
-  const pending = deferred()
-  const f = managedHarness({ start: () => pending.promise })
-  f.render(); await drain(); radio(f.render(), 'crew').onChange()
-  const chooseExisting = crewMode(f.render(), 'crew').onChange
-  const submitted = submit(f.render())
-  chooseExisting()
-  const tree = f.render()
-  assert.equal(find(tree, node => node.type === 'fieldset' && node.props['data-testid'] === 'crew-mode-picker')[0].props.disabled, true)
-  assert.equal(crewMode(tree, 'crew-managed').checked, true)
-  pending.resolve({ success: true, state: workspaceState() })
-  await submitted
+test('client detection and selection work when the workspace preload API is absent', async () => {
+  const windowApi = {}
+  Object.defineProperty(windowApi, 'managedCrew', { get() { throw new Error('Removed API must not be accessed') } })
+  const h = harness({}, windowApi)
+  h.render(); await drain()
+  selectCrew(h)
+  assert.equal(button(h.render(), 'Switch account').disabled, false)
+  await submit(h.render())
+  assert.equal(h.calls.filter(call => call[0] === 'execute').length, 1)
 })
 
 test('opening and selecting clients inspect metadata only; IDE is the default on every mount', async () => {
@@ -289,8 +251,11 @@ test('duplicate submits are serialized and Escape cannot dismiss an in-flight wr
   h.render(); await drain()
   radio(h.render(), 'cli').onChange()
   const tree = h.render()
+  const selectAnotherClient = radio(tree, 'crew').onChange
   const first = submit(tree)
   await submit(tree)
+  selectAnotherClient()
+  assert.equal(radio(h.render(), 'cli').checked, true)
   h.key('Escape')
   assert.equal(h.closed, 0)
   assert.equal(h.calls.filter(call => call[0] === 'execute').length, 1)
@@ -413,116 +378,4 @@ test('failed disconnect displays the actual failure and preserves retry capabili
   assert.doesNotMatch(words(tree), /Synchronization stopped/)
   assert.equal(button(tree, 'Disconnect').disabled, false)
   assert.equal(h.calls.filter(call => call[0] === 'disconnect').length, 1)
-})
-
-const workspaceState = (overrides = {}) => ({ status: 'stopped', canStart: true, canOpen: false, canStop: false,
-  selectedAccount: false, version: '0.12.0', message: '工作区就绪', messageEn: 'Workspace ready.', ...overrides })
-function managedHarness(overrides = {}) {
-  const h = harness(), managedCalls = []
-  let current = workspaceState()
-  const managedApi = {
-    inspect: async id => { managedCalls.push(['inspect', id]); return current },
-    start: async request => { managedCalls.push(['start', JSON.parse(JSON.stringify(request))]); current = workspaceState({ status: 'running', canStart: false, canOpen: true, canStop: true, selectedAccount: true }); return { success: true, state: current } },
-    open: async request => { managedCalls.push(['open', JSON.parse(JSON.stringify(request))]); return { success: true, state: current } },
-    stop: async request => { managedCalls.push(['stop', JSON.parse(JSON.stringify(request))]); current = workspaceState(); return { success: true, state: current } },
-    chooseExecutable: async () => { managedCalls.push(['choose']); return { success: true } },
-    ...overrides
-  }
-  return { h, managedCalls, render: props => h.render({ managedApi, ...props }), setState: value => { current = value } }
-}
-
-test('the independent Crew option is explicit and selection alone never starts or replaces a client', async () => {
-  const f = managedHarness()
-  f.render(); await drain()
-  const tree = f.render()
-  assert.equal(radio(tree, 'ide').checked, true)
-  assert.ok(radio(tree, 'crew'))
-  assert.ok(radio(tree, 'cli'))
-  assert.equal(radio(tree, 'crew-managed'), undefined)
-  selectCrew(f, 'crew-managed')
-  assert.match(words(f.render()), /Recommended/)
-  assert.deepEqual(f.managedCalls, [['inspect', 'account-a']])
-  assert.equal(button(f.render(), 'Start and open').disabled, false)
-  assert.match(words(f.render()), /Keep the manager running/)
-})
-
-test('independent Crew start and reopen use only the dedicated API and preserve the selected account', async () => {
-  const f = managedHarness()
-  f.render(); await drain()
-  selectCrew(f, 'crew-managed')
-  await submit(f.render()); await drain()
-  assert.deepEqual(f.managedCalls.find(call => call[0] === 'start'), ['start', { accountId: 'account-a', operationId: 'operation-1' }])
-  assert.equal(f.h.calls.some(call => ['execute', 'ide', 'disconnect', 'chooseExecutable'].includes(call[0])), false)
-  assert.equal(button(f.render(), 'Open workspace').disabled, false)
-  await submit(f.render()); await drain()
-  assert.deepEqual(f.managedCalls.find(call => call[0] === 'open'), ['open', { accountId: 'account-a', operationId: 'operation-2' }])
-  assert.equal(f.managedCalls.filter(call => call[0] === 'start').length, 1)
-})
-
-test('only the selected running workspace exposes stop and it never disconnects the existing Crew', async () => {
-  const f = managedHarness()
-  f.setState(workspaceState({ status: 'running', canStart: false, canOpen: true, canStop: true, selectedAccount: true }))
-  f.render(); await drain()
-  selectCrew(f, 'crew-managed')
-  button(f.render(), 'Stop workspace').onClick(); await drain()
-  assert.equal(f.managedCalls.filter(call => call[0] === 'stop').length, 1)
-  assert.equal(f.h.calls.some(call => call[0] === 'disconnect'), false)
-  assert.equal(button(f.render(), 'Start and open').disabled, false)
-  f.setState(workspaceState({ status: 'running', canStart: false, canOpen: false, canStop: false, selectedAccount: false,
-    messageEn: 'Another account owns the workspace. Stop it from that account first.' }))
-  await button(f.render(), 'Refresh workspace').onClick(); await drain()
-  assert.equal(button(f.render(), 'Stop workspace'), undefined)
-  assert.equal(button(f.render(), 'Start and open').disabled, true)
-  assert.match(words(f.render()), /Another account owns/)
-})
-
-test('independent executable selection does not alter the original Crew configuration', async () => {
-  const f = managedHarness()
-  f.render(); await drain(); selectCrew(f, 'crew-managed')
-  button(f.render(), 'Choose installed client').onClick(); await drain()
-  assert.equal(f.managedCalls.filter(call => call[0] === 'choose').length, 1)
-  assert.equal(f.h.calls.some(call => call[0] === 'chooseExecutable'), false)
-})
-
-test('independent detection failure leaves the existing IDE and CLI paths usable', async () => {
-  const f = managedHarness({ inspect: async () => { throw Error('SYNTHETIC_PRIVATE_PATH') } })
-  f.render(); await drain()
-  selectCrew(f, 'crew-managed')
-  assert.equal(button(f.render(), 'Start and open').disabled, true)
-  assert.doesNotMatch(words(f.render()), /SYNTHETIC_PRIVATE_PATH/)
-  radio(f.render(), 'cli').onChange()
-  assert.equal(button(f.render(), 'Switch account').disabled, false)
-  radio(f.render(), 'ide').onChange()
-  assert.equal(button(f.render(), 'Switch account').disabled, false)
-})
-
-test('a pending workspace start is single flight and its late reply cannot update another account dialog', async () => {
-  const pending = deferred()
-  let starts = 0
-  const f = managedHarness({ start: () => { starts++; return pending.promise } })
-  f.render(); await drain(); selectCrew(f, 'crew-managed')
-  const tree = f.render()
-  void submit(tree); void submit(tree)
-  assert.equal(starts, 1)
-  f.h.key('Escape')
-  assert.equal(f.h.closed, 0)
-  f.render({ accountId: 'account-b' }); await drain()
-  pending.resolve({ success: true, state: workspaceState({ messageEn: 'Old account workspace started.' }) })
-  await drain()
-  const changed = f.render({ accountId: 'account-b' })
-  assert.equal(radio(changed, 'ide').checked, true)
-  assert.doesNotMatch(words(changed), /Old account workspace started/)
-})
-
-test('the product dialog uses the dedicated preload API when no test API prop is supplied', async () => {
-  const calls = []
-  const h = harness({}, { managedCrew: {
-    inspect: async accountId => { calls.push(['inspect', accountId]); return workspaceState() },
-    start: async request => { calls.push(['start', JSON.parse(JSON.stringify(request))]); return { success: true, state: workspaceState() } }
-  } })
-  h.render(); await drain()
-  selectCrew(h, 'crew-managed')
-  await submit(h.render()); await drain()
-  assert.deepEqual(calls.find(call => call[0] === 'start'), ['start', { accountId: 'account-a', operationId: 'operation-1' }])
-  assert.equal(h.calls.some(call => call[0] === 'execute'), false)
 })
