@@ -285,5 +285,13 @@ for (const version of ['0.12.0', '0.12.2'] as const) {
     assert.equal(report.successful, true); assert.equal(report.testsRun, 11)
     assert.equal(report.realClientsStarted, 0); assert.equal(report.networkRequests, 0)
     assert.ok(report.beforeAfter.filter(row => row.patched).every(row => row.afterCount === 22))
+    if (version === '0.12.2') {
+      const cold = spawnSync(python, ['-I','-B',fileURLToPath(new URL('./crewModelColdProbeRegression.py',import.meta.url)), '--installed-root',f.packageRoot],
+        {encoding:'utf8',timeout:30000,windowsHide:true})
+      assert.equal(cold.status,0,cold.stderr||cold.stdout)
+      const lifecycle=JSON.parse(cold.stdout)
+      assert.equal(lifecycle.successful,true); assert.equal(lifecycle.testsRun,8)
+      assert.equal(lifecycle.realInferenceRequests,0)
+    }
   })
 }

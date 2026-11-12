@@ -57,6 +57,13 @@
           "beforeSha256": null,
           "afterSha256": "0c42a353c202fa9d99ed0dfc0214ddf09773becdf4a35e65d5128b347176a741",
           "normalized": true
+        },
+        {
+          "target": "dashboard/handlers/models_cold_probe.py",
+          "resource": "0.12.2/dashboard/handlers/models_cold_probe.py",
+          "beforeSha256": "db96550e3c107abc16f1626c60ebbd1bcbb77fec40a716e22f495b39480493ee",
+          "afterSha256": "7966b46814d9221f834bf069f4fd616f053c958efacf5a0c829ec8dbd4370432",
+          "normalized": true
         }
       ],
       "checks": [
