@@ -9,6 +9,38 @@ import { cliAccessPayload } from '../../src/main/cliAccessAdapter'
 const now = 1_800_000_000_000
 const request: ClientSwitchRequest = { operationId: 'op-first', accountId: 'account-a', target: 'cli',
   runtimeId: 'runtime-cli', expectedRuntimeRevision: 'runtime-v1' }
+
+test('native Crew account switching requires model readiness, while CLI remains independent', async () => {
+  const f = fixture()
+  f.deps.inspectModels = async () => ({ status: 'needs-repair', ready: false, canRepair: true, canRestore: false,
+    message: '请先修复模型列表', messageEn: 'Repair the model list first.' })
+  const state = await f.service.inspect('account-a')
+  assert.equal(state.targets.find(item => item.target === 'crew')?.status, 'blocked')
+  const blocked = await f.service.execute({ ...request, target: 'crew', runtimeId: 'runtime-crew' })
+  assert.equal(blocked.errorCode, 'MODEL_REPAIR_REQUIRED')
+  assert.equal(f.counters.writes, 0)
+  assert.equal((await f.service.execute({ ...request, operationId: 'cli-still-works' })).status, 'credentials-written')
+})
+
+test('a Crew update between inspection and projection cannot silently bypass native model repair', async () => {
+  const f = fixture()
+  let checks = 0
+  f.deps.inspectModels = async () => ({ status: ++checks === 1 ? 'repaired' : 'needs-repair', ready: checks === 1,
+    canRepair: checks > 1, canRestore: checks === 1, message: '模型修复状态已变化' })
+  const result = await f.service.execute({ ...request, target: 'crew', runtimeId: 'runtime-crew' })
+  assert.equal(result.errorCode, 'MODEL_REPAIR_REQUIRED')
+  assert.equal(f.counters.writes, 0)
+  assert.equal(f.counters.acquired, f.counters.released)
+})
+
+test('unverified client upgrades produce an explicit compatibility state without exposing native error text', async () => {
+  const f = fixture()
+  f.deps.runtime = async () => { throw Object.assign(new Error('PRIVATE_NATIVE_PATH'), { code: 'unsupported-client-contract' }) }
+  const snapshot = await f.service.inspect('account-a')
+  assert.ok(snapshot.targets.every(item => item.status === 'blocked' && item.errorCode === 'CLIENT_CONTRACT_UNSUPPORTED'))
+  assert.equal(JSON.stringify(snapshot).includes('PRIVATE'), false)
+  assert.equal(f.counters.writes, 0)
+})
 interface ManagerFixtureAccount extends ManagerAccessSnapshot {
   refreshToken: string
   activeAccountId: string

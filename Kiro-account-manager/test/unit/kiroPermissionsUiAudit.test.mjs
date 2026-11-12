@@ -152,7 +152,7 @@ test('an existing JSON policy displays its read-only reason and actual path whil
   assert.equal(ctx.calls.exportPermissions, 1)
 })
 
-test('permissions describe the IDE scope and CLI V3 file support accurately in both languages', () => {
+test('permissions distinguish explicit allow rules from model review without changing actions in both languages', () => {
   const sectionSource = readFileSync(new URL('../../src/renderer/src/components/kiro/KiroPermissionsSection.tsx', import.meta.url), 'utf8')
   const sectionExports = {}
   const jsxRuntime = {
@@ -170,15 +170,24 @@ test('permissions describe the IDE scope and CLI V3 file support accurately in b
     }
   })
   for (const isEn of [false, true]) {
+    let applyCalls = 0
     const tree = sectionExports.KiroPermissionsSection({
-      state: makePermState(),
+      state: makePermState({ restrictions: { evaluateCount: 1, hasRestrictiveRules: false } }),
       loading: false, busy: false, exporting: false, error: null, notice: null,
       isEn, detailsOpen: false,
-      onToggleDetails() {}, onApply() {}, onRestore() {}, onExport() {}
+      onToggleDetails() {}, onApply() { applyCalls++ }, onRestore() {}, onExport() {}
     })
     const copy = text(tree)
     assert.doesNotMatch(copy, /V3 (?:does not read|不读取) permissions\.yaml/)
     assert.match(copy, isEn ? /CLI V3 supports permissions\.yaml/ : /CLI V3 支持 permissions\.yaml/)
     assert.match(copy, isEn ? /selected IDE/ : /所选 IDE/)
+    assert.match(copy, /Approve for me/)
+    assert.match(copy, isEn ? /explicit allow rules for all and fs_write/ : /all 和 fs_write 的显式 allow 规则/)
+    assert.match(copy, isEn ? /actions not covered by existing rules/ : /现有规则未覆盖的操作/)
+    assert.match(copy, isEn ? /evaluate: 1/ : /evaluate 规则：1 条/)
+    assert.equal(text(byId(tree, 'kiro-permissions-apply')), isEn ? 'Apply explicit allow rules' : '应用显式允许规则')
+    assert.equal(applyCalls, 0)
+    byId(tree, 'kiro-permissions-apply').props.onClick()
+    assert.equal(applyCalls, 1)
   }
 })

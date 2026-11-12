@@ -88,8 +88,8 @@ export function KiroPermissionsSection({
           return {
             label: isEn ? 'Both rules present, with restrictions' : '双规则已存在，含限制规则',
             detail: isEn
-              ? 'Simultaneous deny, ask, or conditional rules exist; some operations may still prompt or be blocked.'
-              : '同时存在 deny、ask 或条件规则，部分操作仍可能提示或被阻止。',
+              ? 'Simultaneous deny, ask, evaluate, or conditional rules exist; some operations may still prompt or be blocked.'
+              : '同时存在 deny、ask、evaluate 或条件规则，部分操作仍可能提示或被阻止。',
             tone: 'warning'
           }
         }
@@ -213,8 +213,13 @@ export function KiroPermissionsSection({
           </div>
           <p className="text-sm text-muted-foreground">
             {isEn
-              ? 'Reduces confirmation prompts during tool execution. Built-in protections and restrictive rules may still require confirmation or block execution.'
-              : '减少工具执行时的确认提示。部分内置保护和限制规则仍需确认或会阻止执行。'}
+              ? 'This page adds explicit allow rules for all and fs_write. Kiro applies these rules before model review; built-in protections and other rules still apply.'
+              : '此处添加 all 和 fs_write 的显式 allow 规则。Kiro 会先按这些规则处理工具操作，内置保护和其他规则仍然适用。'}
+          </p>
+          <p id="kiro-permissions-model-review-note" className="text-xs text-muted-foreground">
+            {isEn
+              ? 'For model review, select Approve for me in the official Kiro chat permission menu. It evaluates actions not covered by existing rules; this button does not enable that mode.'
+              : '如需模型审核，请在官方 Kiro 的聊天权限模式中选择 Approve for me。它评估现有规则未覆盖的操作；本按钮不会开启该模式。'}
           </p>
           <p className="text-xs text-muted-foreground">
             {isEn
@@ -231,7 +236,7 @@ export function KiroPermissionsSection({
             disabled={!canApply}
             onClick={onApply}
           >
-            {isEn ? 'Apply auto-approval' : '应用自动批准配置'}
+            {isEn ? 'Apply explicit allow rules' : '应用显式允许规则'}
           </Button>
           <Button
             id="kiro-permissions-restore"
@@ -263,7 +268,7 @@ export function KiroPermissionsSection({
         {restoreStatus.detail && <p>{restoreStatus.detail}</p>}
       </div>
 
-      {state?.restrictions.hasRestrictiveRules && (
+      {state && (state.restrictions.hasRestrictiveRules || state.restrictions.evaluateCount > 0) && (
         <div
           id="kiro-permissions-restrictions-warning"
           className="flex items-start gap-2 p-2.5 rounded-lg bg-amber-500/10 text-amber-700 dark:text-amber-300 text-xs"
@@ -272,13 +277,13 @@ export function KiroPermissionsSection({
           <div>
             <p className="font-medium">
               {isEn
-                ? 'Restrictive rules detected in the current file; restrictions in other scopes may also apply'
-                : '检测到当前文件中的限制规则；其他作用域也可能存在限制'}
+                ? 'Restrictive or model-review rules detected; rules in other scopes may also apply'
+                : '检测到限制或模型审核规则；其他作用域的规则也可能适用'}
             </p>
             <p className="mt-0.5">
               {isEn
-                ? `deny: ${state.restrictions.denyCount}, ask: ${state.restrictions.askCount}, conditional allow: ${state.restrictions.scopedAllowCount}`
-                : `deny 规则：${state.restrictions.denyCount} 条，ask 规则：${state.restrictions.askCount} 条，条件性 allow 规则：${state.restrictions.scopedAllowCount} 条`}
+                ? `deny: ${state.restrictions.denyCount}, ask: ${state.restrictions.askCount}, evaluate: ${state.restrictions.evaluateCount}, conditional allow: ${state.restrictions.scopedAllowCount}`
+                : `deny 规则：${state.restrictions.denyCount} 条，ask 规则：${state.restrictions.askCount} 条，evaluate 规则：${state.restrictions.evaluateCount} 条，条件性 allow 规则：${state.restrictions.scopedAllowCount} 条`}
             </p>
           </div>
         </div>

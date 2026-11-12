@@ -2,15 +2,17 @@
 
 Electron application source. See the [project README](../README.md), [stable download](https://github.com/rw0104/kiroaccout/releases/latest) and [all releases](https://github.com/rw0104/kiroaccout/releases).
 
-This source targets **1.10.5 · Windows / macOS / Linux**. Release availability and assets are listed in Releases. Account binding and rotation protection have synthetic-data regression coverage; login and refresh with two real bound accounts have not been validated. See the release notes for this version's validation scope.
+This source targets **1.10.6 · Windows / macOS / Linux**. Release availability and assets are listed in Releases. Account binding and rotation protection have synthetic-data regression coverage; login and refresh with two real bound accounts have not been validated. See the release notes for this version's validation scope.
 
 Migration recovery: if changed legacy data blocks startup after upgrading, choose the recovery option to back up both generations and use the existing secure store. Legacy accounts and credentials are not merged automatically. Keep the entire data directory and its key for later comparison.
 
 Use Add Account → Online Login → Sign in on Kiro website for portal login. For exports, select all or selected accounts, then Backup JSON or Credential JSON. Credentials are excluded by default; that export cannot restore login. Explicitly opt in to include credentials when needed and keep the resulting plain-text file private.
 
-The account power button now opens an IDE / Crew / CLI picker, defaulting to IDE each time. IDE switching and sign-out retain their existing behavior. New Windows connections support official CLI 3.1.0 and Crew 0.12.0. They project short-lived access only, without sharing the manager's refresh token or changing its refresh settings. Keep the manager running; access can pause if its existing refresh is disabled or not ready. Disconnect stops synchronization and lets the client's existing access expire naturally. Stop the new CLI connection before using legacy CLI/Both switching. Crew uses its official bundled engine; conflicting local overrides are preserved and refused.
+The account power button now opens an IDE / Crew / CLI picker, defaulting to IDE each time. IDE switching and sign-out retain their existing behavior. New Windows connections support verified official CLI 3.1.0/3.2.1 and Crew 0.12.0/0.12.2. They project short-lived access only, without sharing the manager's refresh token or changing its refresh settings. Keep the manager running; access can pause if its existing refresh is disabled or not ready. Disconnect stops synchronization and lets the client's existing access expire naturally. Stop the new CLI connection before using legacy CLI/Both switching. Crew uses its official bundled engine; conflicting local overrides are preserved and refused.
 
 The Kiro Crew option connects directly to your existing official client for account switching, authorization and synchronization. The manager no longer creates or launches an independent Crew workspace. Existing workspace conversations, files and sign-in data are retained. Stop any managed workspace in the old version before exiting it to upgrade.
+
+Native model catalog repair: close official Crew and its background service, select Crew, then choose Repair model list. After repair, switch the account and open the official client. Verified program files are backed up and can be restored while the client is stopped. This creates no workspace or browser environment. Reinspect after official updates; new models load from the engine catalog, while unknown client protocols require renewed validation.
 
 After upgrading to 1.10.3, close the CLI and explicitly reconnect an older CLI binding once to adopt the repaired Social provider and profile storage. Existing external sign-in changes are not silently overwritten.
 
@@ -20,7 +22,9 @@ Kiro Settings now supports Memory and Workflows for the default IDE or a selecte
 
 Open an account's details to read its model fallback preferences. Set one fallback for a primary model, or clear that setting, then save. Model consent metadata remains visible without automatic consent. Manage instance-bound accounts inside their official instance. Organization usage can be limited by a shared pool and user or group limits; use the Kiro console to confirm effective availability.
 
-Use Kiro Settings → Tool auto-approval to inspect the selected default IDE or managed instance. Changes require an explicit click on Apply auto-approval. The manager backs up the original configuration before writing and can restore it while the file remains unchanged externally. A JSON-only permissions configuration stays read-only; export the YAML template for manual migration. Auto-approval permits command execution and file changes; existing restrictions and built-in protections may still prompt or block execution. Start a new Kiro session to verify the result.
+Use Kiro Settings → Tool auto-approval to inspect the selected default IDE or managed instance. Changes require an explicit click on Apply explicit allow rules. The manager backs up the original configuration before writing and can restore it while the file remains unchanged externally. A JSON-only permissions configuration stays read-only; export the YAML template for manual migration. Auto-approval permits command execution and file changes; existing restrictions and built-in protections may still prompt or block execution. Start a new Kiro session to verify the result.
+
+Explicit allow rules are distinct from Approve for Me. Existing allow/ask/deny rules take precedence; model review handles uncovered actions. Enable Approve for Me in the official chat permission menu. This manager button does not enable that mode.
 
 Kiro instances share one installed official Kiro.exe and use separate managed profile, home, extension, shared-data and temporary directories. Choose the executable, an instance name and an existing managed account, then create and start the instance. Its credentials are written only to that instance's cache. The instance can renew an expired access token; an invalid refresh token or expired IdC registration requires reauthorization. No extra Windows users, separate installations or system passwords are required.
 
@@ -30,4 +34,4 @@ If missing or expired cache data or a changed IDE account prevents synchronizati
 
 The instance page provides observed state, graceful stop and restart. Unsaved changes can prevent closure; no automatic force kill is performed. Removing a configuration preserves profile files. Old RC Windows-user configurations are inactive and must be recreated. Network, proxy, certificates, the Windows identity and DPAPI remain shared; this is not a security sandbox. A separate install directory or ZIP does not isolate the account manager itself.
 
-[1.10.5 notes](../docs/releases/v1.10.5.md) · [AGPL-3.0](../LICENSE) · [Source attribution](../docs/NOTICE.md) · [中文](README_CN.md)
+[1.10.6 notes](../docs/releases/v1.10.6.md) · [AGPL-3.0](../LICENSE) · [Source attribution](../docs/NOTICE.md) · [中文](README_CN.md)

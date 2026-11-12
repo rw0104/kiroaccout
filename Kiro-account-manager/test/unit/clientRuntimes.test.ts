@@ -24,7 +24,7 @@ interface RuntimeFixture {
   writes: Array<{ target: ExternalClientTarget; config: ClientRuntimeConfig }>
   deps: ClientRuntimeDependencies
   put(path: string, content: string): void
-  install(name: string, target: ExternalClientTarget): string
+  install(name: string, target: ExternalClientTarget, version?: string): string
   registry: ClientRuntimeRegistry
   probe(next: RuntimeProbe): void
 }
@@ -44,15 +44,16 @@ function fixture(t: TestContext): RuntimeFixture {
     helperPath, platform: 'win32', home: join(directory, 'home'), env: {},
     readConfig: target => configs.get(target),
     writeConfig: (target, config) => { writes.push({ target, config }); configs.set(target, config) },
-    probeExecutable: async (path, target) => { probed.push(path); return await probe(path, target) }
+    probeExecutable: async (path, target) => { probed.push(path); return await probe(path, target) },
+    verifyCompatibility: async () => {}
   }
-  const install = (name: string, target: ExternalClientTarget): string => {
+  const install = (name: string, target: ExternalClientTarget, version = '0.12.0'): string => {
     const executable = join(directory, name, target === 'cli' ? 'kiro-cli.exe' : 'KiroCrew.exe')
     put(executable, `SYNTHETIC_OFFICIAL_EXE_${name}`)
     if (target === 'crew') {
       const backend = join(dirname(executable), 'resources/backend-dist/kirocrew-backend')
       for (const filename of ['python.exe', 'python3.dll', 'python312.dll', 'BUILD']) put(join(backend, filename), `SYNTHETIC_${filename}`)
-      put(join(backend, 'Lib/site-packages/kirocrew-0.12.0.dist-info/METADATA'), 'Name: kirocrew\nVersion: 0.12.0\n')
+      put(join(backend, `Lib/site-packages/kirocrew-${version}.dist-info/METADATA`), `Name: kirocrew\nVersion: ${version}\n`)
       for (const filename of ['auth/__init__.py', 'auth/store.py', 'auth/provider.py', 'auth/refresh.py',
         'secrets/__init__.py', 'secrets/vault.py', 'platform_compat.py', 'platform_lock_compat.py',
         'platform_owner_compat.py', 'platform_compat_links.py', 'windows_acl.py',
@@ -205,4 +206,78 @@ test('invalid imported configuration invalidates the cache and does not fall bac
   assert.equal(f.registry.adapter(previous.id), undefined)
   assert.equal(await f.registry.get('cli'), undefined)
   assert.equal(f.probed.length, 1)
+})
+
+test('verified CLI 3.2.1 keeps the native access adapter without an obsolete exact-version gate', async t => {
+  const f = fixture(t)
+  const executablePath = f.install('new-cli', 'cli')
+  f.configs.set('cli', { executablePath, dataHome: join(f.directory, 'cli-data') })
+  f.probe(async () => ({ valid: true, publisher: 'CN=Amazon.com, Inc.', version: '3.2.1' }))
+  const runtime = await f.registry.get('cli')
+  assert.equal(runtime?.version, '3.2.1')
+  assert.ok(runtime?.adapter)
+})
+
+test('Crew metadata follows its installation version and exports a verified native repair descriptor', async t => {
+  const f = fixture(t)
+  const executablePath = f.install('new-crew', 'crew', '0.12.2')
+  f.configs.set('crew', { executablePath, dataHome: join(f.directory, 'crew-data') })
+  f.probe(async () => ({ valid: true, publisher: 'CN=Amazon.com, Inc.', version: '0.12.2' }))
+  const runtime = await f.registry.get('crew')
+  assert.equal(runtime?.version, '0.12.2')
+  const installation = await f.registry.crewInstallation()
+  assert.equal(installation?.executablePath, executablePath)
+  assert.equal(installation?.version, '0.12.2')
+  assert.equal(installation?.revision, runtime?.revision)
+  assert.equal(installation?.pythonExecutable, join(dirname(executablePath), 'resources/backend-dist/kirocrew-backend/python.exe'))
+})
+
+test('a later Crew patch with the verified access contract is accepted but a changed contract is rejected', async t => {
+  const f = fixture(t)
+  const executablePath = f.install('future-crew', 'crew', '0.12.3')
+  f.configs.set('crew', { executablePath, dataHome: join(f.directory, 'crew-data') })
+  f.probe(async () => ({ valid: true, publisher: 'CN=Amazon.com, Inc.', version: '0.12.3' }))
+  let compatibilityCalls = 0
+  f.deps.verifyCompatibility = async () => { compatibilityCalls++ }
+  assert.equal((await f.registry.get('crew'))?.version, '0.12.3')
+  assert.equal(compatibilityCalls, 1)
+  const current = (await f.registry.get('crew'))!
+  f.put(join(dirname(executablePath), 'resources/backend-dist/kirocrew-backend/Lib/site-packages/kiro_crew/auth/store.py'), '# NEW_UNVERIFIED_CONTRACT')
+  f.deps.verifyCompatibility = async () => { throw new Error('unsupported-client-contract') }
+  assert.equal(f.registry.adapter(current.id), undefined)
+  await assert.rejects(f.registry.get('crew'), /unsupported-client-contract/)
+})
+
+test('ambiguous Crew package metadata and unknown CLI versions fail before native credential writes', async t => {
+  const f = fixture(t)
+  const executablePath = f.install('ambiguous-crew', 'crew')
+  f.put(join(dirname(executablePath), 'resources/backend-dist/kirocrew-backend/Lib/site-packages/kirocrew-0.12.2.dist-info/METADATA'), 'Name: kirocrew\nVersion: 0.12.2\n')
+  f.configs.set('crew', { executablePath, dataHome: join(f.directory, 'crew-data') })
+  await assert.rejects(f.registry.get('crew'), /unsupported-client-contract/)
+  const cli = f.install('unknown-cli', 'cli')
+  f.configs.set('cli', { executablePath: cli, dataHome: join(f.directory, 'cli-data') })
+  f.probe(async () => ({ valid: true, publisher: 'CN=Amazon.com, Inc.', version: '4.0.0' }))
+  await assert.rejects(f.registry.get('cli'), /unsupported-client-version/)
+  f.probe(async () => ({ valid: true, publisher: 'CN=Amazon.com, Inc.', version: '3.2.1-preview' }))
+  await assert.rejects(f.registry.get('cli'), /unsupported-client-version/)
+  assert.equal(f.writes.length, 0)
+})
+
+test('a signed known-version executable cannot admit an unverified access implementation', async t => {
+  const f = fixture(t)
+  const executablePath = f.install('unverified-crew', 'crew')
+  f.configs.set('crew', { executablePath, dataHome: join(f.directory, 'crew-data') })
+  f.deps.verifyCompatibility = undefined
+  await assert.rejects(f.registry.get('crew'), /unsupported-client-contract/)
+  assert.equal(f.writes.length, 0)
+})
+
+test('adding conflicting package metadata invalidates an already returned native adapter', async t => {
+  const f = fixture(t)
+  const executablePath = f.install('changed-metadata-crew', 'crew')
+  f.configs.set('crew', { executablePath, dataHome: join(f.directory, 'crew-data') })
+  const runtime = (await f.registry.get('crew'))!
+  f.put(join(dirname(executablePath), 'resources/backend-dist/kirocrew-backend/Lib/site-packages/kirocrew-0.12.2.dist-info/METADATA'), 'Name: kirocrew\nVersion: 0.12.2\n')
+  assert.equal(f.registry.adapter(runtime.id), undefined)
+  await assert.rejects(f.registry.get('crew'), /unsupported-client-contract/)
 })

@@ -56,6 +56,10 @@ import { ClientAccessProjectionService, type ManagerAccessSnapshot, type ClientA
 import { ClientSwitchService } from './clientSwitch'
 import { ClientRuntimeRegistry, type ClientRuntimeConfig } from './clientRuntimes'
 import { registerClientSwitchIpc } from './ipc/clientSwitch'
+import { CrewModelRepairService } from './crewModelRepair'
+import { assertCrewStopped } from './clientProcessGuard'
+import { registerClientModelRepairIpc } from './ipc/clientModelRepair'
+import type { ClientModelRepairState } from '../shared/clientModelRepair'
 import { trackWindowVisibility } from './windowVisibility'
 import { filterAvailableModels, toAccountModel } from '../shared/modelCatalog'
 import { KiroModelPreferencesService, ModelPreferencesError, type ModelPreferenceAccount } from './kiroModelPreferences'
@@ -1338,6 +1342,52 @@ function setupClientSwitching(): void {
       store.set('clientSwitchRuntimes', { ...(previous && typeof previous === 'object' ? previous : {}), [target]: config })
     }
   })
+  const unavailableModels = (): ClientModelRepairState => ({ status: 'error', ready: false, canRepair: false, canRestore: false,
+    errorCode: 'repair-resources-unavailable', message: '模型修复资源不可用，请重新安装管理器后再检测。',
+    messageEn: 'Model repair resources are unavailable. Reinstall the manager and inspect again.' })
+  let modelRepair: Pick<CrewModelRepairService, 'inspect' | 'inspectReadiness' | 'repair' | 'restore'> = {
+    inspect: async () => unavailableModels(),
+    inspectReadiness: async () => unavailableModels(),
+    repair: async () => ({ success: false, state: unavailableModels() }),
+    restore: async () => ({ success: false, state: unavailableModels() })
+  }
+  try {
+    modelRepair = new CrewModelRepairService({
+      resourcesRoot: join(__dirname, '../../resources/crew-model-repair').replace(/app\.asar([/\\])/, 'app.asar.unpacked$1'),
+      backupRoot: join(app.getPath('userData'), 'client-model-repair/backups'),
+      installation: () => process.platform === 'win32' ? runtimes.crewInstallation() : Promise.resolve(undefined),
+      assertStopped: assertCrewStopped
+    })
+  } catch { console.warn('[Client Models] Native model repair resources are unavailable') }
+  let modelMaintenance = false
+  let projectionTick: Promise<void> | undefined
+  let crewOperations = 0
+  let crewDrained: Promise<void> | undefined
+  let resolveCrewDrained: (() => void) | undefined
+  const maintenanceState = (): ClientModelRepairState => ({ status: 'error', ready: false, canRepair: false, canRestore: false,
+    errorCode: 'operation-in-progress', message: '正在更新 Crew 模型兼容文件，请稍候再检测或切换。',
+    messageEn: 'Crew compatibility files are being updated. Wait before inspecting or switching.' })
+  const changeModels = async (action: 'repair' | 'restore', revision: string) => {
+    if (modelMaintenance) return { success: false, state: maintenanceState() }
+    modelMaintenance = true
+    try {
+      await Promise.all([projectionTick, crewDrained])
+      return await modelRepair[action](revision)
+    }
+    finally { modelMaintenance = false }
+  }
+  const modelActions = {
+    inspect: async () => modelMaintenance ? maintenanceState() : modelRepair.inspect(),
+    readiness: async () => modelMaintenance ? maintenanceState() : modelRepair.inspectReadiness(),
+    repair: (revision: string) => changeModels('repair', revision),
+    restore: (revision: string) => changeModels('restore', revision)
+  }
+  registerClientModelRepairIpc({ ipc: ipcMain,
+    trusted: event => requireTrustedMainWindow(event, mainWindow, join(__dirname, '../renderer/index.html'), is.dev ? process.env['ELECTRON_RENDERER_URL'] : undefined),
+    accountExists: accountId => {
+      const saved = store?.get('accountData') as { accounts?: Record<string, unknown> } | undefined
+      return !!saved?.accounts && Object.hasOwn(saved.accounts, accountId)
+    }, service: modelActions })
   const projection = new ClientAccessProjectionService({
     account: getClientProjectionAccess,
     adapter: id => runtimes.adapter(id),
@@ -1353,6 +1403,22 @@ function setupClientSwitching(): void {
   clientAccessProjection = projection
   const service = new ClientSwitchService({
     account: getClientProjectionAccess, runtime: target => runtimes.get(target), projection, bindings,
+    inspectModels: () => modelActions.readiness(),
+    beginModelOperation: target => {
+      if (target !== 'crew') return () => {}
+      if (modelMaintenance) throw new Error('model-maintenance')
+      if (crewOperations++ === 0) crewDrained = new Promise(resolve => { resolveCrewDrained = resolve })
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        if (--crewOperations === 0) {
+          resolveCrewDrained?.()
+          crewDrained = undefined
+          resolveCrewDrained = undefined
+        }
+      }
+    },
     platformSupported: () => process.platform === 'win32',
     beginOperation: accountId => instanceAccountOwnership.beginOperation({ accountId })
   })
@@ -1367,14 +1433,23 @@ function setupClientSwitching(): void {
         properties: ['openFile'], filters: [{ name: 'Official Kiro client', extensions: process.platform === 'win32' ? ['exe'] : ['*'] }] })
       if (selected.canceled || selected.filePaths.length !== 1) return { success: false, canceled: true }
       try { await runtimes.configure(target, selected.filePaths[0]); return { success: true } }
-      catch { return { success: false, message: '请选择已验证版本的官方客户端（CLI 3.1.0 / Crew 0.12.0）；此安装未通过兼容性检查。' } }
+      catch { return { success: false, message: '此官方客户端的签名、文件或登录协议未通过兼容性检查，请确认版本并重新检测。' } }
     }
   })
-  const tick = async (): Promise<void> => {
-    // Hydrate and revalidate adapters before resuming persisted projection bindings.
-    const selected = new Set(bindings().filter(binding => binding.status === 'active').map(binding => binding.runtimeId.startsWith('crew:') ? 'crew' as const : 'cli' as const))
-    await Promise.all([...selected].map(target => runtimes.get(target).catch(() => undefined)))
-    await projection.tick()
+  const tick = (): Promise<void> => {
+    // A source repair must not race this manager's bundled-Python access helper.
+    if (modelMaintenance) return Promise.resolve()
+    if (projectionTick) return projectionTick
+    const task = (async () => {
+      // Hydrate and revalidate adapters before resuming persisted projection bindings.
+      const selected = new Set(bindings().filter(binding => binding.status === 'active').map(binding => binding.runtimeId.startsWith('crew:') ? 'crew' as const : 'cli' as const))
+      await Promise.all([...selected].map(target => runtimes.get(target).catch(() => undefined)))
+      if (!modelMaintenance) await projection.tick()
+    })()
+    projectionTick = task
+    const clear = (): void => { if (projectionTick === task) projectionTick = undefined }
+    void task.then(clear, clear)
+    return task
   }
   clientProjectionTimer = setInterval(() => { void tick().catch(() => {}) }, 15_000)
   clientProjectionTimer.unref?.()

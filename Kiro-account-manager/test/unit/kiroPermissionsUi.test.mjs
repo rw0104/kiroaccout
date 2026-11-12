@@ -390,7 +390,7 @@ test('permissions section renders manual config, restrictive rules, invalid YAML
   assert.equal(text(byId(tree, 'kiro-permissions-restore-status')), 'No restore snapshot')
   assert.equal(byId(tree, 'kiro-permissions-apply').props.disabled, true)
   assert.equal(byId(tree, 'kiro-permissions-restore').props.disabled, true)
-  assert.match(text(byId(tree, 'kiro-permissions-restrictions-warning')), /deny: 1, ask: 2, conditional allow: 3/)
+  assert.match(text(byId(tree, 'kiro-permissions-restrictions-warning')), /deny: 1, ask: 2, evaluate: 0, conditional allow: 3/)
   assert.ok(byId(tree, 'kiro-permissions-unknown-rules-note'))
 
   // Toggle details drawer
