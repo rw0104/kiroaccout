@@ -6,6 +6,9 @@ import vm from 'node:vm'
 
 const ts = createRequire(import.meta.url)('typescript')
 const quiet = { log() {}, warn() {}, error() {} }
+const poolContext = vm.createContext({ exports: {}, console: quiet })
+vm.runInContext(ts.transpileModule(readFileSync(new URL('../../src/main/proxy/accountPool.ts', import.meta.url), 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, poolContext)
+const { upstreamHttpStatus, isCredentialRejection } = poolContext.exports
 const source = readFileSync(new URL('../../src/main/proxy/proxyServer.ts', import.meta.url), 'utf8')
 const tree = ts.createSourceFile('server.ts', source, ts.ScriptTarget.Latest, true)
 const declaration = tree.statements.find(node => ts.isClassDeclaration(node) && node.name?.text === 'ProxyServer')
@@ -16,7 +19,7 @@ const compiled = ts.transpileModule(`class Subject { ${members} }; globalThis.Su
 function harness(refresh, remainingSeconds = 120, random = () => 0) {
   let now = 1_800_000_000_000
   const DateClock = class extends Date { static now() { return now } }
-  const context = vm.createContext({ Date: DateClock, Math: { floor: Math.floor, min: Math.min, random }, console: quiet, Set, Map, ErrorType: { RECOVERABLE: 'recoverable' } })
+  const context = vm.createContext({ Date: DateClock, Math: { floor: Math.floor, min: Math.min, random }, upstreamHttpStatus, isCredentialRejection, console: quiet, Set, Map, ErrorType: { RECOVERABLE: 'recoverable' } })
   vm.runInContext(compiled, context)
   const server = new context.Subject()
   const accounts = new Map([['A', { id: 'A', accessToken: 'SYNTHETIC_ACCESS', refreshToken: 'SYNTHETIC_REFRESH', expiresAt: now + remainingSeconds * 1000, isAvailable: true }]])
@@ -60,7 +63,8 @@ test('actual proxy never retains an expired, near-expiry, unknown or permanently
   for (const [remaining, failureKind] of [[0, 'temporary'], [9, 'temporary'], [120, 'reauth-required'], [120, undefined]]) {
     const h = harness(async () => ({ success: false, failureKind }), remaining)
     assert.equal(await h.server.getAvailableAccount(), null, `${remaining}/${failureKind}`)
-    assert.equal(h.accounts.get('A').isAvailable, false)
+    assert.equal(await h.server.getAvailableAccount(), null, 'an unusable token cannot escape the refresh gate')
+    assert.equal(h.calls, 1, 'neither cooldown nor permanent failures immediately repeat the refresh')
   }
   const boundary = harness(async () => ({ success: false, failureKind: 'temporary' }), 10)
   assert.equal((await boundary.server.getAvailableAccount())?.id, 'A', 'ten seconds is the inclusive usable boundary')
@@ -93,7 +97,7 @@ test('forced authentication refresh cannot reuse the rejected old token or a pro
   const account = h.accounts.get('A')
   assert.equal(await h.server.refreshToken(account), true)
   assert.equal(await h.server.refreshToken(account, undefined, true), false)
-  assert.equal(h.accounts.get('A').isAvailable, false)
+  assert.equal(await h.server.getAvailableAccount(), null)
   const same = harness(async (account, now) => ({ success: true, accessToken: account.accessToken, refreshToken: account.refreshToken, expiresAt: now + 600000 }))
   assert.equal(await same.server.refreshToken(same.accounts.get('A'), undefined, true), false)
   assert.equal(same.accounts.get('A').isAvailable, false)
@@ -215,4 +219,44 @@ test('the main-process refresh callback forwards failure classifications and rej
     assert.equal(await h.server.getAvailableAccount(), null)
     assert.equal(h.updates.length, 0, `invalid expiresIn: ${expiresIn}`)
   }
+})
+
+test('an expired token recovers after a temporary refresh outage without restarting or resyncing the pool', async () => {
+  let recovered = false
+  const h = harness(async (_account, now) => recovered
+    ? { success: true, accessToken: 'SYNTHETIC_RECOVERED', refreshToken: 'SYNTHETIC_RECOVERED_REFRESH', expiresAt: now + 3600000 }
+    : { success: false, failureKind: 'temporary' }, -1)
+  assert.equal(await h.server.getAvailableAccount(), null)
+  recovered = true
+  h.advance(29_000)
+  assert.equal(await h.server.getAvailableAccount(), null)
+  assert.equal(h.calls, 1, 'a temporary outage has a bounded retry cooldown')
+  h.advance(1_001)
+  assert.equal((await h.server.getAvailableAccount())?.accessToken, 'SYNTHETIC_RECOVERED')
+  assert.equal(h.calls, 2)
+})
+
+test('a rejected access token stays unused during a temporary refresh outage but recovers after cooldown', async () => {
+  let recovered = false
+  const h = harness(async (_account, now) => recovered
+    ? { success: true, accessToken: 'SYNTHETIC_RECOVERED', expiresAt: now + 3600000 }
+    : { success: false, failureKind: 'temporary' }, 120)
+  assert.equal(await h.server.refreshToken(h.accounts.get('A'), undefined, true), false)
+  assert.equal(await h.server.getAvailableAccount(), null, 'never reuse an upstream-rejected access token')
+  recovered = true
+  h.advance(30_001)
+  assert.equal((await h.server.getAvailableAccount())?.accessToken, 'SYNTHETIC_RECOVERED')
+  assert.equal(h.calls, 2)
+})
+
+test('a short-lived rotation published by the manager bridge is not refreshed again on every request', async () => {
+  const h = harness(async (_account, now) => {
+    const rotated = { accessToken: 'SYNTHETIC_BRIDGE_ACCESS', refreshToken: 'SYNTHETIC_BRIDGE_REFRESH', expiresAt: now + 120000 }
+    h.accounts.set('A', { ...h.accounts.get('A'), ...rotated })
+    return { success: true, ...rotated }
+  })
+  assert.equal((await h.server.getAvailableAccount())?.accessToken, 'SYNTHETIC_BRIDGE_ACCESS')
+  h.advance(20_000)
+  assert.equal((await h.server.getAvailableAccount())?.accessToken, 'SYNTHETIC_BRIDGE_ACCESS')
+  assert.equal(h.calls, 1)
 })

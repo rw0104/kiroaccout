@@ -22,6 +22,7 @@ assert.equal(properties.length, names.length)
 const factory = ts.transpileModule(`
 let saveDebounceTimer = null, saveMaxWaitTimer = null, saveInFlight = null, lastSaveError = null;
 let savePendingResolvers = [], accountPersistenceQueue = Promise.resolve();
+const saveQueuedFlushes = new Map();
 const SAVE_DEBOUNCE_MS = 500, SAVE_MAX_WAIT_MS = 5000;
 ${helpers.join('\n')}\nconst actions = {${properties.join(',\n')}}`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
 const account = (accessToken = 'SYNTHETIC_ACCESS_0', refreshToken = 'SYNTHETIC_REFRESH_0') => ({

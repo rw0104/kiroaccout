@@ -59,6 +59,9 @@ const SAVE_MAX_WAIT_MS = 5000
 let saveDebounceTimer: ReturnType<typeof setTimeout> | null = null
 let saveMaxWaitTimer: ReturnType<typeof setTimeout> | null = null
 let saveInFlight: Promise<void> | null = null
+// Waiters for the same purpose share the next snapshot. Delete the entry before
+// starting it so mutations arriving during that write can request another one.
+const saveQueuedFlushes = new Map<string | undefined, Promise<void>>()
 let lastSaveError: Error | null = null
 // Every snapshot writer shares this queue. Build snapshots inside the queue so a
 // delayed autosave cannot restore an account after a confirmed deletion.
@@ -1992,10 +1995,15 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     const pending = savePendingResolvers
     savePendingResolvers = []
     if (saveInFlight) {
-      await saveInFlight
-      // A mutation can arrive while the previous snapshot is being saved.
-      // Persist a fresh snapshot before acknowledging this flush.
-      await get().flushSaveImmediately(updateRequestId)
+      let next = saveQueuedFlushes.get(updateRequestId)
+      if (!next) {
+        next = saveInFlight.then(() => {
+          saveQueuedFlushes.delete(updateRequestId)
+          return get().flushSaveImmediately(updateRequestId)
+        })
+        saveQueuedFlushes.set(updateRequestId, next)
+      }
+      await next
       for (const resolve of pending) resolve()
       return
     }

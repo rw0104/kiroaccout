@@ -56,7 +56,7 @@ export function normalizeRefreshProfileArn(value: unknown): string | undefined {
 
 // These codes establish that no connection was made, so no refresh POST was sent.
 // Socket resets, generic timeouts and unknown errors may hide a completed rotation.
-const connectionSetupCodes = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'UND_ERR_CONNECT_TIMEOUT'])
+const connectionSetupCodes = new Set(['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'UND_ERR_CONNECT_TIMEOUT', 'ERR_PROXY_POOL_CAPACITY'])
 function failedBeforeConnection(error: unknown, depth = 0): boolean {
   if (!error || typeof error !== 'object' || depth >= 8) return false
   const detail = error as { code?: unknown; cause?: unknown; errors?: unknown }

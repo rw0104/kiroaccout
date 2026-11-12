@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { useShallow } from 'zustand/react/shallow'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import { AccountToolbar, type AccountViewMode } from './AccountToolbar'
@@ -27,7 +28,14 @@ export function AccountManager({ onBack }: AccountManagerProps): React.ReactNode
     selectedIds,
     activeGroupTab,
     groups
-  } = useAccountsStore()
+  } = useAccountsStore(useShallow(state => ({
+    isLoading: state.isLoading,
+    accounts: state.accounts,
+    importAccountPlan: state.importAccountPlan,
+    selectedIds: state.selectedIds,
+    activeGroupTab: state.activeGroupTab,
+    groups: state.groups
+  })))
 
   const [showAddDialog, setShowAddDialog] = useState(false)
   const [editingAccount, setEditingAccount] = useState<Account | null>(null)

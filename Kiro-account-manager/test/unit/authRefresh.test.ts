@@ -289,7 +289,7 @@ test('refresh failures distinguish temporary responses, permanent credentials an
 test('connection setup failures allow a later explicit refresh without automatically replaying the POST', async () => {
   const setupError = (code: string) => Object.assign(new Error('SYNTHETIC_PRIVATE_CONNECTION'), { code })
   for (const cause of [
-    ...['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'UND_ERR_CONNECT_TIMEOUT'].map(setupError),
+    ...['ENOTFOUND', 'EAI_AGAIN', 'ECONNREFUSED', 'UND_ERR_CONNECT_TIMEOUT', 'ERR_PROXY_POOL_CAPACITY'].map(setupError),
     new AggregateError([setupError('ECONNREFUSED'), setupError('ENOTFOUND')])
   ]) {
     let calls = 0

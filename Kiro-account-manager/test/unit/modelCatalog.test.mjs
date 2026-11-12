@@ -8,6 +8,9 @@ import { requestControlPlane } from '../../src/main/kiroControlPlane.ts'
 import { extractThinkingSchema, filterAvailableModels, modelUnavailableReason, toAccountModel, ModelRequestError } from '../../src/shared/modelCatalog.ts'
 
 const ts = createRequire(import.meta.url)('typescript')
+const poolContext = vm.createContext({ exports: {}, console })
+vm.runInContext(ts.transpileModule(readFileSync(new URL('../../src/main/proxy/accountPool.ts', import.meta.url), 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, poolContext)
+const { upstreamHttpStatus, isCredentialRejection } = poolContext.exports
 const clean = value => JSON.parse(JSON.stringify(value))
 const sourceTree = path => {
   const source = readFileSync(new URL(`../../src/${path}`, import.meta.url), 'utf8')
@@ -112,7 +115,7 @@ function serverHarness(fetcher) {
   const names = ['clearModelCache', 'cleanupModelCache', 'modelCacheKey', 'loadModelCatalog', 'getThinkingConfig', 'getAvailableModels', 'handleModels', 'handleApiError']
   const members = declaration.members.filter(node => names.includes(node.name?.getText(tree))).map(node => node.getText(tree)).join('\n')
   const functions = tree.statements.filter(node => ts.isFunctionDeclaration(node)).map(node => node.getText(tree)).join('\n')
-  const context = vm.createContext({ crypto, Buffer, extractThinkingSchema, filterAvailableModels, modelUnavailableReason, toAccountModel, ModelRequestError,
+  const context = vm.createContext({ crypto, Buffer, upstreamHttpStatus, isCredentialRejection, extractThinkingSchema, filterAvailableModels, modelUnavailableReason, toAccountModel, ModelRequestError,
     mapModelId: id => id, fetchKiroModels: fetcher, setModelContextWindow() {}, classifyError: () => 'other', console, Map, Set, Error })
   execute(`${functions}\nclass Subject { ${members} }; globalThis.Subject=Subject`, context)
   const server = new context.Subject()

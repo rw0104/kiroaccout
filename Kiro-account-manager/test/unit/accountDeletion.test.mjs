@@ -26,6 +26,7 @@ assert.equal(actions.length, actionNames.length)
 const script = ts.transpileModule(`
 let saveDebounceTimer = null, saveMaxWaitTimer = null, saveInFlight = null, lastSaveError = null;
 let savePendingResolvers = [], accountPersistenceQueue = Promise.resolve();
+const saveQueuedFlushes = new Map();
 ${helpers.join('\n')}
 const actions = {${actions.join(',\n')}};
 `, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText

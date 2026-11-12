@@ -8,6 +8,20 @@ export enum ErrorType {
   RECOVERABLE = 'recoverable' // 账号问题 → 切换到下一个账号
 }
 
+/** Only structured status or an explicit leading HTTP status is evidence of a response.
+ * Request IDs, ports and offsets inside arbitrary error text are not status codes.
+ */
+export function upstreamHttpStatus(error: { upstreamStatus?: number; message?: string }): number | undefined {
+  if (Number.isInteger(error.upstreamStatus) && error.upstreamStatus! >= 400 && error.upstreamStatus! < 600) return error.upstreamStatus
+  const match = error.message?.match(/^\s*(?:(?:HTTP(?:\s+status)?|Kiro API(?:\s+Error)?|API(?:\s+error)?)\s*:?\s*)?([45]\d{2})(?=\s|:|$)/i)
+  return match ? Number(match[1]) : undefined
+}
+
+export function isCredentialRejection(error: { upstreamStatus?: number; message?: string }): boolean {
+  const status = upstreamHttpStatus(error)
+  return status === 401 || status === 403 && /(?:expired|invalid)\s+(?:access\s+)?token|token\s+(?:is\s+)?(?:expired|invalid)|\b(?:NotAuthorizedException|UnauthorizedException)\b/i.test(error.message || '')
+}
+
 // 根据 HTTP 状态码和错误原因分类错误
 export function classifyError(statusCode: number, reason?: string): ErrorType {
   // RECOVERABLE: 配额/计费问题
@@ -110,6 +124,31 @@ export class AccountPool {
     const account = this.accounts.get(accountId)
     if (account) {
       this.accounts.set(accountId, { ...account, ...updates })
+    }
+  }
+
+  /** Publish a completed manager rotation without clearing quota, statistics or suspension.
+   * The expected input token prevents a delayed result from replacing a newer generation.
+   */
+  applyTokenRotation(expectedRefreshToken: string, rotation: {
+    accessToken: string; refreshToken?: string; expiresAt: number; profileArn?: string
+  }, expectedAccounts: readonly ProxyAccount[]): void {
+    if (!expectedRefreshToken || !rotation.accessToken || !Number.isFinite(rotation.expiresAt) || rotation.expiresAt <= Date.now()) return
+    for (const expected of expectedAccounts) {
+      const account = this.accounts.get(expected.id)
+      if (!account || account.refreshToken !== expectedRefreshToken ||
+          account.accessToken !== expected.accessToken || account.expiresAt !== expected.expiresAt ||
+          account.clientId !== expected.clientId || account.clientSecret !== expected.clientSecret ||
+          account.provider !== expected.provider || account.authMethod !== expected.authMethod ||
+          account.region !== expected.region || account.profileArn !== expected.profileArn) continue
+      this.accounts.set(account.id, {
+        ...account,
+        accessToken: rotation.accessToken,
+        refreshToken: rotation.refreshToken || expectedRefreshToken,
+        expiresAt: rotation.expiresAt,
+        ...(rotation.profileArn && account.authMethod === 'social' ? { profileArn: rotation.profileArn } : {}),
+        isAvailable: !this.isSuspended(account)
+      })
     }
   }
 
@@ -326,6 +365,7 @@ export class AccountPool {
         ...account,
         requestCount: (account.requestCount || 0) + 1,
         errorCount: 0, // 重置断路器失败计数
+        cooldownUntil: undefined,
         lastUsed: Date.now(),
         isAvailable: true
       })
@@ -376,7 +416,9 @@ export class AccountPool {
     // 配额类错误额外标记耗尽，并按配置的 quotaResetMs 设定自动恢复时间。
     // 否则 quotaExhaustedAt 一直 > 0，isQuotaExhausted 永远为 true，
     // 该账号会被永久跳过（直到 updateQuota/reset 被显式调用）。
-    const isQuotaError = statusCode === 402 || statusCode === 429
+    // 429 is temporary throttling. Only explicit quota exhaustion earns the
+    // long quota-reset window; otherwise a brief throttle becomes a local 503.
+    const isQuotaError = statusCode === 402
     if (isQuotaError) {
       quotaExhaustedAt = now
       // 仅在没有更明确的重置时间，或已有重置时间已过期时，按冷却窗口顺延
@@ -399,6 +441,7 @@ export class AccountPool {
       errorCount,
       quotaExhaustedAt,
       quotaResetAt,
+      cooldownUntil: now + effectiveCooldown,
       lastUsed: now
     })
   }

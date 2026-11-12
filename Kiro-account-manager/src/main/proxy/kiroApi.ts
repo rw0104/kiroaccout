@@ -23,7 +23,7 @@ import { KIRO_LEGACY_IDENTITY } from '../../shared/kiroClientCompatibility'
 import { isRetiredModelId, ModelRequestError, type KiroModel } from '../../shared/modelCatalog'
 export type { KiroModel } from '../../shared/modelCatalog'
 import { getKProxyService } from '../kproxy'
-import { getSystemProxy, safeCreateProxyAgent } from './systemProxy'
+import { getSystemProxy, getSharedProxyAgent } from './systemProxy'
 import {
   countTokens,
   getModelContextLength,
@@ -112,7 +112,7 @@ function estimatePayloadTokens(payload: KiroPayload): number {
 function getNetworkAgent(account?: ProxyAccount): Dispatcher | undefined {
   // 1. 账号专属代理：实现"N 个账号共用 1 个 IP"的分桶反代
   if (account?.proxyUrl) {
-    const agent = safeCreateProxyAgent(account.proxyUrl)
+    const agent = getSharedProxyAgent(account.proxyUrl)
     if (agent) {
       proxyLogger.debug('KiroAPI', `Using account-bound proxy for ${account.email || account.id}`)
       return agent
@@ -124,16 +124,16 @@ function getNetworkAgent(account?: ProxyAccount): Dispatcher | undefined {
     if (kproxyService?.isRunning()) {
       const config = kproxyService.getConfig()
       const proxyUrl = `http://${config.host}:${config.port}`
-      const agent = safeCreateProxyAgent(proxyUrl, { targetCa: kproxyService.getCACertPem() || undefined })
+      const agent = getSharedProxyAgent(proxyUrl, { targetCa: kproxyService.getCACertPem() || undefined })
       if (agent) return agent
     }
   }
   // 3. 环境变量
   const envProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy
-  const envAgent = safeCreateProxyAgent(envProxy)
+  const envAgent = getSharedProxyAgent(envProxy)
   if (envAgent) return envAgent
   // 4. 系统代理
-  return safeCreateProxyAgent(getSystemProxy())
+  return getSharedProxyAgent(getSystemProxy())
 }
 
 /**

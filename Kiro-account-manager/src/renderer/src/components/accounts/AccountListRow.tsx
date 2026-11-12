@@ -1,4 +1,5 @@
 import { memo, useState, useMemo, useCallback } from 'react'
+import { useShallow } from 'zustand/react/shallow'
 import { useAccountsStore } from '@/store/accounts'
 import { useTranslation } from '@/hooks/useTranslation'
 import { Badge, Button } from '../ui'
@@ -62,14 +63,29 @@ function AccountListRowComponent({
     toggleSelection,
     maskEmail,
     maskNickname,
+    privacyMode,
     usagePrecision,
     updateAccountStatus,
-    accountOperationCounts,
+    isAccountOperationPending,
     accountProxyBindings,
     proxyPool,
     unbindAccountFromProxy
-  } = useAccountsStore()
-  const isAccountOperationPending = (accountOperationCounts.get(account.id) ?? 0) > 0
+  } = useAccountsStore(useShallow(state => ({
+    setActiveAccount: state.setActiveAccount,
+    removeAccount: state.removeAccount,
+    checkAccountStatus: state.checkAccountStatus,
+    refreshAccountToken: state.refreshAccountToken,
+    toggleSelection: state.toggleSelection,
+    maskEmail: state.maskEmail,
+    maskNickname: state.maskNickname,
+    privacyMode: state.privacyMode,
+    usagePrecision: state.usagePrecision,
+    updateAccountStatus: state.updateAccountStatus,
+    isAccountOperationPending: (state.accountOperationCounts.get(account.id) ?? 0) > 0,
+    accountProxyBindings: state.accountProxyBindings,
+    proxyPool: state.proxyPool,
+    unbindAccountFromProxy: state.unbindAccountFromProxy
+  })))
   const displayStatus = isAccountOperationPending ? 'refreshing' : account.status
 
   // 该账号绑定的代理（如有）
@@ -107,7 +123,7 @@ function AccountListRowComponent({
   const displayName = useMemo(() => {
     if (account.nickname) return maskNickname(account.nickname)
     return maskEmail(account.email)
-  }, [account.nickname, account.email, maskEmail, maskNickname])
+  }, [account.nickname, account.email, maskEmail, maskNickname, privacyMode])
 
   const maskedEmail = useMemo(() => maskEmail(account.email), [account.email, maskEmail])
 

@@ -266,6 +266,7 @@ test('real refresh wrapper returns a completed rotation when account persistence
   const context = vm.createContext({
     instanceAccountOwnership: { beginOperation: () => () => { released = true } },
     refreshSocialToken: async () => next, applyManagerTokenRotation,
+    proxyServer: undefined,
     store: { get: () => data, set: () => { throw new Error('SYNTHETIC_PRIVATE_PATH') } },
     mainWindow: { webContents: { send: (_event, update) => updates.push(update) } },
     pendingStoreWrites: new Map(), lastSavedData: null, console: { warn() {} }

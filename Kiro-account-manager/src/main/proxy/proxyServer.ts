@@ -17,7 +17,7 @@ import type {
   ProxyAccount,
   TokenRefreshCallback
 } from './types'
-import { AccountPool, ErrorType, classifyError } from './accountPool'
+import { AccountPool, ErrorType, classifyError, upstreamHttpStatus, isCredentialRejection } from './accountPool'
 import { RequestAdmission, RequestAdmissionError, requiresRequestAdmission } from './requestAdmission'
 import { downloadRemoteImageDataUrl } from './remoteImage'
 import { callKiroApiStream, callKiroApi, fetchKiroModels, mapModelId, setModelContextWindow, cleanupConversationCache, clearAllCaches, type KiroModel } from './kiroApi'
@@ -264,6 +264,7 @@ export class ProxyServer {
     generation: ProxyAccount
     nextAttemptAt: number
     failureKind?: 'temporary' | 'reauth-required' | 'uncertain'
+    accessRejected?: boolean
   }>()
   private isHttps: boolean = false
   private isStopping: boolean = false
@@ -1115,9 +1116,10 @@ export class ProxyServer {
 
   // 检查 Token 是否需要刷新
   private isTokenExpiringSoon(account: ProxyAccount): boolean {
+    const schedule = this.getRefreshSchedule(account)
+    if (schedule?.accessRejected) return true
     if (account.expiresAt === undefined) return false
     if (!Number.isFinite(account.expiresAt)) return true
-    const schedule = this.getRefreshSchedule(account)
     if (schedule && this.isAccessTokenUsable(account) && Date.now() <= schedule.nextAttemptAt) return false
     const refreshBeforeMs = (this.config.tokenRefreshBeforeExpiry || 300) * 1000
     return Date.now() + refreshBeforeMs >= account.expiresAt
@@ -1137,7 +1139,7 @@ export class ProxyServer {
       && account.expiresAt >= Date.now() + 10_000
   }
 
-  private getRefreshSchedule(account: ProxyAccount): { generation: ProxyAccount; nextAttemptAt: number; failureKind?: 'temporary' | 'reauth-required' | 'uncertain' } | undefined {
+  private getRefreshSchedule(account: ProxyAccount): { generation: ProxyAccount; nextAttemptAt: number; failureKind?: 'temporary' | 'reauth-required' | 'uncertain'; accessRejected?: boolean } | undefined {
     // Keep at most one schedule per currently present credential generation.
     for (const [id, schedule] of this.tokenRefreshSchedules) {
       if (!this.sameRefreshGeneration(schedule.generation, this.accountPool.getAccount(id))) this.tokenRefreshSchedules.delete(id)
@@ -1153,15 +1155,16 @@ export class ProxyServer {
       return
     }
     const usableUntil = (account.expiresAt ?? 0) - 10_000
-    const nextAttemptAt = failureKind === 'temporary' ? Math.min(Date.now() + 30_000, usableUntil) : usableUntil
-    this.tokenRefreshSchedules.set(account.id, { generation: { ...account }, nextAttemptAt, failureKind })
+    const nextAttemptAt = failureKind === 'temporary' ? Date.now() + 30_000 : usableUntil
+    const accessRejected = this.getRefreshSchedule(account)?.accessRejected
+    this.tokenRefreshSchedules.set(account.id, { generation: { ...account }, nextAttemptAt, failureKind, accessRejected })
   }
 
   private canRetainAccessToken(account: ProxyAccount): boolean {
     const current = this.accountPool.getAccount(account.id)
     if (!this.sameRefreshGeneration(account, current) || !this.isAccessTokenUsable(current)) return false
-    const kind = this.getRefreshSchedule(current!)?.failureKind
-    return kind === 'temporary' || kind === 'uncertain'
+    const schedule = this.getRefreshSchedule(current!)
+    return !schedule?.accessRejected && (schedule?.failureKind === 'temporary' || schedule?.failureKind === 'uncertain')
   }
 
   private acceptRefreshResult(account: ProxyAccount, outcome: 'rotated' | 'superseded' | 'failed', force: boolean): boolean {
@@ -1173,6 +1176,11 @@ export class ProxyServer {
     // A rejected access token cannot be retried just because a refresh cache
     // reports success for the same token, or a proactive waiter kept it alive.
     if (outcome === 'rotated' && this.isAccessTokenUsable(current) && current?.accessToken !== account.accessToken) return true
+    const schedule = current && this.getRefreshSchedule(current)
+    if (outcome === 'failed' && schedule?.failureKind === 'temporary' && this.sameRefreshGeneration(account, current)) {
+      schedule.accessRejected = true
+      return false
+    }
     if (current?.accessToken === account.accessToken && (outcome === 'rotated' || this.sameRefreshGeneration(account, current))) this.accountPool.markNeedsRefresh(account.id)
     return false
   }
@@ -1184,6 +1192,10 @@ export class ProxyServer {
     if (!current || current.isAvailable === false || this.accountPool.isSuspended(current)) return false
     if (!this.sameRefreshGeneration(account, current)) return this.acceptRefreshResult(account, 'superseded', force)
     const schedule = this.getRefreshSchedule(account)
+    if (schedule?.failureKind === 'temporary' && Date.now() < schedule.nextAttemptAt) {
+      if (force) schedule.accessRejected = true
+      return !force && this.canRetainAccessToken(account)
+    }
     // An uncertain POST must not be replayed for this generation, including after expiry.
     if (schedule?.failureKind === 'uncertain') {
       if (!force && this.canRetainAccessToken(account)) return true
@@ -1239,7 +1251,15 @@ export class ProxyServer {
       const current = this.accountPool.getAccount(account.id)
       if (!current) return 'failed'
       // Another operation may have rotated/rebound/removed this account while awaiting refresh.
-      if (!this.sameRefreshGeneration(account, current)) return 'superseded'
+      if (!this.sameRefreshGeneration(account, current)) {
+        // The manager bridge publishes a completed rotation before returning it.
+        // Retain the short-lifetime schedule for that exact published result too.
+        if (result.success && result.accessToken === current.accessToken &&
+            (result.refreshToken || account.refreshToken) === current.refreshToken && this.isAccessTokenUsable(current)) {
+          this.rememberRefreshSchedule(current)
+        }
+        return 'superseded'
+      }
       if (current.isAvailable === false || this.accountPool.isSuspended(current)) return 'failed'
       if (result.success && result.accessToken && typeof result.expiresAt === 'number' && Number.isFinite(result.expiresAt) && result.expiresAt > Date.now()) {
         // 更新账号池中的 Token
@@ -1266,7 +1286,9 @@ export class ProxyServer {
       } else {
         console.warn('[ProxyServer] Proxy account token refresh failed')
         this.rememberRefreshSchedule(current, result.failureKind ?? 'reauth-required')
-        if (!this.canRetainAccessToken(current)) this.accountPool.markNeedsRefresh(account.id)
+        // A definitely temporary outage must not permanently disable an account
+        // when its access token expires. Selection retries after the cooldown.
+        if (result.failureKind !== 'temporary' && !this.canRetainAccessToken(current)) this.accountPool.markNeedsRefresh(account.id)
         return 'failed'
       }
     } catch (error) {
@@ -1442,6 +1464,7 @@ export class ProxyServer {
         if ((error as { retryable?: boolean })?.retryable === false || (error as { outputStarted?: boolean })?.outputStarted) throw error
         lastError = error as Error
         const errMsg = lastError.message || ''
+        const upstreamStatus = upstreamHttpStatus(lastError)
 
         console.log(`[ProxyServer] API call failed (attempt ${attempt + 1}/${maxRetries}): ${errMsg}`)
 
@@ -1492,7 +1515,7 @@ export class ProxyServer {
         }
 
         // 401/403: 尝试刷新 Token
-        if (errMsg.includes('401') || errMsg.includes('403') || errMsg.includes('Auth')) {
+        if (isCredentialRejection(lastError)) {
           console.log('[ProxyServer] Auth error, attempting token refresh')
           const refreshed = await this.refreshToken(currentAccount, signal, true)
           if (refreshed) {
@@ -1511,9 +1534,9 @@ export class ProxyServer {
         }
 
         // 402/429: 额度耗尽，切换端点或账号
-        if (errMsg.includes('402') || errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('ThrottlingException') || errMsg.includes('reached the limit') || errMsg.includes('ServiceQuotaExceededException') || errMsg.includes('limit exceeded') || errMsg.includes('rate limit')) {
+        if (upstreamStatus === 402 || upstreamStatus === 429 || /\b(?:ThrottlingException|ServiceQuotaExceededException)\b/.test(errMsg)) {
           console.log('[ProxyServer] Quota/throttle error, switching endpoint or account')
-          this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, 429)
+          this.accountPool.recordError(currentAccount.id, ErrorType.RECOVERABLE, upstreamStatus === 402 || errMsg.includes('ServiceQuotaExceededException') ? 402 : 429)
           endpointIndex = (endpointIndex + 1) % 2 // 切换端点
           if (endpointIndex === 0) {
             // 已尝试所有端点，切换到没试过的下个账号
@@ -1532,7 +1555,7 @@ export class ProxyServer {
         }
 
         // 5xx: 同账号短退避重试一次；再次 5xx 直接 fallback 到没试过的账号（瞬时故障跨账号绕过）
-        if (errMsg.includes('500') || errMsg.includes('502') || errMsg.includes('503') || errMsg.includes('504')) {
+        if (upstreamStatus !== undefined && [500, 502, 503, 504].includes(upstreamStatus)) {
           console.log('[ProxyServer] Server error, retrying')
           // 第二次及以后的 5xx → 切换账号（旧逻辑会同账号撞死）
           if (attempt > 0) {
@@ -2750,8 +2773,8 @@ export class ProxyServer {
           res.end()
 
           this.recordRequestFailed()
-          const errStatusCode = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode ? classifyError(parseInt(errStatusCode)) : ErrorType.RECOVERABLE, errStatusCode ? parseInt(errStatusCode) : undefined)
+          const errStatusCode = upstreamHttpStatus(error)
+          this.accountPool.recordError(account.id, classifyError(errStatusCode ?? 500), errStatusCode)
           this.events.onResponse?.({ path: '/v1/chat/completions', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/chat/completions', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
@@ -3173,8 +3196,8 @@ export class ProxyServer {
           res.end()
 
           this.recordRequestFailed()
-          const errStatusCode2 = error.message.match(/(\d{3})/)?.[1]
-          this.accountPool.recordError(account.id, errStatusCode2 ? classifyError(parseInt(errStatusCode2)) : ErrorType.RECOVERABLE, errStatusCode2 ? parseInt(errStatusCode2) : undefined)
+          const errStatusCode2 = upstreamHttpStatus(error)
+          this.accountPool.recordError(account.id, classifyError(errStatusCode2 ?? 500), errStatusCode2)
           this.events.onResponse?.({ path: '/v1/messages', model, status: 500, error: error.message })
           this.recordRequest({ path: '/v1/messages', model, accountId: account.id, responseTime: Date.now() - startTime, success: false, error: error.message })
           resolve()
@@ -3199,11 +3222,9 @@ export class ProxyServer {
   private handleApiError(res: http.ServerResponse, account: { id: string }, error: Error, path: string, model?: string, startTime?: number, signal?: AbortSignal): void {
     if (this.isAbortError(error, signal) || this.isResponseClosed(res)) return
     this.recordRequestFailed()
-    const upstreamStatus = (error as { upstreamStatus?: number }).upstreamStatus
-    const errCode = error.message.match(/(\d{3})/)?.[1]
-    const parsedCode = error instanceof ModelRequestError ? 400 : upstreamStatus && upstreamStatus >= 400 && upstreamStatus < 600 ? upstreamStatus : errCode ? parseInt(errCode) : 500
+    const parsedCode = error instanceof ModelRequestError ? 400 : upstreamHttpStatus(error) ?? 500
     const errorType = classifyError(parsedCode)
-    const isAuthError = (error as { retryable?: boolean }).retryable !== false && (error.message.includes('401') || error.message.includes('403') || error.message.includes('Auth'))
+    const isAuthError = (error as { retryable?: boolean }).retryable !== false && isCredentialRejection(error)
 
     if (!(error instanceof ModelRequestError)) this.accountPool.recordError(account.id, errorType, parsedCode)
 

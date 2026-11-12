@@ -108,6 +108,14 @@ test('invalid rotation lifetime cannot overwrite credentials or activate an acco
   assert.equal(h.activated, null)
 })
 
+test('reusing the exact stored credentials does not perform a redundant credential snapshot save', async () => {
+  const h = fixture({ ide: () => ({ success: true, preparedExpiresAt: now + 60_000,
+    refreshedCredentials: { accessToken: 'SYNTHETIC_ACCESS_1', refreshToken: 'SYNTHETIC_REFRESH_1', expiresIn: 60 } }) })
+  assert.equal((await switchAccountToClients('candidate', 'ide', h.deps)).success, true)
+  assert.equal(h.saved.length, 0, 'only the activation needs persistence; credentials are unchanged')
+  assert.equal(h.activated, 'candidate')
+})
+
 test('an already expired prepared access token retains its new refresh token but never activates', async () => {
   for (const target of ['ide', 'cli', 'both']) {
     const expired = () => ({ ...rotated(3), preparedExpiresAt: now - 1 })

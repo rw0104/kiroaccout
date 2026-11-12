@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { useShallow } from 'zustand/react/shallow'
 import { motion, AnimatePresence } from 'framer-motion'
 import { AccountManager } from './components/accounts'
 import { Sidebar, TitleBar, type PageType } from './components/layout'
@@ -37,7 +38,20 @@ function App(): React.JSX.Element {
     checkAndRefreshExpiringTokens,
     updateAccountStatus,
     updateAccount
-  } = useAccountsStore()
+  } = useAccountsStore(useShallow(state => ({
+    loadFromStorage: state.loadFromStorage,
+    startAutoTokenRefresh: state.startAutoTokenRefresh,
+    stopAutoTokenRefresh: state.stopAutoTokenRefresh,
+    applyBackgroundRefreshResults: state.applyBackgroundRefreshResults,
+    applyBackgroundCheckResults: state.applyBackgroundCheckResults,
+    flushSaveImmediately: state.flushSaveImmediately,
+    accounts: state.accounts,
+    activeAccountId: state.activeAccountId,
+    setActiveAccount: state.setActiveAccount,
+    checkAndRefreshExpiringTokens: state.checkAndRefreshExpiringTokens,
+    updateAccountStatus: state.updateAccountStatus,
+    updateAccount: state.updateAccount
+  })))
 
   // 切换到下一个可用账户
   const switchToNextAccount = useCallback(() => {
