@@ -1,0 +1,155 @@
+{
+  "schemaVersion": 1,
+  "license": "Apache-2.0",
+  "upstream": "https://github.com/kirodotdev/KiroCrew",
+  "contracts": [
+    {
+      "id": "crew-0.12.2-model-catalog-v1",
+      "testedVersion": "0.12.2",
+      "upstreamCommit": "b6599234221cfc492c0dd95fdd53643e710c9f28",
+      "frontendEvent": "models_changed",
+      "files": [
+        {
+          "target": "agent_sdk/kas_model_catalog.py",
+          "resource": "0.12.2/agent_sdk/kas_model_catalog.py",
+          "beforeSha256": "21f6632c11cc6e4fdc6fb90efdb2a0148b119ec45152390838bbea886719374a",
+          "afterSha256": "5badd3a7ea9ac483aa3533cfad40e1dba11ade45bfcaa7ca86e8f4f7ef18f41d",
+          "normalized": true
+        },
+        {
+          "target": "acp/session_handle_model_selection.py",
+          "resource": "0.12.2/acp/session_handle_model_selection.py",
+          "beforeSha256": "58deea03f7352323bc509f221b3017f317b1ee57deb2a0b348e8216250a0608a",
+          "afterSha256": "612aad9f86b782e146b6d74daa27a97eeb59f69c8523963df1d4805cda1ff379",
+          "normalized": true
+        },
+        {
+          "target": "acp/session_handle_updates.py",
+          "resource": "0.12.2/acp/session_handle_updates.py",
+          "beforeSha256": "31ce06ae6cbf16aebfbf3e3d6de0037fa1451cd16df83990577ba2f476660562",
+          "afterSha256": "15373514b5567fe2d94891163c50b193253255300f99bb20f6a01703c5d7bdf7",
+          "normalized": true
+        },
+        {
+          "target": "acp/session_handle_mcp.py",
+          "resource": "0.12.2/acp/session_handle_mcp.py",
+          "beforeSha256": "d14b0bb9339e609a996a72ab037874c6fc399f81c0807f4ffb37cb3dab2abe15",
+          "afterSha256": "dabcfadf7f7f3074c5e10d95460668df8676a0382f774bd362f91d38bc3675fd",
+          "normalized": true
+        },
+        {
+          "target": "dashboard/server.py",
+          "resource": "0.12.2/dashboard/server.py",
+          "beforeSha256": "2ca7cee31a1727b7a43438c14148c8904c4481c46bb4665054a99d8faa919f1e",
+          "afterSha256": "f7ead922bb67de02302342aa04be1fbaead6dce48cd4a06d0bb62a6371e2a793",
+          "normalized": true
+        },
+        {
+          "target": "dashboard/server_runtime/api_entrypoint.py",
+          "resource": "0.12.2/dashboard/server_runtime/api_entrypoint.py",
+          "beforeSha256": "0fa35006b729f431318ce582d30ed16663ad227b34c6113fd38fa7695457c353",
+          "afterSha256": "5610681e371c770d64806cf2dbbe5a192a484cc4e761aa9be80a090b2f563ed4",
+          "normalized": true
+        },
+        {
+          "target": "dashboard/server_runtime/model_catalog_events.py",
+          "resource": "0.12.2/dashboard/server_runtime/model_catalog_events.py",
+          "beforeSha256": null,
+          "afterSha256": "0c42a353c202fa9d99ed0dfc0214ddf09773becdf4a35e65d5128b347176a741",
+          "normalized": true
+        }
+      ],
+      "checks": [
+        {
+          "target": "static/dist/assets/useWebSocket-BatKnCqf.js",
+          "sha256": "9ee8ae4ba308ff13e0cc942a04460b38bad4743f9f2d21d6fbf500e520883b04"
+        }
+      ]
+    },
+    {
+      "id": "crew-0.12.0-model-catalog-v1",
+      "testedVersion": "0.12.0",
+      "upstreamCommit": "f315771db6a95704d129c7b722340a676d6bb8a4",
+      "frontendEvent": "models_catalog_changed",
+      "files": [
+        {
+          "target": "acp/session_handle_mcp.py",
+          "resource": "0.12.0/acp/session_handle_mcp.py",
+          "beforeSha256": "2aff03f769d888b058513e586153f0fddae4dc616c79d554072a194a86399ae4",
+          "afterSha256": "c19df6fd7ba9ce77c6e61810431e2c65041888154dfc7ceaac7caffc11c6650b",
+          "normalized": true
+        },
+        {
+          "target": "acp/session_handle_model_selection.py",
+          "resource": "0.12.0/acp/session_handle_model_selection.py",
+          "beforeSha256": "b9dd87646eab436be5cd36099eb21527ad3ceda1a1be03c1c1fa93449c22e698",
+          "afterSha256": "26e0cb5498c624e1fdeeb05d866f3f4a8ba38510925f2c2b4ed92461d9714fe9",
+          "normalized": true
+        },
+        {
+          "target": "acp/session_handle_updates.py",
+          "resource": "0.12.0/acp/session_handle_updates.py",
+          "beforeSha256": "674075e2b8c4afdbdba6999856abeb6d52f7d7349440bb03095f0e55dcfcf786",
+          "afterSha256": "494dec449bda39a6b34da0fe929bc93193cdaada1b46e7880281804293290bb8",
+          "normalized": true
+        },
+        {
+          "target": "agent_sdk/kas_model_catalog.py",
+          "resource": "0.12.0/agent_sdk/kas_model_catalog.py",
+          "beforeSha256": "21f6632c11cc6e4fdc6fb90efdb2a0148b119ec45152390838bbea886719374a",
+          "afterSha256": "84b9d2664d01356308d4815d58b2773728f856fb600aa96f6d6d7a76300cde84",
+          "normalized": true
+        },
+        {
+          "target": "dashboard/server.py",
+          "resource": "0.12.0/dashboard/server.py",
+          "beforeSha256": "46ceda1a3ef77d3ef36908a9cc309d1720cfbcd4e3bdab6c0c30ad0ca6a77322",
+          "afterSha256": "a58fe027e363b4f71c72383aeb590173582a14663491bb680515fce297372aa9",
+          "normalized": true
+        },
+        {
+          "target": "dashboard/server_runtime/api_entrypoint.py",
+          "resource": "0.12.0/dashboard/server_runtime/api_entrypoint.py",
+          "beforeSha256": "af55a35ce002503cbf569051e39237b4e2bd6e55202fd5a7e7baa2b6f9a11e27",
+          "afterSha256": "d6006ef307512ed9f1423c617808c3f2617551d183d1de607ef0f13a9a33a1cf",
+          "normalized": true
+        },
+        {
+          "target": "dashboard/server_runtime/model_catalog_events.py",
+          "resource": "0.12.0/dashboard/server_runtime/model_catalog_events.py",
+          "beforeSha256": null,
+          "afterSha256": "49d1b36c29ccaa9a30a427ed80b22ea7feb268f04bdd6195df3333e36e3ac644",
+          "normalized": true
+        },
+        {
+          "target": "static/dist/assets/useWebSocket-DK9hitwq.js",
+          "resource": "0.12.0/frontend/useWebSocket-DK9hitwq.js",
+          "beforeSha256": "112662b7b36ca7b472ca83c01a55412be3262ab39f9974caa92e46d56a812a66",
+          "afterSha256": "61d2e7631569629d7d6e41549485b6ec32552a191505c0ef6e43280973633f71",
+          "normalized": false
+        },
+        {
+          "target": "static/dist/assets/useWebSocket-DK9hitwq.js.br",
+          "resource": "0.12.0/frontend/useWebSocket-DK9hitwq.js.br",
+          "beforeSha256": "b3b23eec82aee54cb25e25ca07b06bf2d2a035eceb41353224b97a40a9cd5318",
+          "afterSha256": "879df28e845afe498bb928c5ef01c7bae72095c3b1733570b598e9d44d1f659a",
+          "normalized": false
+        },
+        {
+          "target": "static/dist/assets/useWebSocket-DK9hitwq.js.gz",
+          "resource": "0.12.0/frontend/useWebSocket-DK9hitwq.js.gz",
+          "beforeSha256": "369adb8b097beb2e2be0fe1f5f02f4a236581b8ce2d9df6b3dbf4e9c49553aa4",
+          "afterSha256": "fc6a70196dd8d446d9570fffd05ceb0ab01be7cec68be24e8b9af453f7694f33",
+          "normalized": false
+        },
+        {
+          "target": "dashboard/handlers/core.py",
+          "resource": "0.12.0/dashboard/handlers/core.py",
+          "beforeSha256": "7b1dead084d800c7d344ea4b981edf6b4d40c4a7effb3cb0f18eab9605ff5811",
+          "afterSha256": "9078e824f20c31fcc203b5f32bb95677288c87c00014e327a70cf3dbf6dfa691",
+          "normalized": true
+        }
+      ]
+    }
+  ]
+}

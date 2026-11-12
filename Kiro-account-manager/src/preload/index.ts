@@ -1,5 +1,6 @@
 import type { AccountModelInfo } from '../shared/modelCatalog'
 import type { ClientSwitchApi } from '../shared/clientSwitch'
+import type { ClientModelRepairApi } from '../shared/clientModelRepair'
 import type { ModelPreferencesResult, ModelPreferencesWrite } from '../shared/modelPreferences'
 import type { LogPage } from '../shared/logHistory'
 import type { WindowVisibilityState } from '../shared/windowVisibility'
@@ -27,6 +28,11 @@ const api = {
     chooseExecutable: target => ipcRenderer.invoke('client-switch:choose-executable', target),
     cancelAuthorization: operationId => ipcRenderer.invoke('client-switch:cancel-authorization', operationId)
   } satisfies ClientSwitchApi,
+  clientModelRepair: {
+    inspect: accountId => ipcRenderer.invoke('client-model-repair:inspect', accountId),
+    repair: request => ipcRenderer.invoke('client-model-repair:repair', request),
+    restore: request => ipcRenderer.invoke('client-model-repair:restore', request)
+  } satisfies ClientModelRepairApi,
   getWindowVisibility: (): Promise<WindowVisibilityState> => ipcRenderer.invoke('window-get-visibility'),
   onWindowVisibilityChanged: (callback: (state: WindowVisibilityState) => void): (() => void) => {
     const handler = (_event: Electron.IpcRendererEvent, state: WindowVisibilityState): void => callback(state)

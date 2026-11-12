@@ -1,0 +1,15 @@
+KiroCrew test source fixtures
+
+Original KiroCrew code, Copyright Amazon.com, Inc. or its affiliates.
+Licensed under Apache License 2.0; see LICENSE.KiroCrew.
+
+Sources:
+- v0.12.0: https://github.com/kirodotdev/KiroCrew/tree/f315771db6a95704d129c7b722340a676d6bb8a4
+- v0.12.2: https://github.com/kirodotdev/KiroCrew/tree/b6599234221cfc492c0dd95fdd53643e710c9f28
+- Compiled frontend fixtures are from the corresponding official Windows packages.
+
+These fixtures retain the original unpatched model-catalog behavior for offline
+before/after regressions. Only selected functions are evaluated with synthetic
+authentication, storage and transport dependencies. They are not shipped in the
+application and must not be executed as a real client. Expected original digests
+are recorded in resources/crew-model-repair/manifest.json.

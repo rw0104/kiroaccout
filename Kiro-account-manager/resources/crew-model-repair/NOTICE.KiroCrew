@@ -1,0 +1,11 @@
+KiroCrew native model catalog compatibility resources
+
+Derived from KiroCrew, Copyright Amazon.com, Inc. or its affiliates.
+Licensed under the Apache License, Version 2.0 (see LICENSE.KiroCrew).
+Upstream: https://github.com/kirodotdev/KiroCrew
+
+Modified by kiroaccout contributors to capture asynchronous model catalogs,
+retain account-identity checks, and notify the existing official model picker.
+No independent workspace, browser, launcher, authentication cache, or fixed model
+list is introduced. Exact upstream commits and before/after digests are recorded
+in manifest.json. The 0.12.0 frontend corresponding TypeScript source is included.

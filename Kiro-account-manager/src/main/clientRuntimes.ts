@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { execFile } from 'node:child_process'
-import { lstatSync, readFileSync, realpathSync } from 'node:fs'
+import { lstatSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { promisify } from 'node:util'
@@ -8,10 +8,18 @@ import type { ExternalClientTarget } from '../shared/clientSwitch'
 import type { ClientSwitchRuntime } from './clientSwitch'
 import { createCliAccessAdapter } from './cliAccessAdapter'
 import { createCrewAccessAdapter } from './crewAccessAdapter'
+import { assertCrewAccessContract, assertVerifiedCliAccessVersion, ClientCompatibilityError, crewAccessContractFiles, CREW_ACCESS_CONTRACT_FILES } from './clientCompatibility'
 
 const exec = promisify(execFile)
 export interface ClientRuntimeConfig { executablePath: string; dataHome?: string }
 export interface ClientRuntimeProbe { valid: boolean; publisher: string; version: string }
+export interface CrewInstallationInfo {
+  executablePath: string
+  pythonExecutable: string
+  bundleDirectory: string
+  revision: string
+  version: string
+}
 export interface ClientRuntimeDependencies {
   readConfig(target: ExternalClientTarget): ClientRuntimeConfig | undefined
   writeConfig(target: ExternalClientTarget, config: ClientRuntimeConfig): void
@@ -21,6 +29,8 @@ export interface ClientRuntimeDependencies {
   env?: NodeJS.ProcessEnv
   /** Internal test seam. Production verifies Authenticode and the installed version. */
   probeExecutable?: (path: string, target: ExternalClientTarget) => Promise<ClientRuntimeProbe>
+  /** Test-only contract seam. Production reads only installed program resources. */
+  verifyCompatibility?: (target: ExternalClientTarget, executablePath: string, version: string) => Promise<void>
 }
 const hash = (value: string): string => createHash('sha256').update(value).digest('hex')
 const regular = (value: string): boolean => { try { const s = lstatSync(value); return s.isFile() && !s.isSymbolicLink() } catch { return false } }
@@ -34,13 +44,6 @@ interface CachedRuntime {
   dataHome: string
   ticket: ConfigurationTicket
 }
-
-const crewModules = [
-  'auth/__init__.py', 'auth/store.py', 'auth/provider.py', 'auth/refresh.py',
-  'secrets/__init__.py', 'secrets/vault.py', 'platform_compat.py', 'platform_lock_compat.py',
-  'platform_owner_compat.py', 'platform_compat_links.py', 'windows_acl.py',
-  'config/loader_document.py', 'config/loader_locations.py', 'config/sections_agent.py', 'atomic_write.py'
-] as const
 
 function resourceStats(files: readonly string[]): string {
   return hash(JSON.stringify(files.map(path => {
@@ -122,16 +125,25 @@ export class ClientRuntimeRegistry {
     if (target === 'cli') return [executablePath]
     const backend = join(dirname(executablePath), 'resources/backend-dist/kirocrew-backend')
     const packages = join(backend, 'Lib/site-packages')
+    const metadata = readdirSync(packages, { withFileTypes: true }).filter(entry => /^kirocrew-\d+\.\d+\.\d+\.dist-info$/.test(entry.name))
+    if (metadata.length !== 1 || !metadata[0].isDirectory() || metadata[0].isSymbolicLink()) throw new ClientCompatibilityError('unsupported-client-contract')
     return [executablePath, join(backend, 'python.exe'), join(backend, 'python3.dll'), join(backend, 'python312.dll'),
-      join(backend, 'BUILD'), join(packages, 'kirocrew-0.12.0.dist-info/METADATA'),
-      ...crewModules.map(module => join(packages, 'kiro_crew', module)), this.deps.helperPath]
+      join(backend, 'BUILD'), join(packages, metadata[0].name, 'METADATA'),
+      ...(this.deps.verifyCompatibility ? CREW_ACCESS_CONTRACT_FILES : crewAccessContractFiles(backend))
+        .map(module => join(packages, 'kiro_crew', module)), this.deps.helperPath]
   }
 
-  private validateCrewMetadata(files: readonly string[]): void {
+  private validateCrewMetadata(files: readonly string[], expectedVersion: string): void {
     const metadata = files.find(path => path.endsWith('METADATA'))
-    if (!metadata || lstatSync(metadata).size > 1024 * 1024 ||
-        !/^Name: kirocrew\r?$/m.test(readFileSync(metadata, 'utf8')) ||
-        !/^Version: 0\.12\.0\r?$/m.test(readFileSync(metadata, 'utf8'))) throw new Error('unsupported-client-version')
+    if (!metadata || lstatSync(metadata).size > 1024 * 1024) throw new ClientCompatibilityError('unsupported-client-contract')
+    const text = readFileSync(metadata, 'utf8')
+    if (!/^Name: kirocrew\r?$/m.test(text) || text.match(/^Version: (\d+\.\d+\.\d+)\r?$/m)?.[1] !== expectedVersion ||
+        basename(dirname(metadata)) !== `kirocrew-${expectedVersion}.dist-info`) throw new ClientCompatibilityError('unsupported-client-version')
+  }
+
+  private async verifyCompatibility(target: ExternalClientTarget, executablePath: string, version: string): Promise<void> {
+    if (this.deps.verifyCompatibility) await this.deps.verifyCompatibility(target, executablePath, version)
+    else if (target === 'crew') assertCrewAccessContract(join(dirname(executablePath), 'resources/backend-dist/kirocrew-backend'))
   }
 
   private async powershell(script: string, extra: Record<string, string> = {}): Promise<string> {
@@ -171,10 +183,10 @@ export class ClientRuntimeRegistry {
     if (target === 'cli' && !injected) {
       // The official --version path was verified not to initialize auth storage.
       const { stdout } = await exec(path, ['--version'], { windowsHide: true, timeout: 5000, maxBuffer: 4096, env: this.env })
-      version = stdout.match(/\b(\d+\.\d+\.\d+)\b/)?.[1] || ''
-    } else version = version.match(/\b(\d+\.\d+\.\d+)\b/)?.[1] || ''
-    // This is a verified-format matrix; unknown updates need a new compatibility check.
-    if (target === 'cli' ? version !== '3.1.0' : version !== '0.12.0') throw new Error('unsupported-client-version')
+      version = stdout.trim().match(/^kiro-cli\s+(\d+\.\d+\.\d+)$/)?.[1] || ''
+    } else version = version.trim().match(/^(\d+\.\d+\.\d+)(?:\.0)?$/)?.[1] || ''
+    if (!/^\d+\.\d+\.\d+$/.test(version)) throw new ClientCompatibilityError('unsupported-client-version')
+    if (target === 'cli') assertVerifiedCliAccessVersion(version)
     return { path, version }
   }
 
@@ -186,7 +198,9 @@ export class ClientRuntimeRegistry {
     const before = resourceStats(files)
     const verified = await this.inspect(executablePath, target)
     if (!this.current(target, ticket) || resourceStats(files) !== before) throw new Error('client-configuration-changed')
-    if (target === 'crew') this.validateCrewMetadata(files)
+    if (target === 'crew') this.validateCrewMetadata(files, verified.version)
+    await this.verifyCompatibility(target, verified.path, verified.version)
+    if (!this.current(target, ticket) || resourceStats(this.resources(verified.path, target)) !== before) throw new Error('client-configuration-changed')
     this.deps.writeConfig(target, { executablePath: verified.path })
     this.invalidate(target)
     this.observedConfig.set(target, this.configuration(target).snapshot)
@@ -203,10 +217,22 @@ export class ClientRuntimeRegistry {
     return task
   }
 
+  /** Describes the same verified official installation used by native switching.
+   * The repair service owns model-file checks and never receives account data here.
+   */
+  async crewInstallation(): Promise<CrewInstallationInfo | undefined> {
+    const runtime = await this.get('crew')
+    const cached = this.cache.get('crew')
+    if (!runtime || !cached || cached.runtime !== runtime || !this.adapter(runtime.id)) return undefined
+    const bundleDirectory = join(dirname(cached.executablePath), 'resources/backend-dist/kirocrew-backend')
+    return { executablePath: cached.executablePath, pythonExecutable: join(bundleDirectory, 'python.exe'),
+      bundleDirectory, revision: runtime.revision, version: runtime.version }
+  }
+
   adapter(runtimeId: string): ClientSwitchRuntime['adapter'] | undefined {
     for (const [target, cached] of this.cache) if (cached.runtime.id === runtimeId) {
       try {
-        if (this.current(target, cached.ticket) && resourceStats(cached.resources) === cached.statFingerprint) return cached.runtime.adapter
+        if (this.current(target, cached.ticket) && resourceStats(this.resources(cached.executablePath, target)) === cached.statFingerprint) return cached.runtime.adapter
       } catch { /* A removed or updated client invalidates its old adapter. */ }
       this.cache.delete(target)
       return undefined
@@ -243,9 +269,10 @@ export class ClientRuntimeRegistry {
     this.cache.delete(target)
     const verified = await this.inspect(candidate, target)
     if (!this.current(target, ticket) || resourceStats(files) !== stats) return undefined
-    if (target === 'crew') this.validateCrewMetadata(files)
+    if (target === 'crew') this.validateCrewMetadata(files, verified.version)
+    await this.verifyCompatibility(target, verified.path, verified.version)
     const contents = resourceContents(files)
-    if (resourceStats(files) !== stats || !this.current(target, ticket)) return undefined
+    if (resourceStats(this.resources(verified.path, target)) !== stats || !this.current(target, ticket)) return undefined
     const fingerprint = hash(JSON.stringify([verified.path, stats, contents, dataHome, ticket.snapshot]))
     const id = `${target}:${hash(verified.path.toLowerCase()).slice(0, 24)}`
     const domain = `${target}:${hash(dataHome.toLowerCase())}`
@@ -256,7 +283,7 @@ export class ClientRuntimeRegistry {
     const runtime: ClientSwitchRuntime = {
       id, target, revision: fingerprint, version: verified.version, adapter,
       isRunning: async () => {
-        if (!this.current(target, ticket) || resourceStats(files) !== stats) throw new Error('client-configuration-changed')
+        if (!this.current(target, ticket) || resourceStats(this.resources(verified.path, target)) !== stats) throw new Error('client-configuration-changed')
         const filter = target === 'cli' ? "Name = 'kiro-cli.exe'" : "Name = 'KiroCrew.exe' OR Name = 'python.exe' OR Name = 'node.exe' OR Name = 'kirocrew.exe'"
         const script = `$p=Get-CimInstance Win32_Process -Filter "${filter}" -ErrorAction Stop; $found=@($p | Where-Object { ` +
           (target === 'cli' ? '$true' : "$_.Name -eq 'KiroCrew.exe' -or $_.Name -eq 'kirocrew.exe' -or ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($env:KIRO_SWITCH_CLIENT_ROOT,[StringComparison]::OrdinalIgnoreCase)) -or ($_.CommandLine -match 'kiro_crew|kirocrew.*gateway')") +

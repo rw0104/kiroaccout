@@ -9,6 +9,7 @@ import { gunzipSync } from 'node:zlib'
 import { releaseArtifactNames, validateStableManifest } from './lib/releaseArtifacts.mjs'
 import { releaseOptions } from './lib/releaseOptions.mjs'
 import { tlsLibrarySpec, verifyBinaryArchitecture } from './lib/platformResources.mjs'
+import { verifyCrewModelRepairPackage } from './lib/crewModelRepairPackage.mjs'
 
 const require = createRequire(import.meta.url)
 const asar = require('@electron/asar')
@@ -31,6 +32,11 @@ assert.ok(!entries.some(entry => /(^|\/)(\.env(?:\.[^/]*)?|\.kiro|\.local|\.git|
 assert.ok(!entries.some(entry => /author-avatar|支付宝支付|微信支付|交流群/.test(entry)), 'Old promotional resources must not be packaged')
 assert.ok(!entries.some(entry => /^resources\/tls-client-/.test(entry)), 'TLS libraries must be staged separately for the target platform')
 assert.ok(!entries.some(entry => /^resources\/crew-managed(?:\/|$)/.test(entry)), 'Removed Crew workspace resources must not be packaged')
+const crewModelRepair = verifyCrewModelRepairPackage({ entries,
+  readPackaged: entry => asar.extractFile(archive, join(...entry.split('/'))),
+  readUnpacked: entry => readFileSync(join(resources, 'app.asar.unpacked', entry)),
+  readSource: entry => readFileSync(join(appRoot, entry))
+})
 for (const entry of ['out/main/index.js', 'out/preload/index.js', 'out/renderer/index.html',
   'node_modules/undici/package.json',
   'node_modules/jsonc-parser/package.json', 'node_modules/jsonc-parser/lib/umd/main.js',
@@ -93,6 +99,7 @@ const executable = platform === 'win32' ? join(unpacked, 'kiro-account-manager.e
 verifyBinaryArchitecture(readFileSync(executable), platform, arch)
 const report = { version: packaged.version, platform, arch, archiveEntries: entries.length,
   updaterRepository: 'rw0104/kiroaccout', licenseIncluded: true, nativeLibraryIncluded: true,
+  crewModelRepair,
   applicationExecuted: false }
 writeFileSync(join(dist, `package-verification-${platform}-${arch}.json`), JSON.stringify(report, null, 2) + '\n')
 console.log(JSON.stringify(report, null, 2))

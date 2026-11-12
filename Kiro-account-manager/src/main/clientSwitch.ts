@@ -1,4 +1,5 @@
 import type { ClientSwitchCapability, ClientSwitchRequest, ClientSwitchResult, ClientSwitchSnapshot, ExternalClientTarget } from '../shared/clientSwitch'
+import type { ClientModelRepairState } from '../shared/clientModelRepair'
 import { ClientAccessProjectionService, ClientAccessProjectionError, accessPrincipalFingerprint, projectableClientAccess, type ClientAccessValidationIssue, type ManagerAccessSnapshot, type ClientAccessProjectionBinding, type ClientAccessProjectionAdapter } from './clientAccessProjection'
 
 export interface ClientSwitchRuntime {
@@ -18,6 +19,10 @@ export interface ClientSwitchDependencies {
   bindings(): readonly ClientAccessProjectionBinding[]
   /** Holds the existing manager operation lease without changing refresh ownership. */
   beginOperation(accountId: string): () => void
+  /** Native model support is checked separately from credential ownership. */
+  inspectModels?(runtime: ClientSwitchRuntime): Promise<ClientModelRepairState>
+  /** Coordinates native helper use with an installation repair, without changing bindings. */
+  beginModelOperation?(target: ExternalClientTarget): () => void
   now?: () => number
   platformSupported?: () => boolean
 }
@@ -71,6 +76,14 @@ export class ClientSwitchService {
 
   constructor(deps: ClientSwitchDependencies) { this.deps = deps; this.now = deps.now ?? Date.now }
 
+  private async modelReadiness(runtime: ClientSwitchRuntime): Promise<ClientModelRepairState | undefined> {
+    if (runtime.target !== 'crew' || !this.deps.inspectModels) return undefined
+    try { return await this.deps.inspectModels(runtime) }
+    catch { return { status: 'error', ready: false, canRepair: false, canRestore: false,
+      message: '未能确认客户端模型目录兼容状态，请重新检测。',
+      messageEn: 'Model compatibility could not be verified. Inspect the client again.' } }
+  }
+
   private result(request: ClientSwitchRequest, message: string, messageEn: string,
     errorCode?: string, committed = false): ClientSwitchResult {
     return {
@@ -94,7 +107,13 @@ export class ClientSwitchService {
     const inspectedRuntimes = new Map<ExternalClientTarget, ClientSwitchRuntime>()
     const snapshots = await Promise.all(targets.map(async (target): Promise<ClientSwitchCapability> => {
       let runtime: ClientSwitchRuntime | undefined
-      try { runtime = await this.deps.runtime(target) } catch {
+      try { runtime = await this.deps.runtime(target) } catch (error) {
+        const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined
+        if (code === 'unsupported-client-version' || code === 'unsupported-client-contract') return {
+          target, status: 'blocked', errorCode: 'CLIENT_CONTRACT_UNSUPPORTED',
+          message: '此客户端版本或登录协议尚未通过兼容验证，请更新管理器后重新检测。不会用旧模型列表代替检测结果。',
+          messageEn: 'This client version or access protocol is not yet verified. Update the manager and inspect again; old model lists are not a substitute.'
+        }
         return { target, status: 'blocked', message: '客户端兼容性检测未完成，请重试或重新选择安装位置。',
           messageEn: 'Client verification did not complete. Retry or select its installation again.' }
       }
@@ -104,6 +123,9 @@ export class ClientSwitchService {
       const base = { target, runtimeId: runtime.id, revision: runtime.revision, version: runtime.version,
         connected: !!principal && binding?.status === 'active' && binding.accountId === accountId &&
           binding.runtimeId === runtime.id && binding.principalFingerprint === principal }
+      const models = await this.modelReadiness(runtime)
+      if (models && !models.ready) return { ...base, status: 'blocked', errorCode: 'MODEL_REPAIR_REQUIRED',
+        message: models.message, messageEn: models.messageEn }
       if (access?.validationIssue !== undefined) return { ...base, status: 'blocked',
         ...accessDiagnostic(new ClientAccessProjectionError('credential-unusable', access.validationIssue), access.provider) }
       if (access?.temporarilyUnavailable) return { ...base, status: 'blocked',
@@ -162,7 +184,9 @@ export class ClientSwitchService {
 
   private async perform(request: ClientSwitchRequest): Promise<ClientSwitchResult> {
     let release: (() => void) | undefined
+    let releaseModels: (() => void) | undefined
     try {
+      releaseModels = this.deps.beginModelOperation?.(request.target)
       release = this.deps.beginOperation(request.accountId)
       const principal = accessPrincipalFingerprint(this.deps.account(request.accountId))
       const snapshot = await this.inspect(request.accountId)
@@ -188,6 +212,9 @@ export class ClientSwitchService {
         return this.result(request, '所选账号的身份已变化，请重新检测后再切换。',
           'The selected account identity changed. Inspect it again before switching.', 'PRINCIPAL_CHANGED')
       }
+      const models = await this.modelReadiness(runtime)
+      if (models && !models.ready) return this.result(request, models.message,
+        models.messageEn || 'Repair the client model list before switching.', 'MODEL_REPAIR_REQUIRED')
       const projected = await this.deps.projection.execute({ accountId: request.accountId, runtimeId: runtime.id,
         authDomainId: runtime.adapter.authDomainId, expectedPrincipalFingerprint: principal })
       if (projected.status !== 'projected' && projected.status !== 'unchanged') {
@@ -223,7 +250,7 @@ export class ClientSwitchService {
     } catch {
       return this.result(request, '未能确认账号或客户端状态，替换已停止；管理器登录未更改。',
         'Account or client state could not be verified. The manager sign-in was not changed.', 'SWITCH_REFUSED')
-    } finally { release?.() }
+    } finally { release?.(); releaseModels?.() }
   }
 
   authorize(request: ClientSwitchRequest): Promise<ClientSwitchResult> {

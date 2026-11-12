@@ -4,6 +4,7 @@ import { AlertCircle, CheckCircle2, Loader2, Monitor, RefreshCw, Terminal, Users
 import { Button } from '../ui'
 import { cn } from '@/lib/utils'
 import type { ClientSwitchApi, ClientSwitchCapability, ClientSwitchTarget } from '../../../../shared/clientSwitch'
+import type { ClientModelRepairApi, ClientModelRepairState } from '../../../../shared/clientModelRepair'
 
 interface ClientSwitchDialogProps {
   accountId: string
@@ -11,6 +12,7 @@ interface ClientSwitchDialogProps {
   isCurrentAccount: boolean
   isEn: boolean
   api: ClientSwitchApi
+  modelRepairApi?: ClientModelRepairApi
   onSwitchIde: () => Promise<{ success: boolean; error?: string }>
   onClose: () => void
 }
@@ -20,20 +22,24 @@ const clientNames: Record<ClientSwitchTarget, string> = { ide: 'Kiro IDE', crew:
 const clientIcons = { ide: Monitor, crew: Users, cli: Terminal }
 
 /** A selection or inspection never starts a credential write. Only submit does. */
-export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, isEn, api, onSwitchIde, onClose }: ClientSwitchDialogProps): React.ReactNode {
+export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, isEn, api, modelRepairApi, onSwitchIde, onClose }: ClientSwitchDialogProps): React.ReactNode {
   const titleId = useId()
   const accountLabelId = useId()
   const [target, setTarget] = useState<ClientSwitchTarget>('ide')
   const [capabilities, setCapabilities] = useState<ClientSwitchCapability[]>([])
   const [inspecting, setInspecting] = useState(true)
   const [inspectError, setInspectError] = useState(false)
+  const [modelRepairState, setModelRepairState] = useState<ClientModelRepairState | null>(null)
+  const [modelRepairInspecting, setModelRepairInspecting] = useState(true)
+  const [modelRepairError, setModelRepairError] = useState(false)
   const [busy, setBusy] = useState(false)
-  const [activity, setActivity] = useState<'switch' | 'authorize' | 'configure' | 'disconnect' | null>(null)
+  const [activity, setActivity] = useState<'switch' | 'authorize' | 'configure' | 'disconnect' | 'repair' | 'restore' | null>(null)
   const [canceling, setCanceling] = useState(false)
   const [result, setResult] = useState<{ success: boolean; message: string } | null>(null)
   const panelRef = useRef<HTMLDivElement>(null)
   const initialRadioRef = useRef<HTMLInputElement>(null)
   const apiRef = useRef(api)
+  const modelRepairApiRef = useRef(modelRepairApi)
   const closeRef = useRef(onClose)
   const busyRef = useRef(false)
   const cancelingRef = useRef(false)
@@ -42,28 +48,50 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
   const inspectSequence = useRef(0)
   const operationSequence = useRef(0)
   apiRef.current = api
+  modelRepairApiRef.current = modelRepairApi ?? (typeof window === 'undefined' ? undefined : window.api?.clientModelRepair)
 
   const inspect = useCallback(async () => {
     const sequence = ++inspectSequence.current
     setInspecting(true)
     setInspectError(false)
-    try {
-      const existing = await apiRef.current.inspect(accountId)
-      if (!mountedRef.current || sequence !== inspectSequence.current) return
-      setCapabilities(existing.targets)
-    } catch {
-      if (!mountedRef.current || sequence !== inspectSequence.current) return
-      setCapabilities([])
-      setInspectError(true)
-    } finally {
-      if (mountedRef.current && sequence === inspectSequence.current) setInspecting(false)
-    }
+    setModelRepairInspecting(true)
+    setModelRepairError(false)
+    setModelRepairState(null)
+    // A slow Crew installation check must not block the independent IDE/CLI flow.
+    await Promise.all([
+      (async () => {
+        try {
+          const existing = await apiRef.current.inspect(accountId)
+          if (!mountedRef.current || sequence !== inspectSequence.current) return
+          setCapabilities(existing.targets)
+        } catch {
+          if (!mountedRef.current || sequence !== inspectSequence.current) return
+          setCapabilities([])
+          setInspectError(true)
+        } finally {
+          if (mountedRef.current && sequence === inspectSequence.current) setInspecting(false)
+        }
+      })(),
+      (async () => {
+        try {
+          const currentApi = modelRepairApiRef.current
+          if (!currentApi) throw new Error('Model repair API unavailable')
+          const state = await currentApi.inspect(accountId)
+          if (mountedRef.current && sequence === inspectSequence.current) setModelRepairState(state)
+        } catch {
+          if (mountedRef.current && sequence === inspectSequence.current) setModelRepairError(true)
+        } finally {
+          if (mountedRef.current && sequence === inspectSequence.current) setModelRepairInspecting(false)
+        }
+      })()
+    ])
   }, [accountId])
 
   useEffect(() => {
     mountedRef.current = true
     setTarget('ide')
     setResult(null)
+    setModelRepairState(null)
     busyRef.current = false
     setBusy(false)
     setActivity(null)
@@ -116,7 +144,12 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
   }, [])
 
   const capability = capabilities.find(item => item.target === target)
-  const canSubmit = !busy && (target === 'ide' || (!inspecting && capability?.status === 'ready'))
+  const crewReady = !modelRepairInspecting && !modelRepairError && modelRepairState?.ready === true
+  const canSubmit = !busy && (target === 'ide' || (!inspecting && capability?.status === 'ready' && (target !== 'crew' || crewReady)))
+  const canRepairModels = !busy && !inspecting && !modelRepairInspecting && !!modelRepairState?.revision &&
+    modelRepairState.status !== 'running' && modelRepairState.canRepair
+  const canRestoreModels = !busy && !inspecting && !modelRepairInspecting && !!modelRepairState?.revision &&
+    modelRepairState.status !== 'running' && modelRepairState.canRestore
   const sharedAuthentication = capability?.sharedTargets && capability.sharedTargets.length > 1
 
   const requestClose = async (): Promise<void> => {
@@ -214,6 +247,40 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
       void inspect()
     } catch {
       if (mountedRef.current && sequence === operationSequence.current) setResult({ success: false, message: isEn ? 'Could not stop synchronization. Check the client state before retrying.' : '停止同步未完成，请检查客户端状态后重试。' })
+    } finally {
+      if (sequence === operationSequence.current) {
+        busyRef.current = false
+        if (mountedRef.current) { setBusy(false); setActivity(null) }
+      }
+    }
+  }
+
+  const changeModelRepair = async (action: 'repair' | 'restore'): Promise<void> => {
+    const currentApi = modelRepairApiRef.current
+    const expectedRevision = modelRepairState?.revision
+    if (target !== 'crew' || busyRef.current || !currentApi || !expectedRevision ||
+        !(action === 'repair' ? canRepairModels : canRestoreModels)) return
+    const sequence = ++operationSequence.current
+    busyRef.current = true
+    setBusy(true)
+    setActivity(action)
+    setResult(null)
+    try {
+      const response = await currentApi[action]({ operationId: crypto.randomUUID(), accountId, expectedRevision })
+      if (!mountedRef.current || sequence !== operationSequence.current) return
+      setModelRepairState(response.state)
+      setResult({ success: response.success, message: isEn
+        ? response.messageEn || response.message || response.state.messageEn || response.state.message
+        : response.message || response.state.message })
+      void inspect()
+    } catch {
+      if (mountedRef.current && sequence === operationSequence.current) {
+        setModelRepairState(null)
+        setModelRepairError(true)
+        setResult({ success: false, message: isEn
+          ? 'The model list operation did not complete. Check the installation again before retrying.'
+          : '模型列表操作未完成，请重新检测客户端后重试。' })
+      }
     } finally {
       if (sequence === operationSequence.current) {
         busyRef.current = false
@@ -333,6 +400,35 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
                 )
               })}
             </fieldset>
+            {target === 'crew' && (
+              <section className="space-y-2 rounded-lg border p-3" aria-label={isEn ? 'Crew model list' : 'Crew 模型列表'}>
+                <div className="flex items-center justify-between gap-3">
+                  <h3 className="text-sm font-medium">{isEn ? 'Crew model list' : 'Crew 模型列表'}</h3>
+                  {modelRepairState?.version && <span className="text-xs text-muted-foreground">Crew {modelRepairState.version}</span>}
+                </div>
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  {isEn
+                    ? 'Applies to the selected official Crew installation. Close Crew before changing its files; existing conversations and sign-in are kept.'
+                    : '作用于所选的官方 Crew 安装。修改文件前请关闭 Crew，会话和登录资料保留。'}
+                </p>
+                <p className="text-xs leading-relaxed" role="status">
+                  {modelRepairInspecting ? (isEn ? 'Checking model list compatibility…' : '正在检测模型列表兼容性…')
+                    : modelRepairError || !modelRepairState ? (isEn ? 'Model list inspection failed. Check again before switching to Crew.' : '模型列表检测失败，请重新检测后再切换到 Crew。')
+                      : isEn ? modelRepairState.messageEn || modelRepairState.message : modelRepairState.message}
+                </p>
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <Button type="button" variant="ghost" size="sm" disabled={busy || inspecting || modelRepairInspecting} onClick={() => void inspect()}>
+                    <RefreshCw className="h-3 w-3" />{isEn ? 'Check again' : '重新检测'}
+                  </Button>
+                  <Button type="button" variant="ghost" size="sm" disabled={!canRestoreModels} onClick={() => void changeModelRepair('restore')}>
+                    {isEn ? 'Restore official files' : '恢复官方文件'}
+                  </Button>
+                  <Button type="button" variant="outline" size="sm" disabled={!canRepairModels} onClick={() => void changeModelRepair('repair')}>
+                    {isEn ? 'Repair model list' : '修复模型列表'}
+                  </Button>
+                </div>
+              </section>
+            )}
             {target !== 'ide' && (
               <div className="flex flex-wrap items-center justify-end gap-2">
                 {capability?.connected && (
@@ -385,6 +481,7 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
             <Button type="submit" disabled={!canSubmit}>
               {busy && <Loader2 className="h-4 w-4 animate-spin" />}
               {busy ? (activity === 'authorize' ? (isEn ? 'Authorizing…' : '正在授权…') : activity === 'configure' ? (isEn ? 'Configuring…' : '正在配置…') : activity === 'disconnect' ? (isEn ? 'Disconnecting…' : '正在停止同步…')
+                : activity === 'repair' ? (isEn ? 'Repairing…' : '正在修复…') : activity === 'restore' ? (isEn ? 'Restoring…' : '正在恢复…')
                 : (isEn ? 'Switching…' : '正在切换…'))
                 : (isEn ? 'Switch account' : '切换账号')}
             </Button>

@@ -18,11 +18,14 @@ const drain = async () => { for (let i = 0; i < 12; i++) await Promise.resolve()
 const event = () => ({ preventDefault() { return undefined }, stopPropagation() { return undefined } })
 const capability = (target, status = 'ready', extras = {}) => ({ target, status, runtimeId: `${target}-runtime`, revision: `${target}-revision`, message: '客户端状态', messageEn: `${target} state`, ...extras })
 const response = (overrides = {}) => ({ status: 'identity-verified', message: '已验证所选账号', messageEn: 'Selected account verified', ...overrides })
+const modelRepairState = (overrides = {}) => ({ status: 'repaired', ready: true, canRepair: false, canRestore: true,
+  version: '0.12.2', revision: 'synthetic-installation-revision', message: '模型目录修复已安装', messageEn: 'Model catalog repair is installed.', ...overrides })
 
-function harness(overrides = {}, windowApi) {
+function harness(overrides = {}, windowApi, repairOverrides = {}) {
   const state = [], refs = [], effects = [], callbacks = []
   const listeners = new Map()
   const calls = []
+  const repairCalls = []
   let stateIndex = 0, refIndex = 0, effectIndex = 0, callbackIndex = 0, idIndex = 0, pending = []
   let closed = 0, sequence = 0
   const hooks = {
@@ -55,6 +58,12 @@ function harness(overrides = {}, windowApi) {
     cancelAuthorization: async id => { calls.push(['cancelAuthorization', id]) },
     ...overrides
   }
+  const repairApi = {
+    inspect: async id => { repairCalls.push(['inspect', id]); return modelRepairState() },
+    repair: async input => { repairCalls.push(['repair', JSON.parse(JSON.stringify(input))]); return { success: true, state: modelRepairState() } },
+    restore: async input => { repairCalls.push(['restore', JSON.parse(JSON.stringify(input))]); return { success: true, state: modelRepairState({ status: 'needs-repair', ready: false, canRepair: true, canRestore: false }) } },
+    ...repairOverrides
+  }
   const jsx = (type, props) => ({ type, props })
   const exports = {}
   vm.runInNewContext(compiled, {
@@ -78,12 +87,12 @@ function harness(overrides = {}, windowApi) {
     }
   })
   return {
-    api, calls,
+    api, calls, repairCalls,
     get closed() { return closed },
     render(props = {}) {
       stateIndex = refIndex = effectIndex = callbackIndex = idIndex = 0
       const tree = exports.ClientSwitchDialog({
-        accountId: 'account-a', accountLabel: 'Example account', isCurrentAccount: false, isEn: true, api,
+        accountId: 'account-a', accountLabel: 'Example account', isCurrentAccount: false, isEn: true, api, modelRepairApi: repairApi,
         onSwitchIde: async () => { calls.push(['ide']); return { success: true } },
         onClose: () => { closed++ }, ...props
       })
@@ -378,4 +387,140 @@ test('failed disconnect displays the actual failure and preserves retry capabili
   assert.doesNotMatch(words(tree), /Synchronization stopped/)
   assert.equal(button(tree, 'Disconnect').disabled, false)
   assert.equal(h.calls.filter(call => call[0] === 'disconnect').length, 1)
+})
+
+test('Crew must repair the selected installation before switching and sends its inspected revision', async () => {
+  let ready = false
+  const h = harness({}, undefined, {
+    inspect: async () => modelRepairState({ status: ready ? 'repaired' : 'needs-repair', ready,
+      canRepair: !ready, canRestore: ready, messageEn: ready ? 'Model catalog repair is installed.' : 'The model catalog needs repair.' }),
+    repair: async input => { h.repairCalls.push(['repair', JSON.parse(JSON.stringify(input))]); ready = true; return { success: true, state: modelRepairState() } }
+  })
+  h.render(); await drain(); selectCrew(h)
+  let tree = h.render()
+  assert.equal(button(tree, 'Switch account').disabled, true)
+  assert.equal(button(tree, 'Repair model list').disabled, false)
+  assert.match(words(tree), /selected official Crew installation/i)
+  assert.match(words(tree), /0\.12\.2/)
+  assert.doesNotMatch(words(tree), /synthetic-installation-revision/)
+  await submit(tree)
+  assert.equal(h.calls.some(call => call[0] === 'execute'), false)
+  button(tree, 'Repair model list').onClick(); await drain()
+  assert.deepEqual(h.repairCalls[0], ['repair', { operationId: 'operation-1', accountId: 'account-a', expectedRevision: 'synthetic-installation-revision' }])
+  tree = h.render()
+  assert.equal(button(tree, 'Switch account').disabled, false)
+  await submit(tree)
+  assert.equal(h.calls.find(call => call[0] === 'execute')[1].target, 'crew')
+})
+
+test('running but repaired Crew may switch while its repair and restore actions remain unavailable', async () => {
+  const h = harness({}, undefined, { inspect: async () => modelRepairState({ status: 'running', ready: true, canRestore: false,
+    messageEn: 'Crew is running with the repaired model catalog.' }) })
+  h.render(); await drain(); selectCrew(h)
+  const tree = h.render()
+  assert.equal(button(tree, 'Switch account').disabled, false)
+  assert.equal(button(tree, 'Repair model list').disabled, true)
+  assert.equal(button(tree, 'Restore official files').disabled, true)
+})
+
+test('restoring official files is explicit and blocks switching again when a catalog repair is needed', async () => {
+  let restored = false
+  const state = () => modelRepairState({ status: restored ? 'needs-repair' : 'repaired', ready: !restored, canRepair: restored, canRestore: !restored })
+  const h = harness({}, undefined, { inspect: async () => state(), restore: async input => {
+    h.repairCalls.push(['restore', JSON.parse(JSON.stringify(input))]); restored = true
+    return { success: true, state: state(), messageEn: 'Official files restored.' }
+  } })
+  h.render(); await drain(); selectCrew(h)
+  button(h.render(), 'Restore official files').onClick(); await drain()
+  assert.deepEqual(h.repairCalls[0], ['restore', { operationId: 'operation-1', accountId: 'account-a', expectedRevision: 'synthetic-installation-revision' }])
+  const tree = h.render()
+  assert.equal(button(tree, 'Switch account').disabled, true)
+  assert.match(words(tree), /Official files restored/)
+  assert.equal(h.calls.some(call => call[0] === 'execute' || call[0] === 'authorize'), false)
+})
+
+test('rechecking after a client update invalidates an old ready state without touching IDE or CLI', async () => {
+  const update = deferred()
+  let checks = 0
+  const h = harness({}, undefined, { inspect: async () => ++checks === 1 ? modelRepairState() : update.promise })
+  h.render(); await drain(); selectCrew(h)
+  const oldTree = h.render()
+  button(oldTree, 'Check again').onClick()
+  assert.equal(button(h.render(), 'Switch account').disabled, true)
+  update.resolve(modelRepairState({ status: 'unsupported', ready: false, canRepair: false, canRestore: false, revision: 'synthetic-new-install',
+    messageEn: 'This updated client needs a compatibility check.' }))
+  await drain()
+  let tree = h.render()
+  assert.equal(button(tree, 'Switch account').disabled, true)
+  assert.match(words(tree), /updated client needs a compatibility check/)
+  radio(tree, 'cli').onChange()
+  assert.equal(button(h.render(), 'Switch account').disabled, false)
+  assert.equal(button(h.render(), 'Repair model list'), undefined)
+  assert.equal(h.repairCalls.some(call => call[0] === 'repair' || call[0] === 'restore'), false)
+})
+
+test('repair mutations require a revision, serialize clicks, and discard late results for another account', async () => {
+  const pending = deferred()
+  const h = harness({}, undefined, { inspect: async () => modelRepairState({ status: 'needs-repair', ready: false, canRepair: true, canRestore: false }),
+    repair: input => { h.repairCalls.push(['repair', input]); return pending.promise } })
+  h.render(); await drain(); selectCrew(h)
+  const action = button(h.render(), 'Repair model list')
+  action.onClick(); action.onClick()
+  assert.equal(h.repairCalls.length, 1)
+  assert.equal(button(h.render(), 'Repairing…').disabled, true)
+  h.key('Escape'); assert.equal(h.closed, 0)
+  h.render({ accountId: 'account-b' }); await drain()
+  pending.resolve({ success: true, state: modelRepairState(), messageEn: 'Stale repair result.' }); await drain()
+  const tree = h.render({ accountId: 'account-b' })
+  assert.equal(radio(tree, 'ide').checked, true)
+  assert.doesNotMatch(words(tree), /Stale repair result/)
+  const noRevision = harness({}, undefined, { inspect: async () => modelRepairState({ status: 'needs-repair', ready: false, canRepair: true, revision: undefined }) })
+  noRevision.render(); await drain(); selectCrew(noRevision)
+  assert.equal(button(noRevision.render(), 'Repair model list').disabled, true)
+})
+
+test('missing or failed repair inspection cannot silently bypass Crew readiness but IDE remains usable', async () => {
+  const h = harness({}, undefined, { inspect: async () => { throw new Error('SYNTHETIC_PRIVATE_PATH') } })
+  h.render(); await drain(); selectCrew(h)
+  const tree = h.render()
+  assert.equal(button(tree, 'Switch account').disabled, true)
+  assert.match(words(tree), /Model list inspection failed/)
+  assert.doesNotMatch(words(tree), /SYNTHETIC_PRIVATE_PATH/)
+  radio(tree, 'ide').onChange()
+  assert.equal(button(h.render(), 'Switch account').disabled, false)
+})
+
+test('a slow Crew model inspection does not block CLI switching and a newer upstream fix needs no repair', async () => {
+  const pending = deferred()
+  const h = harness({}, undefined, { inspect: () => pending.promise })
+  h.render(); await drain()
+  radio(h.render(), 'cli').onChange()
+  assert.equal(button(h.render(), 'Switch account').disabled, false)
+  await submit(h.render())
+  assert.equal(h.calls.find(call => call[0] === 'execute')[1].target, 'cli')
+  pending.resolve(modelRepairState({ status: 'upstream-fixed', ready: true, canRestore: false,
+    messageEn: 'This official version already handles model catalog updates.' }))
+  await drain(); selectCrew(h)
+  const tree = h.render()
+  assert.equal(button(tree, 'Switch account').disabled, false)
+  assert.equal(button(tree, 'Repair model list').disabled, true)
+  assert.equal(button(tree, 'Restore official files').disabled, true)
+  assert.match(words(tree), /official version already handles/)
+})
+
+test('failed file repair exposes safe retry guidance without claiming success or switching accounts', async () => {
+  const h = harness({}, undefined, {
+    inspect: async () => modelRepairState({ status: 'needs-repair', ready: false, canRepair: true, canRestore: false }),
+    repair: async () => { throw new Error('SYNTHETIC_PRIVATE_INSTALL_PATH') }
+  })
+  h.render(); await drain(); selectCrew(h)
+  button(h.render(), 'Repair model list').onClick(); await drain()
+  let tree = h.render()
+  assert.equal(button(tree, 'Switch account').disabled, true)
+  assert.match(words(tree), /operation did not complete/)
+  assert.doesNotMatch(words(tree), /SYNTHETIC_PRIVATE_INSTALL_PATH|Model catalog repair is installed/)
+  button(tree, 'Check again').onClick(); await drain()
+  tree = h.render()
+  assert.equal(button(tree, 'Repair model list').disabled, false)
+  assert.equal(h.calls.some(call => call[0] === 'execute'), false)
 })

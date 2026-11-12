@@ -1,0 +1,6 @@
+Kiro-account-manager/resources/crew-model-repair/** text eol=lf
+Kiro-account-manager/test/fixtures/crew-model-repair/** text eol=lf
+Kiro-account-manager/resources/crew-model-repair/**/*.br binary
+Kiro-account-manager/resources/crew-model-repair/**/*.gz binary
+Kiro-account-manager/test/fixtures/crew-model-repair/**/*.br binary
+Kiro-account-manager/test/fixtures/crew-model-repair/**/*.gz binary
