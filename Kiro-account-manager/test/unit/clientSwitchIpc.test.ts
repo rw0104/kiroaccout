@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import type { BrowserWindow, IpcMain, IpcMainInvokeEvent } from 'electron'
 import { registerClientSwitchIpc } from '../../src/main/ipc/clientSwitch'
+import { assertVerifiedCliAccessVersion } from '../../src/main/clientCompatibility'
 import { requireTrustedMainWindow } from '../../src/main/trustedIpc'
 import { ClientSwitchService, type ClientSwitchDependencies } from '../../src/main/clientSwitch'
 import { ClientAccessProjectionService, accessPrincipalFingerprint, type ManagerAccessSnapshot, type ClientAccessProjectionBinding } from '../../src/main/clientAccessProjection'
@@ -32,7 +33,7 @@ interface IpcFixture {
   invoke(channel: string, args?: unknown[], sender?: IpcMainInvokeEvent): Promise<IpcReply>
 }
 
-function harness(): IpcFixture {
+function harness(selectedCliVersion?: string): IpcFixture {
   const calls: string[] = []
   const handlers = new Map<string, IpcHandler>()
   const renderer = join(process.cwd(), 'synthetic-renderer.html')
@@ -77,6 +78,7 @@ function harness(): IpcFixture {
   })
   const deps: ClientSwitchDependencies = {
     account: readAccount,
+    independentAuthDomains: true,
     runtime: async target => {
       calls.push('runtime-read')
       return target === 'cli' ? { id: request.runtimeId, target, revision: request.expectedRuntimeRevision,
@@ -95,7 +97,11 @@ function harness(): IpcFixture {
       requireTrustedMainWindow(candidate, activeWindow, renderer)
     },
     service,
-    chooseExecutable: async target => { calls.push(`configure:${target}`); return { success: true } }
+    chooseExecutable: async target => {
+      calls.push(`configure:${target}`)
+      if (selectedCliVersion !== undefined) assertVerifiedCliAccessVersion(selectedCliVersion)
+      return { success: true }
+    }
   })
   return { handlers, calls, account, event, frame, webContents,
     get binding() { return binding ? { ...binding } : undefined },
@@ -138,6 +144,20 @@ test('choose-executable rejects every unsupported target before opening a picker
   }
 })
 
+test('choosing an unverified CLI reports the detected version and official sign-in command', async () => {
+  for (const version of ['3.4.0', '3.4.0\nPRIVATE']) {
+    const h = harness(version)
+    const reply = await h.invoke('client-switch:choose-executable', ['cli']) as { success: boolean; message: string; messageEn: string }
+    assert.equal(reply.success, false)
+    for (const message of [reply.message, reply.messageEn]) {
+      assert.match(message, /kiro-cli login/)
+      assert.equal(message.includes('3.4.0'), version === '3.4.0')
+      assert.doesNotMatch(message, /PRIVATE/)
+    }
+    assert.deepEqual(h.calls, ['trusted', 'configure:cli'])
+  }
+})
+
 test('actual execute IPC returns state only while keeping manager credentials and settings unchanged', async () => {
   const h = harness()
   const before = JSON.stringify(h.account)
@@ -169,6 +189,16 @@ test('inspect IPC is read-only and authorize/cancel never start login, refresh o
   assert.deepEqual(h.calls, ['trusted'])
   h.calls.length = 0
   assert.equal(await h.invoke('client-switch:cancel-authorization'), undefined)
+  assert.deepEqual(h.calls, ['trusted'])
+})
+
+test('scoped inspection reaches only the selected native store and rejects unknown targets before discovery', async () => {
+  const h = harness()
+  const result = await h.invoke('client-switch:inspect', [request.accountId, 'cli']) as Awaited<ReturnType<ClientSwitchApi['inspect']>>
+  assert.deepEqual(result.targets.map(item => [item.target, item.status]), [['cli', 'ready']])
+  assert.deepEqual(h.calls, ['trusted', 'account-read', 'runtime-read'])
+  h.calls.length = 0
+  await assert.rejects(h.invoke('client-switch:inspect', [request.accountId, 'other']))
   assert.deepEqual(h.calls, ['trusted'])
 })
 

@@ -1,16 +1,17 @@
 import type { IpcMain, IpcMainInvokeEvent } from 'electron'
-import type { ClientSwitchRequest, ExternalClientTarget } from '../../shared/clientSwitch'
+import type { ClientSwitchApi, ClientSwitchRequest, ExternalClientTarget } from '../../shared/clientSwitch'
 import type { ClientSwitchService } from '../clientSwitch'
+import { cliVersionGuidance } from '../clientCompatibility'
 
 export function registerClientSwitchIpc(deps: {
   ipc: Pick<IpcMain, 'handle'>
   trusted(event: IpcMainInvokeEvent): void
   service: ClientSwitchService
-  chooseExecutable(target: ExternalClientTarget): Promise<{ success: boolean; canceled?: boolean; message?: string }>
+  chooseExecutable: ClientSwitchApi['chooseExecutable']
 }): void {
-  deps.ipc.handle('client-switch:inspect', (event, accountId: string) => {
+  deps.ipc.handle('client-switch:inspect', (event, accountId: string, target?: ExternalClientTarget) => {
     deps.trusted(event)
-    return deps.service.inspect(accountId)
+    return deps.service.inspect(accountId, target)
   })
   deps.ipc.handle('client-switch:execute', (event, request: ClientSwitchRequest) => {
     deps.trusted(event)
@@ -24,10 +25,16 @@ export function registerClientSwitchIpc(deps: {
     deps.trusted(event)
     return deps.service.disconnect(request)
   })
-  deps.ipc.handle('client-switch:choose-executable', (event, target: ExternalClientTarget) => {
+  deps.ipc.handle('client-switch:choose-executable', async (event, target: ExternalClientTarget) => {
     deps.trusted(event)
     if (target !== 'cli' && target !== 'crew') throw new Error('Invalid client selection')
-    return deps.chooseExecutable(target)
+    try { return await deps.chooseExecutable(target) }
+    catch (error) {
+      const guidance = target === 'cli' && cliVersionGuidance(error)
+      if (guidance) return { success: false, message: guidance.message, messageEn: guidance.messageEn }
+      return { success: false, message: '此官方客户端的签名、文件或登录协议未通过兼容性检查，请确认版本并重新检测。',
+        messageEn: 'Client verification failed. Check the installation and version, then try again.' }
+    }
   })
   deps.ipc.handle('client-switch:cancel-authorization', (event) => {
     deps.trusted(event)

@@ -50,7 +50,7 @@ function harness(overrides = {}, windowApi, repairOverrides = {}) {
     }
   }
   const api = {
-    inspect: async id => { calls.push(['inspect', id]); return { targets: [capability('crew'), capability('cli')] } },
+    inspect: async (id, target) => { calls.push(['inspect', id, target]); return { targets: [capability(target)] } },
     execute: async input => { calls.push(['execute', JSON.parse(JSON.stringify(input))]); return response() },
     authorize: async input => { calls.push(['authorize', JSON.parse(JSON.stringify(input))]); return response() },
     disconnect: async input => { calls.push(['disconnect', JSON.parse(JSON.stringify(input))]); return response({ status: 'disconnected' }) },
@@ -112,13 +112,45 @@ function find(tree, predicate) {
 const words = tree => typeof tree === 'string' ? tree : Array.isArray(tree) ? tree.map(words).join('') : words(tree?.props?.children ?? '')
 const button = (tree, text) => find(tree, node => node.type === 'Button' && words(node) === text)[0]?.props
 const radio = (tree, target) => find(tree, node => node.type === 'input' && node.props['data-client-target'] === target)[0]?.props
-const selectCrew = view => { radio(view.render(), 'crew').onChange() }
+const selectClient = async (view, target, props) => {
+  radio(view.render(props), target).onChange()
+  await drain()
+}
 const submit = tree => find(tree, node => node.type === 'form')[0].props.onSubmit(event())
+
+test('opening the switcher on IDE performs zero external inspections, including repeated opens', async () => {
+  let switchInspections = 0
+  let modelInspections = 0
+  for (let i = 0; i < 10; i++) {
+    const h = harness()
+    const tree = h.render()
+    await drain()
+    assert.equal(button(tree, 'Switch account').disabled, false)
+    switchInspections += h.calls.length
+    modelInspections += h.repairCalls.length
+    h.unmount()
+  }
+  assert.deepEqual({ switchInspections, modelInspections }, { switchInspections: 0, modelInspections: 0 })
+})
+
+test('a late Crew status cannot replace the selected CLI status', async () => {
+  const pending = deferred()
+  const h = harness({
+    inspect: async (_id, target) => target === 'crew' ? pending.promise : { targets: [capability('cli')] }
+  })
+  await selectClient(h, 'crew')
+  assert.equal(button(h.render(), 'Switch account').disabled, true)
+  await selectClient(h, 'cli')
+  pending.resolve({ targets: [capability('crew', 'blocked')] })
+  await drain()
+  const tree = h.render()
+  assert.match(words(tree), /cli state/)
+  assert.equal(button(tree, 'Switch account').disabled, false)
+})
 
 test('Crew selection uses the existing official client directly without workspace modes', async () => {
   const h = harness()
-  h.render(); await drain()
-  selectCrew(h)
+  await selectClient(h, 'crew')
   const tree = h.render()
   const clients = find(tree, node => node.type === 'input' && node.props.type === 'radio')
   assert.deepEqual(clients.map(node => node.props.value), ['ide', 'crew', 'cli'])
@@ -126,7 +158,7 @@ test('Crew selection uses the existing official client directly without workspac
   assert.equal(button(tree, 'Switch account').disabled, false)
   assert.match(words(tree), /does not start it/)
   assert.doesNotMatch(words(tree), /workspace/i)
-  assert.deepEqual(h.calls, [['inspect', 'account-a']])
+  assert.deepEqual(h.calls, [['inspect', 'account-a', 'crew']])
   await submit(tree)
   assert.equal(h.calls.find(call => call[0] === 'execute')[1].target, 'crew')
 })
@@ -135,8 +167,7 @@ test('client detection and selection work when the workspace preload API is abse
   const windowApi = {}
   Object.defineProperty(windowApi, 'managedCrew', { get() { throw new Error('Removed API must not be accessed') } })
   const h = harness({}, windowApi)
-  h.render(); await drain()
-  selectCrew(h)
+  await selectClient(h, 'crew')
   assert.equal(button(h.render(), 'Switch account').disabled, false)
   await submit(h.render())
   assert.equal(h.calls.filter(call => call[0] === 'execute').length, 1)
@@ -150,9 +181,11 @@ test('opening and selecting clients inspect metadata only; IDE is the default on
   await drain()
   tree = h.render()
   radio(tree, 'cli').onChange()
+  await drain()
   tree = h.render()
   assert.equal(radio(tree, 'cli').checked, true)
-  assert.deepEqual(h.calls, [['inspect', 'account-a']])
+  assert.deepEqual(h.calls, [['inspect', 'account-a', 'cli']])
+  assert.deepEqual(h.repairCalls, [])
   button(tree, 'Cancel').onClick()
   assert.equal(h.closed, 1)
   h.unmount()
@@ -173,8 +206,7 @@ test('IDE submission invokes only the existing IDE callback, even if external di
 
 test('external submission carries target identity and revision without manager credentials', async () => {
   const h = harness()
-  h.render(); await drain()
-  selectCrew(h)
+  await selectClient(h, 'crew')
   await submit(h.render())
   assert.deepEqual(h.calls.find(call => call[0] === 'execute'), ['execute', {
     operationId: 'operation-1', accountId: 'account-a', target: 'crew',
@@ -187,8 +219,7 @@ test('external submission carries target identity and revision without manager c
 
 test('blocked targets show their reason and cannot fall back to a legacy credential write', async () => {
   const h = harness({ inspect: async () => ({ targets: [capability('crew', 'blocked', { messageEn: 'Finish the running Crew task first.' })] }) })
-  h.render(); await drain()
-  selectCrew(h)
+  await selectClient(h, 'crew')
   const tree = h.render()
   assert.equal(button(tree, 'Switch account').disabled, true)
   assert.match(words(tree), /Finish the running Crew task first/)
@@ -203,7 +234,7 @@ test('authorization is explicit and cancel uses its operation ID before closing'
     authorize: input => { h.calls.push(['authorize', JSON.parse(JSON.stringify(input))]); return pending.promise }
   })
   h.render(); await drain()
-  radio(h.render(), 'cli').onChange()
+  await selectClient(h, 'cli')
   let tree = h.render()
   assert.equal(button(tree, 'Switch account').disabled, true)
   assert.deepEqual(h.calls, [])
@@ -224,8 +255,7 @@ test('authorization is explicit and cancel uses its operation ID before closing'
 
 test('shared Crew and CLI authentication is explained before committing', async () => {
   const h = harness({ inspect: async () => ({ targets: [capability('crew', 'ready', { sharedTargets: ['crew', 'cli'] })] }) })
-  h.render(); await drain()
-  selectCrew(h)
+  await selectClient(h, 'crew')
   assert.match(words(h.render()), /Switching will affect both clients/)
   assert.deepEqual(h.calls, [])
 })
@@ -238,7 +268,7 @@ test('late authorization cancellation cannot close another account dialog', asyn
     cancelAuthorization: id => { h.calls.push(['cancelAuthorization', id]); return cancellation.promise }
   })
   h.render(); await drain()
-  radio(h.render(), 'cli').onChange()
+  await selectClient(h, 'cli')
   button(h.render(), 'Authorize this account in client').onClick()
   const cancel = button(h.render(), 'Cancel authorization')
   cancel.onClick(); cancel.onClick()
@@ -258,7 +288,7 @@ test('duplicate submits are serialized and Escape cannot dismiss an in-flight wr
   const pending = deferred()
   const h = harness({ execute: input => { h.calls.push(['execute', input]); return pending.promise } })
   h.render(); await drain()
-  radio(h.render(), 'cli').onChange()
+  await selectClient(h, 'cli')
   const tree = h.render()
   const selectAnotherClient = radio(tree, 'crew').onChange
   const first = submit(tree)
@@ -281,7 +311,7 @@ test('a late inspection or write response cannot update a newly selected account
     inspect: id => id === 'account-a' ? lateInspect.promise : Promise.resolve({ targets: [capability('cli')] }),
     execute: () => lateWrite.promise
   })
-  h.render()
+  await selectClient(h, 'cli')
   h.render({ accountId: 'account-b' })
   await drain()
   lateInspect.resolve({ targets: [capability('crew', 'ready', { messageEn: 'Stale account A state' })] })
@@ -289,6 +319,7 @@ test('a late inspection or write response cannot update a newly selected account
   let tree = h.render({ accountId: 'account-b' })
   assert.doesNotMatch(words(tree), /Stale account A state/)
   radio(tree, 'cli').onChange()
+  await drain()
   const write = submit(h.render({ accountId: 'account-b' }))
   h.render({ accountId: 'account-c' }); await drain()
   lateWrite.resolve(response({ messageEn: 'Stale account B success' }))
@@ -301,7 +332,7 @@ test('a late inspection or write response cannot update a newly selected account
 test('choosing a client executable delegates to the native picker without executing a switch', async () => {
   const h = harness()
   h.render(); await drain()
-  radio(h.render(), 'cli').onChange()
+  await selectClient(h, 'cli')
   button(h.render(), 'Choose installed client').onClick()
   await drain()
   assert.deepEqual(h.calls.find(call => call[0] === 'chooseExecutable'), ['chooseExecutable', 'cli'])
@@ -311,20 +342,20 @@ test('choosing a client executable delegates to the native picker without execut
 test('disconnect is explicit for a connected external client and never appears for IDE', async () => {
   let connected = true
   const h = harness({
-    inspect: async id => { h.calls.push(['inspect', id]); return { targets: [capability('cli', 'ready', { connected }), capability('crew')] } },
+    inspect: async (id, target) => { h.calls.push(['inspect', id, target]); return { targets: [capability(target, 'ready', { connected: target === 'cli' && connected })] } },
     disconnect: async input => { h.calls.push(['disconnect', JSON.parse(JSON.stringify(input))]); connected = false; return response({ status: 'disconnected' }) }
   })
   h.render(); await drain()
   assert.equal(button(h.render(), 'Disconnect'), undefined)
-  selectCrew(h)
+  await selectClient(h, 'crew')
   assert.equal(button(h.render(), 'Disconnect'), undefined)
-  radio(h.render(), 'cli').onChange()
+  await selectClient(h, 'cli')
   let tree = h.render()
   assert.equal(button(tree, 'Disconnect').disabled, false)
-  assert.deepEqual(h.calls, [['inspect', 'account-a']])
+  assert.deepEqual(h.calls, [['inspect', 'account-a', 'crew'], ['inspect', 'account-a', 'cli']])
   button(tree, 'Disconnect').onClick()
   await drain()
-  assert.deepEqual(h.calls[1], ['disconnect', {
+  assert.deepEqual(h.calls[2], ['disconnect', {
     operationId: 'operation-1', accountId: 'account-a', target: 'cli',
     runtimeId: 'cli-runtime', expectedRuntimeRevision: 'cli-revision'
   }])
@@ -332,14 +363,13 @@ test('disconnect is explicit for a connected external client and never appears f
   assert.equal(button(tree, 'Disconnect'), undefined)
   assert.match(words(tree), /Existing short-lived client credentials will expire naturally/)
   assert.match(words(tree), /manager sign-in is unchanged/)
-  assert.deepEqual(h.calls.map(call => call[0]), ['inspect', 'disconnect', 'inspect'])
+  assert.deepEqual(h.calls.map(call => call[0]), ['inspect', 'inspect', 'disconnect', 'inspect'])
   assert.equal(h.closed, 0)
 })
 
 test('a connected but blocked target can stop synchronization without attempting a write', async () => {
   const h = harness({ inspect: async () => ({ targets: [capability('crew', 'blocked', { connected: true, sharedTargets: ['crew', 'cli'] })] }) })
-  h.render(); await drain()
-  selectCrew(h)
+  await selectClient(h, 'crew')
   const tree = h.render()
   assert.equal(button(tree, 'Switch account').disabled, true)
   assert.equal(button(tree, 'Disconnect').disabled, false)
@@ -357,7 +387,7 @@ test('disconnect is serialized and a stale response cannot alter another account
     disconnect: input => { h.calls.push(['disconnect', JSON.parse(JSON.stringify(input))]); return pending.promise }
   })
   h.render(); await drain()
-  radio(h.render(), 'cli').onChange()
+  await selectClient(h, 'cli')
   const disconnect = button(h.render(), 'Disconnect')
   disconnect.onClick(); disconnect.onClick()
   assert.equal(h.calls.length, 1)
@@ -379,7 +409,7 @@ test('failed disconnect displays the actual failure and preserves retry capabili
     disconnect: async input => { h.calls.push(['disconnect', input]); return response({ status: 'blocked', messageEn: 'Another operation is still running.' }) }
   })
   h.render(); await drain()
-  radio(h.render(), 'cli').onChange()
+  await selectClient(h, 'cli')
   button(h.render(), 'Disconnect').onClick()
   await drain()
   const tree = h.render()
@@ -396,7 +426,7 @@ test('Crew must repair the selected installation before switching and sends its 
       canRepair: !ready, canRestore: ready, messageEn: ready ? 'Model catalog repair is installed.' : 'The model catalog needs repair.' }),
     repair: async input => { h.repairCalls.push(['repair', JSON.parse(JSON.stringify(input))]); ready = true; return { success: true, state: modelRepairState() } }
   })
-  h.render(); await drain(); selectCrew(h)
+  await selectClient(h, 'crew')
   let tree = h.render()
   assert.equal(button(tree, 'Switch account').disabled, true)
   assert.equal(button(tree, 'Repair model list').disabled, false)
@@ -416,7 +446,7 @@ test('Crew must repair the selected installation before switching and sends its 
 test('running but repaired Crew may switch while its repair and restore actions remain unavailable', async () => {
   const h = harness({}, undefined, { inspect: async () => modelRepairState({ status: 'running', ready: true, canRestore: false,
     messageEn: 'Crew is running with the repaired model catalog.' }) })
-  h.render(); await drain(); selectCrew(h)
+  await selectClient(h, 'crew')
   const tree = h.render()
   assert.equal(button(tree, 'Switch account').disabled, false)
   assert.equal(button(tree, 'Repair model list').disabled, true)
@@ -430,7 +460,7 @@ test('restoring official files is explicit and blocks switching again when a cat
     h.repairCalls.push(['restore', JSON.parse(JSON.stringify(input))]); restored = true
     return { success: true, state: state(), messageEn: 'Official files restored.' }
   } })
-  h.render(); await drain(); selectCrew(h)
+  await selectClient(h, 'crew')
   button(h.render(), 'Restore official files').onClick(); await drain()
   assert.deepEqual(h.repairCalls[0], ['restore', { operationId: 'operation-1', accountId: 'account-a', expectedRevision: 'synthetic-installation-revision' }])
   const tree = h.render()
@@ -443,7 +473,7 @@ test('rechecking after a client update invalidates an old ready state without to
   const update = deferred()
   let checks = 0
   const h = harness({}, undefined, { inspect: async () => ++checks === 1 ? modelRepairState() : update.promise })
-  h.render(); await drain(); selectCrew(h)
+  await selectClient(h, 'crew')
   const oldTree = h.render()
   button(oldTree, 'Check again').onClick()
   assert.equal(button(h.render(), 'Switch account').disabled, true)
@@ -454,6 +484,7 @@ test('rechecking after a client update invalidates an old ready state without to
   assert.equal(button(tree, 'Switch account').disabled, true)
   assert.match(words(tree), /updated client needs a compatibility check/)
   radio(tree, 'cli').onChange()
+  await drain()
   assert.equal(button(h.render(), 'Switch account').disabled, false)
   assert.equal(button(h.render(), 'Repair model list'), undefined)
   assert.equal(h.repairCalls.some(call => call[0] === 'repair' || call[0] === 'restore'), false)
@@ -463,7 +494,7 @@ test('repair mutations require a revision, serialize clicks, and discard late re
   const pending = deferred()
   const h = harness({}, undefined, { inspect: async () => modelRepairState({ status: 'needs-repair', ready: false, canRepair: true, canRestore: false }),
     repair: input => { h.repairCalls.push(['repair', input]); return pending.promise } })
-  h.render(); await drain(); selectCrew(h)
+  await selectClient(h, 'crew')
   const action = button(h.render(), 'Repair model list')
   action.onClick(); action.onClick()
   assert.equal(h.repairCalls.length, 1)
@@ -475,13 +506,13 @@ test('repair mutations require a revision, serialize clicks, and discard late re
   assert.equal(radio(tree, 'ide').checked, true)
   assert.doesNotMatch(words(tree), /Stale repair result/)
   const noRevision = harness({}, undefined, { inspect: async () => modelRepairState({ status: 'needs-repair', ready: false, canRepair: true, revision: undefined }) })
-  noRevision.render(); await drain(); selectCrew(noRevision)
+  await selectClient(noRevision, 'crew')
   assert.equal(button(noRevision.render(), 'Repair model list').disabled, true)
 })
 
 test('missing or failed repair inspection cannot silently bypass Crew readiness but IDE remains usable', async () => {
   const h = harness({}, undefined, { inspect: async () => { throw new Error('SYNTHETIC_PRIVATE_PATH') } })
-  h.render(); await drain(); selectCrew(h)
+  await selectClient(h, 'crew')
   const tree = h.render()
   assert.equal(button(tree, 'Switch account').disabled, true)
   assert.match(words(tree), /Model list inspection failed/)
@@ -493,14 +524,15 @@ test('missing or failed repair inspection cannot silently bypass Crew readiness 
 test('a slow Crew model inspection does not block CLI switching and a newer upstream fix needs no repair', async () => {
   const pending = deferred()
   const h = harness({}, undefined, { inspect: () => pending.promise })
-  h.render(); await drain()
-  radio(h.render(), 'cli').onChange()
+  await selectClient(h, 'crew')
+  assert.equal(button(h.render(), 'Switch account').disabled, true)
+  await selectClient(h, 'cli')
   assert.equal(button(h.render(), 'Switch account').disabled, false)
   await submit(h.render())
   assert.equal(h.calls.find(call => call[0] === 'execute')[1].target, 'cli')
   pending.resolve(modelRepairState({ status: 'upstream-fixed', ready: true, canRestore: false,
     messageEn: 'This official version already handles model catalog updates.' }))
-  await drain(); selectCrew(h)
+  await drain(); await selectClient(h, 'crew')
   const tree = h.render()
   assert.equal(button(tree, 'Switch account').disabled, false)
   assert.equal(button(tree, 'Repair model list').disabled, true)
@@ -513,7 +545,7 @@ test('failed file repair exposes safe retry guidance without claiming success or
     inspect: async () => modelRepairState({ status: 'needs-repair', ready: false, canRepair: true, canRestore: false }),
     repair: async () => { throw new Error('SYNTHETIC_PRIVATE_INSTALL_PATH') }
   })
-  h.render(); await drain(); selectCrew(h)
+  await selectClient(h, 'crew')
   button(h.render(), 'Repair model list').onClick(); await drain()
   let tree = h.render()
   assert.equal(button(tree, 'Switch account').disabled, true)

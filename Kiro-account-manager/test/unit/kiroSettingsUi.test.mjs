@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
+import * as sharedSettings from '../../src/shared/kiroSettings.ts'
 
 const ts = createRequire(import.meta.url)('typescript')
 const clean = value => JSON.parse(JSON.stringify(value))
@@ -56,6 +57,7 @@ function harness(overrides = {}) {
   vm.runInNewContext(compiled, {
     exports, window: { api }, confirm: () => true, console: { error() {} },
     require(name) {
+      if (name === '../../../../shared/kiroSettings') return sharedSettings
       if (name === 'react') return hooks
       if (name === 'react/jsx-runtime') return { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) }
       if (name === '../ui') return Object.fromEntries(['Card', 'CardContent', 'CardHeader', 'CardTitle', 'Button', 'Toggle', 'Select'].map(type => [type, type]))
@@ -86,6 +88,25 @@ function nodes(tree, predicate) {
 const byId = (tree, id) => nodes(tree, node => node.props?.id === id)[0]
 const text = tree => typeof tree === 'string' ? tree : Array.isArray(tree) ? tree.map(text).join(' ') : tree && typeof tree === 'object' ? text(tree.props?.children) : ''
 const button = (tree, label) => nodes(tree, node => node.type === 'Button' && text(node).trim() === label)[0]
+
+test('MCP edit routes remote entries to the raw user config and command entries to the form', async () => {
+  const ctx = harness({ getKiroSettings: async () => ({ settings: {}, mcpConfig: { mcpServers: {
+    remote: { url: 'https://example.invalid/mcp', headers: { 'X-Test': 'synthetic-field' }, oauthScopes: ['read'] },
+    local: { command: 'synthetic-command' }
+  } } }) })
+  let tree = await ctx.ready()
+  const edits = nodes(tree, node => node.type === 'button' && /Edit/.test(node.props?.title))
+  await edits[0].props.onClick()
+  assert.deepEqual(ctx.calls.defaultWrites, ['mcp'])
+  tree = ctx.render()
+  assert.equal(nodes(tree, node => node.type === 'McpServerEditor').length, 0)
+  assert.doesNotMatch(JSON.stringify(tree), /synthetic-field/)
+  ctx.api.openKiroMcpConfig = async () => ({ success: false, error: 'Synthetic missing editor' })
+  await edits[0].props.onClick()
+  assert.match(text(ctx.render()), /Synthetic missing editor/)
+  edits[1].props.onClick()
+  assert.equal(nodes(ctx.render(), node => node.type === 'McpServerEditor')[0].props.serverName, 'local')
+})
 
 test('A-B-A target switching cannot reuse the first model request for the latest A visit', async () => {
   const requests = []
@@ -153,7 +174,12 @@ test('memory and workflows use verified values, preserve loaded choices, and sav
   const memory = byId(tree, 'kiro-memory')
   assert.ok(memory)
   assert.equal(memory.props.value, 'useOnly')
-  assert.deepEqual(clean(memory.props.options.map(option => option.value)), ['off', 'useAndLearn', 'useWithoutLearning', 'useOnly'])
+  assert.deepEqual(clean(memory.props.options), [
+    { value: 'off', label: "Don't use" },
+    { value: 'useAndLearn', label: 'Use and create automatically' },
+    { value: 'useWithoutLearning', label: 'Use and create when asked' },
+    { value: 'useOnly', label: "Use but don't create" }
+  ])
   assert.equal(byId(tree, 'kiro-workflows-enabled').props.checked, true)
   memory.props.onChange('useAndLearn')
   tree = ctx.render()

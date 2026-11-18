@@ -10,7 +10,23 @@ export const VERIFIED_CLI_ACCESS_VERSIONS: readonly string[] = Object.freeze(['3
 
 export class ClientCompatibilityError extends Error {
   readonly code: 'unsupported-client-version' | 'unsupported-client-contract'
-  constructor(code: ClientCompatibilityError['code']) { super(code); this.name = 'ClientCompatibilityError'; this.code = code }
+  readonly version?: string
+  constructor(code: ClientCompatibilityError['code'], detectedVersion?: string) {
+    super(code)
+    this.name = 'ClientCompatibilityError'
+    this.code = code
+    if (detectedVersion && /^\d{1,8}\.\d{1,8}\.\d{1,8}$/.test(detectedVersion)) this.version = detectedVersion
+  }
+}
+
+export function cliVersionGuidance(error: unknown): { version?: string; message: string; messageEn: string } | undefined {
+  if (!(error instanceof ClientCompatibilityError) || error.code !== 'unsupported-client-version') return undefined
+  const client = error.version && `Kiro CLI ${error.version}`
+  return {
+    version: error.version,
+    message: `管理器尚未验证${client ? ` ${client} ` : '此 CLI 版本'}的本地账号切换。请在终端运行 kiro-cli login，按提示完成登录。`,
+    messageEn: `The manager has not verified account switching for ${client || 'this CLI version'}. Run kiro-cli login in a terminal to sign in.`
+  }
 }
 
 export const CREW_ACCESS_CONTRACT_FILES = Object.freeze([
@@ -21,7 +37,7 @@ export const CREW_ACCESS_CONTRACT_FILES = Object.freeze([
 ] as const)
 
 export function assertVerifiedCliAccessVersion(version: string): void {
-  if (!VERIFIED_CLI_ACCESS_VERSIONS.includes(version)) throw new ClientCompatibilityError('unsupported-client-version')
+  if (!VERIFIED_CLI_ACCESS_VERSIONS.includes(version)) throw new ClientCompatibilityError('unsupported-client-version', version)
 }
 
 export function crewAccessContractDigest(readSource: (relativePath: string) => string, files: readonly string[] = CREW_ACCESS_CONTRACT_FILES): string {

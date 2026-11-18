@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, readFileSync, readdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -13,7 +14,7 @@ import vm from 'node:vm'
 const appRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const metadata = JSON.parse(readFileSync(join(appRoot, 'package.json'), 'utf8'))
 const preview = { name: 'kiro-account-manager', version: '1.8.5-rc.1' }
-const run = (script, args = []) => spawnSync(process.execPath, [join(appRoot, 'scripts', script), ...args], { encoding: 'utf8', timeout: 10000 })
+const run = (script, args = [], input) => spawnSync(process.execPath, [join(appRoot, 'scripts', script), ...args], { input, encoding: 'utf8', timeout: 10000 })
 function temporary(fn) {
   const directory = mkdtempSync(join(tmpdir(), 'kiro-release-fixture-'))
   try { fn(directory) } finally { rmSync(directory, { recursive: true, force: true }) }
@@ -93,6 +94,37 @@ test('checksum aggregation validates each payload and rejects extra assets befor
   result = run('release-checksums.mjs', ['--all', '--dist', dist])
   assert.notEqual(result.status, 0)
   assert.match(result.stderr, /Checksum verification failed/)
+}))
+
+test('a publish retry accepts only the same completed release and exact staged bytes', () => temporary(dist => {
+  const commit = '1'.repeat(40)
+  const release = { tagName: `v${metadata.version}`, targetCommitish: commit, isDraft: false,
+    isPrerelease: metadata.version.includes('-'), assets: [] }
+  const files = ['SHA256SUMS.txt', ...releaseTargets(metadata.version).flatMap(target =>
+    [...releaseArtifactNames({ ...metadata, ...target }), checksumFilename(target)]
+  )]
+  for (const name of files) {
+    const payload = Buffer.from(`test asset ${name}`)
+    writeFileSync(join(dist, name), payload)
+    release.assets.push({ name, size: payload.length, state: 'uploaded',
+      digest: `sha256:${createHash('sha256').update(payload).digest('hex')}` })
+  }
+  const verify = changes => run('verify-published-release.mjs', [dist, commit], JSON.stringify({ ...release, ...changes }))
+  const good = verify({})
+  assert.equal(good.status, 0, good.stderr)
+  for (const [changes, reason] of [
+    [{ isDraft: true }, /still a draft/],
+    [{ targetCommitish: '2'.repeat(40) }, /target differs/],
+    [{ isPrerelease: !release.isPrerelease }, /channel differs/],
+    [{ assets: release.assets.slice(1) }, /asset list differs/],
+    [{ assets: release.assets.map((asset, i) => i === 0 ? { ...asset, state: 'new' } : asset) }, /Incomplete upload/]
+  ]) {
+    const result = verify(changes)
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, reason)
+  }
+  writeFileSync(join(dist, files[0]), Buffer.alloc(release.assets[0].size))
+  assert.match(verify({}).stderr, /Digest differs/)
 }))
 
 test('staging includes only target assets and rejects stale content in the stage', () => temporary(dist => {

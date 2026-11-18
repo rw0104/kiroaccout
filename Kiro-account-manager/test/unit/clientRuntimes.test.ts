@@ -248,6 +248,19 @@ test('a later Crew patch with the verified access contract is accepted but a cha
   await assert.rejects(f.registry.get('crew'), /unsupported-client-contract/)
 })
 
+test('auto-detection and manual selection preserve the verified CLI version in compatibility diagnostics without saving configuration', async t => {
+  const f = fixture(t)
+  const executablePath = f.install('new-cli', 'cli')
+  const configuration = { executablePath, dataHome: join(f.directory, 'cli-data') }
+  f.configs.set('cli', configuration)
+  f.probe(async () => ({ valid: true, publisher: 'CN=Amazon.com, Inc.', version: '3.4.0' }))
+  const expected = { code: 'unsupported-client-version', version: '3.4.0' }
+  await assert.rejects(f.registry.get('cli'), expected)
+  await assert.rejects(f.registry.configure('cli', executablePath), expected)
+  assert.equal(f.configs.get('cli'), configuration)
+  assert.equal(f.writes.length, 0)
+})
+
 test('ambiguous Crew package metadata and unknown CLI versions fail before native credential writes', async t => {
   const f = fixture(t)
   const executablePath = f.install('ambiguous-crew', 'crew')

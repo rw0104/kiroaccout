@@ -1,5 +1,6 @@
 import type { ClientSwitchCapability, ClientSwitchRequest, ClientSwitchResult, ClientSwitchSnapshot, ExternalClientTarget } from '../shared/clientSwitch'
 import type { ClientModelRepairState } from '../shared/clientModelRepair'
+import { cliVersionGuidance } from './clientCompatibility'
 import { ClientAccessProjectionService, ClientAccessProjectionError, accessPrincipalFingerprint, projectableClientAccess, type ClientAccessValidationIssue, type ManagerAccessSnapshot, type ClientAccessProjectionBinding, type ClientAccessProjectionAdapter } from './clientAccessProjection'
 
 export interface ClientSwitchRuntime {
@@ -15,6 +16,8 @@ export interface ClientSwitchRuntime {
 export interface ClientSwitchDependencies {
   account(accountId: string): ManagerAccessSnapshot | undefined
   runtime(target: ExternalClientTarget): Promise<ClientSwitchRuntime | undefined>
+  /** Registries with separate stores can inspect one client without probing for shared sign-in. */
+  independentAuthDomains?: boolean
   projection: ClientAccessProjectionService
   bindings(): readonly ClientAccessProjectionBinding[]
   /** Holds the existing manager operation lease without changing refresh ownership. */
@@ -97,17 +100,20 @@ export class ClientSwitchService {
     }
   }
 
-  async inspect(accountId: string): Promise<ClientSwitchSnapshot> {
-    if (!validId(accountId)) throw new Error('Invalid account selection')
-    if (this.deps.platformSupported && !this.deps.platformSupported()) return { targets: targets.map(target => ({ target, status: 'blocked',
+  async inspect(accountId: string, selected?: ExternalClientTarget): Promise<ClientSwitchSnapshot> {
+    if (!validId(accountId) || selected !== undefined && !targets.includes(selected)) throw new Error('Invalid client selection')
+    const inspectTargets = selected && this.deps.independentAuthDomains ? [selected] : targets
+    if (this.deps.platformSupported && !this.deps.platformSupported()) return { targets: (selected ? [selected] : targets).map(target => ({ target, status: 'blocked',
       message: '此版本的 CLI/Crew 连接目前仅支持 Windows；IDE 切号保持可用。',
       messageEn: 'CLI/Crew connections in this release support Windows. IDE account switching remains available.' })) }
     const access = this.deps.account(accountId)
     const principal = accessPrincipalFingerprint(access)
     const inspectedRuntimes = new Map<ExternalClientTarget, ClientSwitchRuntime>()
-    const snapshots = await Promise.all(targets.map(async (target): Promise<ClientSwitchCapability> => {
+    const snapshots = await Promise.all(inspectTargets.map(async (target): Promise<ClientSwitchCapability> => {
       let runtime: ClientSwitchRuntime | undefined
       try { runtime = await this.deps.runtime(target) } catch (error) {
+        const cliGuidance = target === 'cli' && cliVersionGuidance(error)
+        if (cliGuidance) return { target, status: 'blocked', errorCode: 'CLIENT_CONTRACT_UNSUPPORTED', ...cliGuidance }
         const code = error && typeof error === 'object' && 'code' in error ? error.code : undefined
         if (code === 'unsupported-client-version' || code === 'unsupported-client-contract') return {
           target, status: 'blocked', errorCode: 'CLIENT_CONTRACT_UNSUPPORTED',
@@ -167,7 +173,7 @@ export class ClientSwitchService {
       }
       if (shared.length > 1) snapshot.sharedTargets = shared
     }
-    return { targets: snapshots }
+    return { targets: selected ? snapshots.filter(item => item.target === selected) : snapshots }
   }
 
   execute(request: ClientSwitchRequest): Promise<ClientSwitchResult> {
