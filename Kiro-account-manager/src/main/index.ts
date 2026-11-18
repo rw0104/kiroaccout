@@ -37,7 +37,7 @@ import { createWindowsKiroInstallationDiscovery } from './kiroInstanceDiscovery'
 import { readKiroSettingsDocument, updateKiroSettingsDocument, parseKiroSettingsObject, resolveKiroSettingsTarget, kiroSettingsFailure } from './kiroSettings'
 import { createSteeringFiles, steeringFileFailure } from './steeringFiles'
 import { requireTrustedMainWindow } from './trustedIpc'
-import type { KiroSettingsTarget } from '../shared/kiroSettings'
+import { isMcpCommandServer, type KiroSettingsTarget, type McpCommandServer } from '../shared/kiroSettings'
 import { KiroPermissionsService, kiroPermissionsFailure } from './kiroPermissionsService'
 import type { KiroPermissionsRevision } from '../shared/kiroPermissions'
 import * as os from 'node:os'
@@ -1403,6 +1403,8 @@ function setupClientSwitching(): void {
   clientAccessProjection = projection
   const service = new ClientSwitchService({
     account: getClientProjectionAccess, runtime: target => runtimes.get(target), projection, bindings,
+    // ClientRuntimeRegistry prefixes each authentication domain with its client target.
+    independentAuthDomains: true,
     inspectModels: () => modelActions.readiness(),
     beginModelOperation: target => {
       if (target !== 'crew') return () => {}
@@ -1432,8 +1434,8 @@ function setupClientSwitching(): void {
       const selected = await dialog.showOpenDialog(mainWindow, { title: target === 'crew' ? '选择 KiroCrew.exe' : '选择 kiro-cli.exe',
         properties: ['openFile'], filters: [{ name: 'Official Kiro client', extensions: process.platform === 'win32' ? ['exe'] : ['*'] }] })
       if (selected.canceled || selected.filePaths.length !== 1) return { success: false, canceled: true }
-      try { await runtimes.configure(target, selected.filePaths[0]); return { success: true } }
-      catch { return { success: false, message: '此官方客户端的签名、文件或登录协议未通过兼容性检查，请确认版本并重新检测。' } }
+      await runtimes.configure(target, selected.filePaths[0])
+      return { success: true }
     }
   })
   const tick = (): Promise<void> => {
@@ -5426,7 +5428,9 @@ app.whenReady().then(async () => {
         fs.writeFileSync(configPath, JSON.stringify({ mcpServers: {} }, null, 2))
       }
       
-      shell.openPath(configPath)
+      if (await shell.openPath(configPath)) {
+        return { success: false, error: '无法打开 MCP 配置文件，请确认已设置 JSON 文件编辑器。' }
+      }
       return { success: true }
     } catch (error) {
       console.error('[KiroSettings] Failed to open MCP config:', error)
@@ -6653,8 +6657,11 @@ app.whenReady().then(async () => {
   // ============ MCP 服务器管理 IPC ============
 
   // IPC: 保存 MCP 服务器配置
-  ipcMain.handle('save-mcp-server', async (_event, name: string, config: { command: string; args?: string[]; env?: Record<string, string> }, oldName?: string) => {
+  ipcMain.handle('save-mcp-server', async (_event, name: string, config: McpCommandServer, oldName?: string) => {
     try {
+      if (typeof name !== 'string' || !name.trim() || !isMcpCommandServer(config)) {
+        return { success: false, error: '本地 MCP 服务器需要有效的名称和命令。' }
+      }
       const os = await import('os')
       const fs = await import('fs')
       const path = await import('path')
@@ -6668,13 +6675,25 @@ app.whenReady().then(async () => {
         mcpConfig = JSON.parse(content)
       }
       
-      // 如果是重命名，先删除旧的
-      if (oldName && oldName !== name) {
-        delete mcpConfig.mcpServers[oldName]
+      const servers = mcpConfig?.mcpServers
+      if (!servers || typeof servers !== 'object' || Array.isArray(servers)) {
+        return { success: false, error: '请在用户 MCP 配置文件中检查 mcpServers。' }
       }
-      
-      // 添加/更新服务器
-      mcpConfig.mcpServers[name] = config
+      if (name !== oldName && Object.hasOwn(servers, name)) {
+        return { success: false, error: '同名 MCP 服务器已存在，请选择其他名称。' }
+      }
+      let previous: McpCommandServer | undefined
+      if (oldName !== undefined) {
+        const current = servers[oldName]
+        if (!Object.hasOwn(servers, oldName) || !isMcpCommandServer(current)) {
+          return { success: false, error: '此条目已更改或需要在用户 MCP 配置文件中编辑。' }
+        }
+        previous = current
+      }
+      // Replace only fields the command form owns, including clearing args or env.
+      const edited = { ...previous, command: config.command, args: config.args, env: config.env }
+      mcpConfig.mcpServers = { ...servers, [name]: edited }
+      if (oldName !== undefined && oldName !== name) delete mcpConfig.mcpServers[oldName]
       
       // 确保目录存在
       const dir = path.dirname(mcpPath)
@@ -6685,9 +6704,8 @@ app.whenReady().then(async () => {
       fs.writeFileSync(mcpPath, JSON.stringify(mcpConfig, null, 2))
       console.log('[KiroSettings] Saved MCP server:', name)
       return { success: true }
-    } catch (error) {
-      console.error('[KiroSettings] Failed to save MCP server:', error)
-      return { success: false, error: error instanceof Error ? error.message : 'Failed to save MCP server' }
+    } catch {
+      return { success: false, error: '无法保存 MCP 服务器，请检查用户 MCP 配置文件。' }
     }
   })
 

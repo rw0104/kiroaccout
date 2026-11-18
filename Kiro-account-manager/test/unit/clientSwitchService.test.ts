@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { assertVerifiedCliAccessVersion } from '../../src/main/clientCompatibility'
 import { ClientSwitchService, type ClientSwitchDependencies, type ClientSwitchRuntime } from '../../src/main/clientSwitch'
 import { ClientAccessProjectionService, accessPrincipalFingerprint, type ManagerAccessSnapshot, type ClientAccessProjectionBinding,
   type ClientAccessProjectionAdapter, type ClientAccessProjectionDependencies } from '../../src/main/clientAccessProjection'
@@ -41,6 +42,30 @@ test('unverified client upgrades produce an explicit compatibility state without
   assert.equal(JSON.stringify(snapshot).includes('PRIVATE'), false)
   assert.equal(f.counters.writes, 0)
 })
+
+test('CLI preflight offers official login for a detected unverified version before opening its account store', async () => {
+  const f = fixture()
+  f.deps.runtime = async target => {
+    if (target === 'cli') assertVerifiedCliAccessVersion('3.4.0')
+    return undefined
+  }
+  const [cli] = (await f.service.inspect('account-a', 'cli')).targets
+  assert.equal(cli.version, '3.4.0')
+  assert.equal(cli.errorCode, 'CLIENT_CONTRACT_UNSUPPORTED')
+  assert.equal(cli.status, 'blocked')
+  for (const message of [cli.message, cli.messageEn]) assert.match(message ?? '', /3\.4\.0.*kiro-cli login/)
+  assert.equal(f.counters.targetReads, 0)
+  assert.equal(f.counters.writes, 0)
+})
+
+test('scoped inspections still report a shared store when a registry permits shared authentication', async () => {
+  const f = fixture()
+  const { targets } = await f.service.inspect('account-a', 'cli')
+  assert.equal(targets.length, 1)
+  assert.equal(targets[0].target, 'cli')
+  assert.deepEqual(targets[0].sharedTargets, ['crew', 'cli'])
+})
+
 interface ManagerFixtureAccount extends ManagerAccessSnapshot {
   refreshToken: string
   activeAccountId: string

@@ -114,9 +114,9 @@ jobs:
             echo "Existing tag does not match the built commit"
             exit 1
           fi
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            echo "Release already exists: $RELEASE_TAG"
-            exit 1
+          if gh release view "$RELEASE_TAG" --json tagName,targetCommitish,isDraft,isPrerelease,assets > "$RUNNER_TEMP/existing-release.json"; then
+            node Kiro-account-manager/scripts/verify-published-release.mjs release-assets "$target_sha" < "$RUNNER_TEMP/existing-release.json"
+            exit 0
           fi
           flags=(--latest=true)
           draft_flags=(--latest=false)

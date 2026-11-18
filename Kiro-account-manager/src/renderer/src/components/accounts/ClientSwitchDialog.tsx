@@ -26,11 +26,11 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
   const titleId = useId()
   const accountLabelId = useId()
   const [target, setTarget] = useState<ClientSwitchTarget>('ide')
-  const [capabilities, setCapabilities] = useState<ClientSwitchCapability[]>([])
-  const [inspecting, setInspecting] = useState(true)
+  const [capability, setCapability] = useState<ClientSwitchCapability>()
+  const [inspecting, setInspecting] = useState(false)
   const [inspectError, setInspectError] = useState(false)
   const [modelRepairState, setModelRepairState] = useState<ClientModelRepairState | null>(null)
-  const [modelRepairInspecting, setModelRepairInspecting] = useState(true)
+  const [modelRepairInspecting, setModelRepairInspecting] = useState(false)
   const [modelRepairError, setModelRepairError] = useState(false)
   const [busy, setBusy] = useState(false)
   const [activity, setActivity] = useState<'switch' | 'authorize' | 'configure' | 'disconnect' | 'repair' | 'restore' | null>(null)
@@ -50,29 +50,30 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
   apiRef.current = api
   modelRepairApiRef.current = modelRepairApi ?? (typeof window === 'undefined' ? undefined : window.api?.clientModelRepair)
 
-  const inspect = useCallback(async () => {
+  const inspect = useCallback(async (selection: ClientSwitchTarget): Promise<void> => {
     const sequence = ++inspectSequence.current
-    setInspecting(true)
+    setCapability(undefined)
+    setInspecting(selection !== 'ide')
     setInspectError(false)
-    setModelRepairInspecting(true)
+    setModelRepairInspecting(selection === 'crew')
     setModelRepairError(false)
     setModelRepairState(null)
-    // A slow Crew installation check must not block the independent IDE/CLI flow.
+    if (selection === 'ide') return
     await Promise.all([
       (async () => {
         try {
-          const existing = await apiRef.current.inspect(accountId)
+          const existing = await apiRef.current.inspect(accountId, selection)
           if (!mountedRef.current || sequence !== inspectSequence.current) return
-          setCapabilities(existing.targets)
+          setCapability(existing.targets.find(item => item.target === selection))
         } catch {
           if (!mountedRef.current || sequence !== inspectSequence.current) return
-          setCapabilities([])
           setInspectError(true)
         } finally {
           if (mountedRef.current && sequence === inspectSequence.current) setInspecting(false)
         }
       })(),
       (async () => {
+        if (selection !== 'crew') return
         try {
           const currentApi = modelRepairApiRef.current
           if (!currentApi) throw new Error('Model repair API unavailable')
@@ -91,13 +92,12 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
     mountedRef.current = true
     setTarget('ide')
     setResult(null)
-    setModelRepairState(null)
+    void inspect('ide')
     busyRef.current = false
     setBusy(false)
     setActivity(null)
     setCanceling(false)
     cancelingRef.current = false
-    void inspect()
     return () => {
       mountedRef.current = false
       inspectSequence.current++
@@ -143,7 +143,6 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
     }
   }, [])
 
-  const capability = capabilities.find(item => item.target === target)
   const crewReady = !modelRepairInspecting && !modelRepairError && modelRepairState?.ready === true
   const canSubmit = !busy && (target === 'ide' || (!inspecting && capability?.status === 'ready' && (target !== 'crew' || crewReady)))
   const canRepairModels = !busy && !inspecting && !modelRepairInspecting && !!modelRepairState?.revision &&
@@ -186,8 +185,8 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
     try {
       const response = await apiRef.current.chooseExecutable(target)
       if (!mountedRef.current || sequence !== operationSequence.current) return
-      if (!response.success && !response.canceled) setResult({ success: false, message: response.message || (isEn ? 'Could not configure this client.' : '客户端配置未完成。') })
-      if (response.success) void inspect()
+      if (!response.success && !response.canceled) setResult({ success: false, message: (isEn ? response.messageEn || response.message : response.message) || (isEn ? 'Could not configure this client.' : '客户端配置未完成。') })
+      if (response.success) void inspect(target)
     } catch {
       if (mountedRef.current && sequence === operationSequence.current) setResult({ success: false, message: isEn ? 'Could not configure this client.' : '客户端配置未完成。' })
     } finally {
@@ -211,7 +210,7 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
       const response = await apiRef.current.authorize({ operationId, accountId, target, runtimeId: capability.runtimeId, expectedRuntimeRevision: capability.revision })
       if (!mountedRef.current || sequence !== operationSequence.current) return
       setResult({ success: response.status === 'identity-verified', message: isEn ? response.messageEn || response.message : response.message })
-      void inspect()
+      void inspect(target)
     } catch {
       if (mountedRef.current && sequence === operationSequence.current) setResult({ success: false, message: isEn ? 'Client authorization did not complete. Please try again.' : '客户端授权未完成，请重试。' })
     } finally {
@@ -244,7 +243,7 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
           ? (isEn ? 'Synchronization stopped. Existing short-lived client credentials will expire naturally. The manager sign-in is unchanged.' : '已停止同步，客户端现有短期凭证会自然到期；管理器登录不变。')
           : (isEn ? response.messageEn || response.message : response.message)
       })
-      void inspect()
+      void inspect(target)
     } catch {
       if (mountedRef.current && sequence === operationSequence.current) setResult({ success: false, message: isEn ? 'Could not stop synchronization. Check the client state before retrying.' : '停止同步未完成，请检查客户端状态后重试。' })
     } finally {
@@ -272,7 +271,7 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
       setResult({ success: response.success, message: isEn
         ? response.messageEn || response.message || response.state.messageEn || response.state.message
         : response.message || response.state.message })
-      void inspect()
+      void inspect(target)
     } catch {
       if (mountedRef.current && sequence === operationSequence.current) {
         setModelRepairState(null)
@@ -317,7 +316,7 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
           success: response.status === 'credentials-written' || response.status === 'identity-verified',
           message: isEn ? response.messageEn || response.message : response.message
         })
-        void inspect()
+        void inspect(target)
       }
     } catch {
       if (mountedRef.current && sequence === operationSequence.current) setResult({ success: false, message: isEn ? 'The request did not complete. Check the client state before retrying.' : '请求未完成，请检查客户端状态后重试。' })
@@ -359,14 +358,14 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
               <legend className="sr-only">{isEn ? 'Switch the selected account to' : '将所选账号切换到'}</legend>
               {targets.map(client => {
                 const Icon = clientIcons[client]
-                const item = capabilities.find(entry => entry.target === client)
+                const item = capability?.target === client ? capability : undefined
                 const selected = target === client
                 const description = client === 'ide'
                   ? (isEn ? 'Use the existing IDE account switch.' : '按现有方式切换 IDE 账号。')
                   : client === 'crew'
                     ? (isEn ? 'Switch the account in your existing Crew client. This does not start it.' : '切换已有 Crew 客户端的账号，不会启动客户端。')
                     : (isEn ? 'Switch the account used by the local CLI.' : '切换本机 CLI 使用的账号。')
-                const detail = client === 'ide' ? '' : inspecting
+                const detail = client === 'ide' || !selected ? '' : inspecting
                   ? (isEn ? 'Checking client…' : '正在检测客户端…')
                   : item ? (isEn ? item.messageEn || item.message : item.message)
                     : (isEn ? 'Client information is unavailable.' : '暂时无法获取客户端信息。')
@@ -383,7 +382,12 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
                       value={client}
                       data-client-target={client}
                       checked={selected}
-                      onChange={() => { if (!busyRef.current) { setTarget(client); setResult(null) } }}
+                      onChange={() => {
+                        if (busyRef.current || client === target) return
+                        setTarget(client)
+                        setResult(null)
+                        void inspect(client)
+                      }}
                       className="mt-1 h-4 w-4 shrink-0 accent-primary"
                     />
                     <Icon className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" aria-hidden="true" />
@@ -417,7 +421,7 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
                       : isEn ? modelRepairState.messageEn || modelRepairState.message : modelRepairState.message}
                 </p>
                 <div className="flex flex-wrap items-center justify-end gap-2">
-                  <Button type="button" variant="ghost" size="sm" disabled={busy || inspecting || modelRepairInspecting} onClick={() => void inspect()}>
+                  <Button type="button" variant="ghost" size="sm" disabled={busy || inspecting || modelRepairInspecting} onClick={() => void inspect(target)}>
                     <RefreshCw className="h-3 w-3" />{isEn ? 'Check again' : '重新检测'}
                   </Button>
                   <Button type="button" variant="ghost" size="sm" disabled={!canRestoreModels} onClick={() => void changeModelRepair('restore')}>
@@ -462,7 +466,7 @@ export function ClientSwitchDialog({ accountId, accountLabel, isCurrentAccount, 
             {inspectError && (
               <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground" role="status">
                 <span>{isEn ? 'Client detection failed. IDE switching is still available.' : '客户端检测失败，仍可使用原 IDE 切号。'}</span>
-                <Button type="button" variant="ghost" size="sm" onClick={() => void inspect()} disabled={busy || inspecting}>
+                <Button type="button" variant="ghost" size="sm" onClick={() => void inspect(target)} disabled={busy || inspecting}>
                   <RefreshCw className="h-3 w-3" />{isEn ? 'Retry' : '重试'}
                 </Button>
               </div>

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, Button, Toggle, Select } from '../ui'
 import { useTranslation } from '@/hooks/useTranslation'
 import { SteeringEditor, McpServerEditor, KiroPermissionsSection } from '../kiro'
-import type { KiroMemoryMode, KiroSettingsTarget, KiroSettingsTargetInfo } from '../../../../shared/kiroSettings'
+import { isMcpCommandServer, type McpCommandServer, type KiroMemoryMode, type KiroSettingsTarget, type KiroSettingsTargetInfo } from '../../../../shared/kiroSettings'
 import type { KiroPermissionsState } from '../../../../shared/kiroPermissions'
 import type { KiroManagedInstanceView } from '../../../../shared/kiroInstances'
 import { 
@@ -47,14 +47,8 @@ interface KiroSettings {
   notificationsBilling: boolean
 }
 
-interface McpServer {
-  command: string
-  args?: string[]
-  env?: Record<string, string>
-}
-
 interface McpConfig {
-  mcpServers: Record<string, McpServer>
+  mcpServers: Record<string, unknown>
 }
 
 // 默认禁止的危险命令
@@ -161,7 +155,7 @@ export function KiroSettingsPage() {
   const [newTrustedToolName, setNewTrustedToolName] = useState('')
   const [newDenyCommand, setNewDenyCommand] = useState('')
   const [editingFile, setEditingFile] = useState<string | null>(null)
-  const [editingMcp, setEditingMcp] = useState<{ name?: string; server?: McpServer } | null>(null)
+  const [editingMcp, setEditingMcp] = useState<{ name?: string; server?: McpCommandServer } | null>(null)
   const { t } = useTranslation()
   const isEn = t('common.unknown') === 'Unknown'
   const autonomyOptions = isEn ? autonomyOptionsEn : autonomyOptionsZh
@@ -171,10 +165,10 @@ export function KiroSettingsPage() {
     JSON.stringify(settings[key as keyof KiroSettings]) !== JSON.stringify(baselineRef.current[key as keyof KiroSettings])
   )
   const memoryOptions = [
-    { value: 'off', label: isEn ? 'Off' : '关闭' },
-    { value: 'useAndLearn', label: isEn ? 'Use and learn' : '使用并学习' },
-    { value: 'useWithoutLearning', label: isEn ? "Use but don't learn" : '使用但不自动学习' },
-    { value: 'useOnly', label: isEn ? 'Use only (read-only)' : '仅使用（只读）' }
+    { value: 'off', label: isEn ? "Don't use" : '不使用记忆' },
+    { value: 'useAndLearn', label: isEn ? 'Use and create automatically' : '使用记忆并自动创建' },
+    { value: 'useWithoutLearning', label: isEn ? 'Use and create when asked' : '使用记忆，仅在要求时创建' },
+    { value: 'useOnly', label: isEn ? "Use but don't create" : '使用已有记忆（只读）' }
   ]
 
   useEffect(() => {
@@ -489,10 +483,13 @@ export function KiroSettingsPage() {
 
   const openMcpConfig = async (type: 'user' | 'workspace') => {
     if (targetRef.current.type !== 'default') return
+    const generation = requestRef.current
+    const failure = isEn ? 'Could not open the MCP configuration file.' : '无法打开 MCP 配置文件。'
     try {
-      await window.api.openKiroMcpConfig(type)
-    } catch (err) {
-      console.error(err)
+      const result = await window.api.openKiroMcpConfig(type)
+      if (!result.success && generation === requestRef.current) setError(result.error || failure)
+    } catch {
+      if (generation === requestRef.current) setError(failure)
     }
   }
 
@@ -724,8 +721,8 @@ export function KiroSettingsPage() {
               <div className="flex-1 min-w-[220px]">
                 <label htmlFor="kiro-memory" className="font-medium">{isEn ? 'Memory' : '记忆'}</label>
                 <p id="kiro-memory-hint" className="text-sm text-muted-foreground mt-1">{isEn
-                  ? 'User-level setting for the selected IDE. Switching to or from Off or Use only applies to new sessions. Switching between the two learning modes applies immediately to local sessions.'
-                  : '所选 IDE 的用户级设置。切换关闭或仅使用（只读）需新建会话；在两种学习模式间切换会立即应用到本地会话。'}</p>
+                  ? 'This setting applies to the selected IDE. The CLI has its own Memory setting. Start a new session when entering or leaving either the disabled or read-only mode. Changes between the two creation modes apply immediately to local sessions.'
+                  : '此设置适用于所选 IDE。CLI 有独立的记忆设置。启用或停用记忆、进入或退出只读模式后，请新建会话。在两种创建方式之间切换会立即应用到本地会话。'}</p>
                 <p className="text-sm text-muted-foreground mt-1">{isEn
                   ? 'Cloud sync is managed separately in Kiro and may be limited by your organization.'
                   : '云端同步在 Kiro 中单独管理，并可能受组织设置限制。'}</p>
@@ -986,30 +983,34 @@ export function KiroSettingsPage() {
                 <p className="text-sm text-muted-foreground">{isEn ? 'No MCP servers configured' : '暂无配置的 MCP 服务器'}</p>
               ) : (
                 <div className="space-y-2">
-                  {Object.entries(mcpConfig.mcpServers).map(([name, server]) => (
-                    <div key={name} className="flex items-center justify-between p-2 bg-muted rounded-md">
-                      <div className="flex-1">
-                        <p className="font-medium text-sm">{name}</p>
-                        <p className="text-xs text-muted-foreground font-mono">{server.command}</p>
+                  {Object.entries(mcpConfig.mcpServers).map(([name, server]) => {
+                    const local = isMcpCommandServer(server) ? server : undefined
+                    const editTitle = local ? (isEn ? 'Edit' : '编辑') : (isEn ? 'Edit user MCP config' : '编辑用户 MCP 配置')
+                    return (
+                      <div key={name} className="flex items-center justify-between p-2 bg-muted rounded-md">
+                        <div className="flex-1">
+                          <p className="font-medium text-sm">{name}</p>
+                          <p className="text-xs text-muted-foreground font-mono">{local?.command ?? (isEn ? 'User MCP config' : '用户 MCP 配置')}</p>
+                        </div>
+                        <div className="flex gap-1">
+                          <button
+                            className="p-1 hover:bg-background rounded transition-colors"
+                            onClick={() => local ? setEditingMcp({ name, server: local }) : openMcpConfig('user')}
+                            title={editTitle}
+                          >
+                            <Edit className="h-4 w-4 text-primary" />
+                          </button>
+                          <button
+                            className="p-1 hover:bg-background rounded transition-colors"
+                            onClick={() => deleteMcpServer(name)}
+                            title={isEn ? 'Delete' : '删除'}
+                          >
+                            <Trash2 className="h-4 w-4 text-destructive" />
+                          </button>
+                        </div>
                       </div>
-                      <div className="flex gap-1">
-                        <button
-                          className="p-1 hover:bg-background rounded transition-colors"
-                          onClick={() => setEditingMcp({ name, server })}
-                          title={isEn ? 'Edit' : '编辑'}
-                        >
-                          <Edit className="h-4 w-4 text-primary" />
-                        </button>
-                        <button
-                          className="p-1 hover:bg-background rounded transition-colors"
-                          onClick={() => deleteMcpServer(name)}
-                          title={isEn ? 'Delete' : '删除'}
-                        >
-                          <Trash2 className="h-4 w-4 text-destructive" />
-                        </button>
-                      </div>
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </div>

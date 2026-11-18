@@ -42,10 +42,10 @@ export interface ClientSwitchResult {
 }
 
 export interface ClientSwitchApi {
-  inspect(accountId: string): Promise<ClientSwitchSnapshot>
+  inspect(accountId: string, target?: ExternalClientTarget): Promise<ClientSwitchSnapshot>
   execute(request: ClientSwitchRequest): Promise<ClientSwitchResult>
   disconnect(request: ClientSwitchRequest): Promise<ClientSwitchResult>
   authorize(request: ClientSwitchRequest): Promise<ClientSwitchResult>
-  chooseExecutable(target: ExternalClientTarget): Promise<{ success: boolean; canceled?: boolean; message?: string }>
+  chooseExecutable(target: ExternalClientTarget): Promise<{ success: boolean; canceled?: boolean; message?: string; messageEn?: string }>
   cancelAuthorization(operationId: string): Promise<void>
 }

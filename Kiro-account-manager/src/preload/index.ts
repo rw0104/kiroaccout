@@ -21,7 +21,7 @@ import { electronAPI } from '@electron-toolkit/preload'
 // Custom APIs for renderer
 const api = {
   clientSwitch: {
-    inspect: accountId => ipcRenderer.invoke('client-switch:inspect', accountId),
+    inspect: (accountId, target) => ipcRenderer.invoke('client-switch:inspect', accountId, target),
     execute: request => ipcRenderer.invoke('client-switch:execute', request),
     disconnect: request => ipcRenderer.invoke('client-switch:disconnect', request),
     authorize: request => ipcRenderer.invoke('client-switch:authorize', request),
