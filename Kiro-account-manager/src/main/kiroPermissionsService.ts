@@ -1051,6 +1051,7 @@ export class KiroPermissionsService {
         target: resolved.targetInfo,
         compatibility,
         contentStatus: inspection.contentStatus,
+        modelReviewDefault: inspection.modelReviewDefault,
         revision,
         presence: inspection.presence,
         restrictions: inspection.restrictions,

@@ -180,6 +180,18 @@ export function KiroPermissionsSection({
       state.restore.status === 'available'
   )
 
+  const reviewDefault = loading || state?.contentStatus === 'invalid' ? undefined : state?.modelReviewDefault
+  const reviewStatus = reviewDefault === 'preset'
+    ? (isEn ? 'Approve for me preset found in user permissions' : '用户权限文件已配置 Approve for me 预设')
+    : reviewDefault === 'evaluate-rule'
+      ? (isEn ? 'Unconditional evaluate rule found in user permissions' : '用户权限文件含无条件 evaluate 规则')
+      : reviewDefault === 'absent'
+        ? (isEn ? 'No default model review setting found in user permissions' : '用户权限文件未配置默认模型审核')
+        : (isEn ? 'User permissions not verified' : '用户权限文件尚未确认')
+  const broadAllow = !loading && state?.contentStatus !== 'invalid' && (state?.presence.allAllow || state?.presence.fsWriteAllow)
+  const broadRule = state?.presence.allAllow ? 'all' : 'fs_write'
+  const canUndoBroadRule = canRestore && Boolean(state?.restore.addedRules?.some(rule => state.presence[rule === 'all' ? 'allAllow' : 'fsWriteAllow']))
+
   const badgeToneClass =
     contentStatus.tone === 'success'
       ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/20'
@@ -191,11 +203,30 @@ export function KiroPermissionsSection({
 
   return (
     <div id="kiro-permissions-section" className="border-t pt-4 space-y-3">
+      <div className="rounded-md border bg-muted/30 p-3 space-y-1">
+        <p className="text-sm font-medium">{isEn ? 'Model review · Approve for me' : '模型审核 · Approve for me'}</p>
+        <p id="kiro-permissions-model-review-status" className="text-sm">{reviewStatus}</p>
+        <p id="kiro-permissions-model-review-note" className="text-xs text-muted-foreground">
+          {isEn
+            ? 'For the current chat, choose Approve for me in the Kiro chat permission menu. For new chats, run Kiro: Enable Approve For Me (User) in the Kiro Command Palette. The status above describes the user file only. A workspace or chat can use a different mode.'
+            : '当前聊天可在 Kiro 聊天输入框的权限菜单中选择 Approve for me。要为新聊天设为默认，在 Kiro 命令面板运行 Kiro: Enable Approve For Me (User)。上方仅显示用户权限文件的配置，工作区或聊天可以使用不同模式。'}
+        </p>
+        {broadAllow && (
+          <p id="kiro-permissions-model-review-conflict" className="text-xs text-muted-foreground">
+            {isEn
+              ? `An unconditional allow rule for ${broadRule} takes precedence over model review. Matching actions skip model review unless an ask or deny rule takes priority.`
+              : `检测到 ${broadRule} 的无条件 allow 规则。它优先于模型审核，命中的操作会跳过模型审核，除非有更高优先级的 ask 或 deny 规则。`}
+            {canUndoBroadRule && (isEn
+              ? ' To undo the manager’s write, restore the previous permissions file before setting the new default in Kiro.'
+              : ' 如要撤销管理器的写入，可先恢复原权限文件，再到 Kiro 设置审核默认值。')}
+          </p>
+        )}
+      </div>
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="space-y-1 flex-1 min-w-[240px]">
           <div className="flex items-center gap-2 flex-wrap">
             <ShieldCheck className="h-4 w-4 text-primary" />
-            <span className="font-medium">{isEn ? 'Tool auto-approval' : '工具自动批准'}</span>
+            <span className="font-medium">{isEn ? 'Explicit allow rules' : '显式允许规则'}</span>
             <span
               id="kiro-permissions-content-status"
               className={`px-2 py-0.5 text-xs rounded-full border ${badgeToneClass}`}
@@ -215,11 +246,6 @@ export function KiroPermissionsSection({
             {isEn
               ? 'This page adds explicit allow rules for all and fs_write. Kiro applies these rules before model review; built-in protections and other rules still apply.'
               : '此处添加 all 和 fs_write 的显式 allow 规则。Kiro 会先按这些规则处理工具操作，内置保护和其他规则仍然适用。'}
-          </p>
-          <p id="kiro-permissions-model-review-note" className="text-xs text-muted-foreground">
-            {isEn
-              ? 'For model review, select Approve for me in the official Kiro chat permission menu. It evaluates actions not covered by existing rules; this button does not enable that mode.'
-              : '如需模型审核，请在官方 Kiro 的聊天权限模式中选择 Approve for me。它评估现有规则未覆盖的操作；本按钮不会开启该模式。'}
           </p>
           <p className="text-xs text-muted-foreground">
             {isEn
