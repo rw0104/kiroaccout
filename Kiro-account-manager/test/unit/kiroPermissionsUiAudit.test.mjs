@@ -171,23 +171,41 @@ test('permissions distinguish explicit allow rules from model review without cha
   })
   for (const isEn of [false, true]) {
     let applyCalls = 0
-    const tree = sectionExports.KiroPermissionsSection({
-      state: makePermState({ restrictions: { evaluateCount: 1, hasRestrictiveRules: false } }),
+    const render = (state) => sectionExports.KiroPermissionsSection({
+      state,
       loading: false, busy: false, exporting: false, error: null, notice: null,
       isEn, detailsOpen: false,
       onToggleDetails() {}, onApply() { applyCalls++ }, onRestore() {}, onExport() {}
     })
+    const tree = render({ ...makePermState({ restrictions: { evaluateCount: 1, hasRestrictiveRules: false } }), modelReviewDefault: 'absent' })
     const copy = text(tree)
     assert.doesNotMatch(copy, /V3 (?:does not read|不读取) permissions\.yaml/)
     assert.match(copy, isEn ? /CLI V3 supports permissions\.yaml/ : /CLI V3 支持 permissions\.yaml/)
     assert.match(copy, isEn ? /selected IDE/ : /所选 IDE/)
     assert.match(copy, /Approve for me/)
     assert.match(copy, isEn ? /explicit allow rules for all and fs_write/ : /all 和 fs_write 的显式 allow 规则/)
-    assert.match(copy, isEn ? /actions not covered by existing rules/ : /现有规则未覆盖的操作/)
+    assert.match(copy, /Enable Approve For Me \(User\)/)
     assert.match(copy, isEn ? /evaluate: 1/ : /evaluate 规则：1 条/)
+    assert.match(text(byId(tree, 'kiro-permissions-model-review-status')), isEn ? /No default model review setting/ : /未配置默认模型审核/)
     assert.equal(text(byId(tree, 'kiro-permissions-apply')), isEn ? 'Apply explicit allow rules' : '应用显式允许规则')
     assert.equal(applyCalls, 0)
     byId(tree, 'kiro-permissions-apply').props.onClick()
     assert.equal(applyCalls, 1)
+
+    const preset = render({ ...makePermState(), modelReviewDefault: 'preset' })
+    assert.match(text(byId(preset, 'kiro-permissions-model-review-status')), isEn ? /preset found/ : /已配置 Approve for me 预设/)
+    assert.doesNotMatch(text(preset), isEn ? /skip model review/ : /跳过模型审核/)
+
+    const broadAllowState = {
+      ...makePermState({ presence: { allAllow: true, missingRules: ['fs_write'] },
+        restore: { status: 'available', canRestore: true, addedRules: ['all'] } }),
+      modelReviewDefault: 'preset'
+    }
+    const broadAllow = render(broadAllowState)
+    const conflict = text(byId(broadAllow, 'kiro-permissions-model-review-conflict'))
+    assert.match(conflict, isEn ? /skip model review/ : /跳过模型审核/)
+    assert.match(conflict, isEn ? /restore the previous permissions file/ : /可先恢复原权限文件/)
+    const external = render({ ...broadAllowState, restore: { status: 'external_modified', canRestore: false } })
+    assert.doesNotMatch(text(byId(external, 'kiro-permissions-model-review-conflict')), isEn ? /restore the previous permissions file/ : /可先恢复原权限文件/)
   }
 })

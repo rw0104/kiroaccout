@@ -9,6 +9,14 @@ import {
 const LARGE_INTEGER = '9007199254740993'
 const NEGATIVE_INTEGER = '-9223372036854775809'
 
+test('a scoped evaluate rule does not indicate the official user approval default', () => {
+  const scoped = 'rules: [{capability: all, effect: evaluate, match: ["git *"]}]'
+  const unconditional = 'rules: [{capability: all, effect: evaluate, match: [], exclude: []}]'
+  assert.equal(inspectKiroPermissionsDocument(scoped).restrictions.evaluateCount, 1)
+  assert.equal(inspectKiroPermissionsDocument(scoped).modelReviewDefault, 'absent')
+  assert.equal(inspectKiroPermissionsDocument(unconditional).modelReviewDefault, 'evaluate-rule')
+})
+
 test('auto-approval merge preserves large integers in unknown top-level metadata', () => {
   const original = [
     '# preserve exact metadata values',

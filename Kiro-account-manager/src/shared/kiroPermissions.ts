@@ -33,6 +33,9 @@ export interface KiroPermissionsCompatibility {
 
 export type KiroPermissionsContentStatus = 'unconfigured' | 'partial' | 'configured' | 'invalid'
 
+/** What the selected IDE's user permissions file declares. Session mode is independent. */
+export type KiroModelReviewDefault = 'preset' | 'evaluate-rule' | 'absent'
+
 export interface KiroPermissionsRevision {
   exists: boolean
   sha256: string | null
@@ -95,6 +98,7 @@ export interface KiroPermissionsState {
   target: KiroPermissionsTargetInfo
   compatibility: KiroPermissionsCompatibility
   contentStatus: KiroPermissionsContentStatus
+  modelReviewDefault?: KiroModelReviewDefault
   revision: KiroPermissionsRevision
   presence: KiroAutoApprovalRulePresence
   restrictions: KiroPermissionsRestrictionSummary

@@ -36,6 +36,26 @@ async function apply(f) {
   return f.service.applyAutoApproval(target, state.state.revision)
 }
 
+test('official Approve for Me configuration is reported separately from explicit allow rules', async () => {
+  const f = await fixture({ inspectVersion: async () => '1.4.154' })
+  const preset = 'policies: [approve-for-me]\nrules: []\n'
+  await fs.writeFile(f.yaml, preset)
+  const inspected = await f.service.getState(target)
+  assert.equal(inspected.state.modelReviewDefault, 'preset')
+  assert.equal(inspected.state.restrictions.evaluateCount, 0)
+  assert.equal(inspected.state.presence.allAllow, false)
+  assert.equal(await fs.readFile(f.yaml, 'utf8'), preset)
+
+  const applied = await f.service.applyAutoApproval(target, inspected.state.revision)
+  assert.equal(applied.success, true)
+  assert.equal(applied.state.modelReviewDefault, 'preset')
+  assert.equal(applied.state.presence.allAllow, true)
+
+  const restored = await f.service.restoreBeforeAutoApproval(target, applied.state.revision)
+  assert.equal(restored.success, true)
+  assert.equal(await fs.readFile(f.yaml, 'utf8'), preset)
+})
+
 test('JSON-only user policies remain active and read-only; YAML precedence and shadowing races are preserved', async () => {
   const f = await fixture()
   const jsonPath = join(f.settings, 'permissions.json')

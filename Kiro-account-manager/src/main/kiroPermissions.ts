@@ -19,6 +19,7 @@ import {
   KIRO_AUTO_APPROVAL_TEMPLATE_YAML,
   type KiroAutoApprovalCapability,
   type KiroAutoApprovalRulePresence,
+  type KiroModelReviewDefault,
   type KiroPermissionsContentStatus,
   type KiroPermissionsErrorCode,
   type KiroPermissionsRestrictionSummary,
@@ -218,6 +219,7 @@ function isRecognizedRuleSemantics(rule: Record<string, unknown>): boolean {
 export interface KiroPermissionsInspection {
   revision: KiroPermissionsRevision
   contentStatus: KiroPermissionsContentStatus
+  modelReviewDefault: KiroModelReviewDefault
   presence: KiroAutoApprovalRulePresence
   restrictions: KiroPermissionsRestrictionSummary
   rulesSnapshot: Array<Record<string, unknown>>
@@ -228,6 +230,7 @@ export function emptyPermissionsInspection(): KiroPermissionsInspection {
   return {
     revision: { exists: false, sha256: null },
     contentStatus: 'unconfigured',
+    modelReviewDefault: 'absent',
     presence: {
       allAllow: false,
       fsWriteAllow: false,
@@ -264,6 +267,7 @@ export function inspectKiroPermissionsDocument(
   let scopedAllowCount = 0
   let unknownRuleCount = 0
   let hasPolicyReferences = false
+  let modelReviewDefault: KiroModelReviewDefault = 'absent'
   const rulesSnapshot: Array<Record<string, unknown>> = []
   const topLevelSnapshot: Record<string, unknown> = {}
 
@@ -287,6 +291,7 @@ export function inspectKiroPermissionsDocument(
         )
       }
       hasPolicyReferences = policies.length > 0
+      if (policies.includes('approve-for-me')) modelReviewDefault = 'preset'
     }
 
     const rulesPair = rootMap.items.find(
@@ -339,6 +344,13 @@ export function inspectKiroPermissionsDocument(
           denyCount++
         } else if (jsRule.effect === 'evaluate') {
           evaluateCount++
+          // Kiro IDE recognizes the preset and the older unscoped all/evaluate rule.
+          const unscoped = [jsRule.match, jsRule.exclude].every(
+            value => value == null || (Array.isArray(value) && value.length === 0)
+          )
+          if (modelReviewDefault === 'absent' && jsRule.capability === 'all' && unscoped) {
+            modelReviewDefault = 'evaluate-rule'
+          }
         } else if (
           jsRule.effect === 'allow' &&
           (recognized || jsRule.match !== undefined || jsRule.exclude !== undefined)
@@ -363,6 +375,7 @@ export function inspectKiroPermissionsDocument(
   return {
     revision: { exists: true, sha256 },
     contentStatus,
+    modelReviewDefault,
     presence: {
       allAllow,
       fsWriteAllow,
