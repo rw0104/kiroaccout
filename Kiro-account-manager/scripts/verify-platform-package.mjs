@@ -10,6 +10,7 @@ import { releaseArtifactNames, validateStableManifest } from './lib/releaseArtif
 import { releaseOptions } from './lib/releaseOptions.mjs'
 import { tlsLibrarySpec, verifyBinaryArchitecture } from './lib/platformResources.mjs'
 import { verifyCrewModelRepairPackage } from './lib/crewModelRepairPackage.mjs'
+import { verifyMacSignature } from './lib/macSigning.mjs'
 
 const require = createRequire(import.meta.url)
 const asar = require('@electron/asar')
@@ -74,8 +75,9 @@ const library = readFileSync(join(resources, tls.filename))
 assert.equal(library.length, tlsReport.size, 'TLS package size differs from verified library')
 assert.equal(createHash('sha256').update(library).digest('hex'), tlsReport.sha256, 'TLS package hash differs from verified library')
 verifyBinaryArchitecture(library, platform, arch)
-assert.ok(statSync(join(contentRoot, 'LICENSE.kiroaccout.txt')).size > 10000, 'AGPL license must accompany the package')
-assert.ok(statSync(join(contentRoot, 'THIRD_PARTY_NOTICES.md')).size > 0, 'Upstream and third-party notices must accompany the package')
+const noticesRoot = platform === 'darwin' ? resources : contentRoot
+assert.ok(statSync(join(noticesRoot, 'LICENSE.kiroaccout.txt')).size > 10000, 'AGPL license must accompany the package')
+assert.ok(statSync(join(noticesRoot, 'THIRD_PARTY_NOTICES.md')).size > 0, 'Upstream and third-party notices must accompany the package')
 const updateConfig = yaml.load(readFileSync(join(resources, 'app-update.yml'), 'utf8'))
 assert.equal(updateConfig.provider, 'github')
 assert.equal(updateConfig.owner, 'rw0104')
@@ -97,9 +99,11 @@ const executable = platform === 'win32' ? join(unpacked, 'kiro-account-manager.e
   : platform === 'linux' ? join(unpacked, 'kiro-account-manager')
     : join(contentRoot, 'MacOS', builder.mac?.executableName || builder.productName)
 verifyBinaryArchitecture(readFileSync(executable), platform, arch)
+const macSignature = platform === 'darwin' ? verifyMacSignature(dirname(contentRoot)) : undefined
 const report = { version: packaged.version, platform, arch, archiveEntries: entries.length,
   updaterRepository: 'rw0104/kiroaccout', licenseIncluded: true, nativeLibraryIncluded: true,
   crewModelRepair,
+  ...(macSignature ? { macSignature } : {}),
   applicationExecuted: false }
 writeFileSync(join(dist, `package-verification-${platform}-${arch}.json`), JSON.stringify(report, null, 2) + '\n')
 console.log(JSON.stringify(report, null, 2))
