@@ -34,6 +34,8 @@ function harness(overrides = {}) {
     openExternal() {},
     ...overrides
   }
+  const getSettings = api.getKiroSettings
+  api.getKiroSettings = async target => ({ memoryLocation: 'settings-file', ...await getSettings(target) })
   const hooks = {
     useState(initial) {
       const index = stateIndex++
@@ -317,4 +319,29 @@ test('Select and Toggle forward field labels and block disabled mouse/keyboard c
   assert.ok(menu, 'optional disabled prop preserves existing enabled behavior')
   nodes(menu, node => node.type === 'button')[0].props.onClick()
   assert.equal(changes, 1)
+})
+
+test('current IDE directs Memory changes to the selected IDE and displays an unset session model', async () => {
+  const ctx = harness({ getKiroSettings: async () => ({ settings: {}, memoryLocation: 'ide' }),
+    getKiroAvailableModels: async () => ({ models: [{ id: 'one', name: 'One', description: '' }] }) })
+  const tree = await ctx.ready()
+  assert.equal(byId(tree, 'kiro-memory'), undefined)
+  assert.match(text(tree), /Memories.*gear/i)
+  const model = byId(tree, 'kiro-session-model')
+  assert.equal(model.props.value, '')
+  assert.ok(model.props.options.some(option => option.value === ''))
+  assert.match(text(tree), /new sessions/i)
+})
+
+test('ignore file editor saves filenames and preserves an initial model absent from the catalog', async () => {
+  const ctx = harness({ getKiroSettings: async () => ({ settings: { ignoreFiles: ['.gitignore'], modelSelection: 'saved-model' }, memoryLocation: 'ide' }),
+    getKiroAvailableModels: async () => ({ models: [{ id: 'one', name: 'One', description: '' }] }) })
+  let tree = await ctx.ready()
+  assert.equal(byId(tree, 'kiro-ignore-files').props.value, '.gitignore')
+  assert.ok(byId(tree, 'kiro-session-model').props.options.some(option => option.value === 'saved-model'))
+  byId(tree, 'kiro-ignore-files').props.onChange({ target: { value: '.gitignore\n.projectignore\n' } })
+  tree = ctx.render()
+  await button(tree, 'Save').props.onClick()
+  assert.deepEqual(ctx.calls.save, [{ patch: { ignoreFiles: ['.gitignore', '.projectignore'] }, target: { type: 'default' } }])
+  assert.equal(byId(ctx.render(), 'kiro-ignore-files').props.value, '.gitignore\n.projectignore')
 })

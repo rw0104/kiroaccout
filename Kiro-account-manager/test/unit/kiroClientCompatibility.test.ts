@@ -16,7 +16,7 @@ test('Social refresh uses the verified current auth-service identity without leg
   assert.equal((await service.refresh({ kind: 'social', refreshToken: 'synthetic-refresh' })).success, true)
   assert.deepEqual(requests[0].headers, {
     'Content-Type': 'application/json',
-    'User-Agent': 'KiroIDE-1.4.154-synthetic-machine'
+    'User-Agent': 'KiroIDE-1.5.11-synthetic-machine'
   })
   assert.equal(requests[0].body, JSON.stringify({ refreshToken: 'synthetic-refresh' }))
 
@@ -25,8 +25,8 @@ test('Social refresh uses the verified current auth-service identity without leg
 })
 
 test('Social identity handles missing or unsafe optional machine metadata', () => {
-  assert.equal(getKiroSocialUserAgent(), 'KiroIDE-1.4.154')
-  assert.equal(getKiroSocialUserAgent(''), 'KiroIDE-1.4.154')
-  assert.equal(getKiroSocialUserAgent('machine\r\nInjected: yes'), 'KiroIDE-1.4.154')
-  assert.equal(getKiroSocialUserAgent('a'.repeat(129)), 'KiroIDE-1.4.154')
+  assert.equal(getKiroSocialUserAgent(), 'KiroIDE-1.5.11-UNDETERMINED_MACHINE_ID')
+  assert.equal(getKiroSocialUserAgent(''), 'KiroIDE-1.5.11-UNDETERMINED_MACHINE_ID')
+  assert.equal(getKiroSocialUserAgent('machine\r\nInjected: yes'), 'KiroIDE-1.5.11-UNDETERMINED_MACHINE_ID')
+  assert.equal(getKiroSocialUserAgent('a'.repeat(129)), 'KiroIDE-1.5.11-UNDETERMINED_MACHINE_ID')
 })

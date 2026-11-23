@@ -34,8 +34,10 @@ const legacySecret = (clientId = base.clientId, deadline = expires / 1000 + 0.18
 
 const mainSource = readFileSync(new URL('../../src/main/index.ts', import.meta.url), 'utf8')
 const mainTree = ts.createSourceFile('index.ts', mainSource, ts.ScriptTarget.Latest, true)
+let proactiveHandler
 let switchHandler
 function findSwitch(node) {
+  if (ts.isFunctionDeclaration(node) && node.name?.text === 'runUnboundProactiveRenewal') proactiveHandler = node.getText(mainTree)
   if (ts.isCallExpression(node) && node.arguments[0]?.text === 'switch-account') {
     switchHandler = node.arguments[1].getText(mainTree)
   }
@@ -46,7 +48,7 @@ assert.ok(switchHandler)
 
 // Execute the complete module with filesystem and home replaced before evaluation.
 // No production paths, cache reads, writes, listeners or Electron are reachable.
-function harness({ registrationFailure = false, connectionDeleteFailure = false, connectionWriteFailure = false, tokenFailure = false, externalHandoff = false, clock = () => now } = {}) {
+function harness({ registrationFailure = false, connectionDeleteFailure = false, connectionWriteFailure = false, tokenFailure = false, externalHandoff = false, sharingViolations = 0, afterStage, clock = () => now } = {}) {
   const calls = [],
     files = new Map(),
     exports = {}
@@ -54,6 +56,8 @@ function harness({ registrationFailure = false, connectionDeleteFailure = false,
     exports,
     Buffer,
     Error,
+    process: { platform: 'win32' },
+    setTimeout(callback, delay) { calls.push(['delay', delay]); callback() },
     Date: class extends Date {
       static now() {
         return clock()
@@ -68,15 +72,11 @@ function harness({ registrationFailure = false, connectionDeleteFailure = false,
           },
           async writeFile(path, content, options) {
             calls.push(['write', path, options])
-            if (tokenFailure && path.endsWith('kiro-auth-token.json')) throw new Error('SYNTHETIC_TOKEN_DISK_FAILURE')
             if (connectionWriteFailure && /kiro-connection/.test(path)) throw new Error('SYNTHETIC_CONNECTION_DISK_FAILURE')
             if (registrationFailure && !path.endsWith('kiro-auth-token.json'))
               throw new Error('SYNTHETIC_DISK_FAILURE')
             files.set(path, JSON.parse(content))
-            if (externalHandoff && path.endsWith('kiro-auth-token.json')) {
-              files.set(path, { provider: 'Enterprise', accessToken: 'SYNTHETIC_EXTERNAL_ACCESS', refreshToken: 'SYNTHETIC_EXTERNAL_REFRESH' })
-              files.set(path.replace('kiro-auth-token.json', 'kiro-connection.json'), { authMethod: 'IdC', provider: 'Enterprise', startUrl: 'https://external.awsapps.com/start', region: 'us-west-2' })
-            }
+            if (path.includes('kiro-auth-token.json.') && path.endsWith('.tmp')) afterStage?.(files, path.slice(0, path.indexOf('.json.') + 5))
           },
           async readFile(path) {
             if (!files.has(path)) throw Object.assign(new Error('Synthetic absent file'), { code: 'ENOENT' })
@@ -90,8 +90,17 @@ function harness({ registrationFailure = false, connectionDeleteFailure = false,
           async rename(from, to) {
             calls.push(['rename', from, to])
             if (!files.has(from)) throw Object.assign(new Error('Synthetic absent file'), { code: 'ENOENT' })
+            if (tokenFailure) throw new Error('SYNTHETIC_TOKEN_DISK_FAILURE')
+            if (sharingViolations > 0) {
+              sharingViolations--
+              throw Object.assign(new Error('Synthetic sharing violation'), { code: 'EACCES' })
+            }
             files.set(to, files.get(from))
             files.delete(from)
+            if (externalHandoff && to.endsWith('kiro-auth-token.json')) {
+              files.set(to, { provider: 'Enterprise', accessToken: 'SYNTHETIC_EXTERNAL_ACCESS', refreshToken: 'SYNTHETIC_EXTERNAL_REFRESH' })
+              files.set(to.replace('kiro-auth-token.json', 'kiro-connection.json'), { authMethod: 'IdC', provider: 'Enterprise', startUrl: 'https://external.awsapps.com/start', region: 'us-west-2' })
+            }
           },
           async link(from, to) {
             if (files.has(to)) throw Object.assign(new Error('Synthetic existing file'), { code: 'EEXIST' })
@@ -194,7 +203,7 @@ test('actual IDE cache writer stores the genuine OIDC registration expiry with U
   assert.ok(result.clientRegPath.endsWith(`${token.clientIdHash}.json`))
   const writes = h.calls.filter((call) => call[0] === 'write')
   assert.equal(writes[0][1], result.clientRegPath)
-  assert.equal(writes[1][1], result.tokenPath)
+  assert.ok(h.calls.some(([op, from, to]) => op === 'rename' && from === writes[1][1] && to === result.tokenPath))
   assert.equal(
     writes.every((call) => call[2].mode === 0o600),
     true
@@ -389,4 +398,73 @@ test('a generation changed during cache preparation cannot publish stale credent
     if (++checks === 2) throw new Error('Synthetic stale generation')
   }), /stale generation/)
   assert.equal(h.files.has(h.KIRO_AUTH_TOKEN_PATH), false)
+})
+
+
+test('the IDE can observe a complete token generation while its successor is being published', async () => {
+  const h = harness()
+  await h.writeKiroAuthTokenFile(base)
+  assert.equal(h.calls.some(([op, path]) => op === 'write' && path === h.KIRO_AUTH_TOKEN_PATH), false)
+  assert.ok(h.calls.some(([op, , target]) => op === 'rename' && target === h.KIRO_AUTH_TOKEN_PATH))
+})
+
+const initialToken = { accessToken: base.accessToken, refreshToken: base.refreshToken,
+  expiresAt: base.expiresAtIso, authMethod: 'IdC', provider: 'BuilderId', clientIdHash: 'synthetic-registration' }
+const rotation = { accessToken: 'NEW_SYNTHETIC_ACCESS', refreshToken: 'NEW_SYNTHETIC_REFRESH', expiresAt: new Date(now + 7200000).toISOString() }
+
+test('renewal publishes only the original active login and preserves its other files and token metadata', async () => {
+  const h = harness({ sharingViolations: 2 })
+  h.files.set(h.KIRO_AUTH_TOKEN_PATH, initialToken)
+  h.files.set(h.KIRO_CONNECTION_PATH, oldConnection)
+  assert.equal(await h.readMatchingKiroAuthToken({ ...base, accessToken: 'STALE_SYNTHETIC_ACCESS' }), null)
+  const generation = await h.readMatchingKiroAuthToken(base)
+  assert.equal(await h.updateKiroAuthTokenFile(generation, rotation), true)
+  assert.deepEqual(h.files.get(h.KIRO_AUTH_TOKEN_PATH), { ...initialToken, ...rotation })
+  assert.equal(h.files.get(h.KIRO_CONNECTION_PATH), oldConnection)
+  assert.deepEqual(h.calls.filter(([op]) => op === 'delay'), [['delay', 10], ['delay', 20]])
+  assert.equal(h.files.size, 2)
+})
+
+test('an IDE sign-out, renewal or switch during staging wins over a late manager renewal', async () => {
+  for (const replacement of [null, { ...initialToken, expiresAt: rotation.expiresAt }, { ...initialToken, ...rotation }]) {
+    const h = harness({ afterStage(files, path) { if (replacement) files.set(path, replacement); else files.delete(path) } })
+    h.files.set(h.KIRO_AUTH_TOKEN_PATH, initialToken)
+    const observed = await h.readMatchingKiroAuthToken(base)
+    assert.equal(await h.updateKiroAuthTokenFile(observed, rotation), false)
+    assert.equal(h.files.get(h.KIRO_AUTH_TOKEN_PATH), replacement ?? undefined)
+    assert.equal(h.calls.some(([op]) => op === 'rename'), false)
+    assert.equal([...h.files.keys()].some(path => path.endsWith('.tmp')), false)
+  }
+})
+
+test('a persistent Windows sharing violation keeps the original token after three rename attempts', async () => {
+  const h = harness({ sharingViolations: 3 })
+  h.files.set(h.KIRO_AUTH_TOKEN_PATH, initialToken)
+  await assert.rejects(h.updateKiroAuthTokenFile(await h.readMatchingKiroAuthToken(base), rotation), { code: 'EACCES' })
+  assert.equal(h.files.get(h.KIRO_AUTH_TOKEN_PATH), initialToken)
+  assert.equal(h.files.size, 1)
+  assert.equal(h.calls.filter(([op]) => op === 'rename').length, 3)
+})
+
+
+test('the proactive renewal timer neither refreshes a signed-out IDE nor restores a superseded IDE login', async () => {
+  for (const active of [false, true]) {
+    const h = harness()
+    if (active) h.files.set(h.KIRO_AUTH_TOKEN_PATH, initialToken)
+    let requests = 0
+    const other = { ...initialToken, accessToken: 'SIMULATED_OTHER', refreshToken: 'SIMULATED_OTHER_REFRESH' }
+    const context = vm.createContext({ ...h, Date, proactiveRenewalEnabled: true,
+      console: { log() {}, warn() {} }, instanceAccountOwnership: { isBound: () => false },
+      store: { get: () => ({ accounts: { demo: { credentials: base } } }),
+        set: () => assert.fail('the central refresh service already persists a successful rotation') },
+      refreshTokenByMethod: async () => {
+        requests++
+        h.files.set(h.KIRO_AUTH_TOKEN_PATH, other)
+        return { success: true, accessToken: rotation.accessToken, refreshToken: rotation.refreshToken, expiresIn: 600 }
+      }, scheduleProactiveRenewal: () => assert.fail('a stale timer cannot reschedule itself') })
+    vm.runInContext(ts.transpileModule(proactiveHandler, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context)
+    await context.runUnboundProactiveRenewal('demo')
+    assert.equal(requests, active ? 1 : 0)
+    assert.equal(h.files.get(h.KIRO_AUTH_TOKEN_PATH), active ? other : undefined)
+  }
 })

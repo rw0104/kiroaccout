@@ -1,5 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { resolveOidcRegistrationExpiry } from '../shared/oidcRegistration'
+import { getKiroSocialUserAgent } from '../shared/kiroClientCompatibility'
 
 export type LoginKind = 'builderid' | 'social' | 'iamsso' | 'portal'
 export type PortalProvider = 'Google' | 'Github' | 'BuilderId' | 'Enterprise'
@@ -42,6 +44,7 @@ interface HttpResponse {
 interface LoginDependencies {
   fetch: (url: string, init: { method: string; headers: Record<string, string>; body: string; signal?: AbortSignal; redirect?: RequestRedirect }) => Promise<HttpResponse>
   authEndpoint: string
+  getMachineId?: () => string | undefined
   openBrowser: (url: string, privateMode?: boolean) => void | Promise<unknown>
   notifySocial: (callback: SocialLoginCallback) => void
   now?: () => number
@@ -77,6 +80,7 @@ interface LoginSession {
   expiryTimer?: ReturnType<typeof setTimeout>
   callback?: SocialLoginCallback
   result?: LoginResult
+  accessTokenExpiresAt?: number
   exchangeStarted?: boolean
 }
 const SCOPES = ['codewhisperer:completions', 'codewhisperer:analysis', 'codewhisperer:conversations', 'codewhisperer:transformations', 'codewhisperer:taskassist']
@@ -88,6 +92,21 @@ const text = (value: unknown): string | undefined => typeof value === 'string' &
 const positive = (value: unknown, fallback: number): number => typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
 const body = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 const validRegion = (region: unknown): region is string => typeof region === 'string' && /^(?:af|ap|ca|eu|il|me|mx|sa|us)(?:-[a-z]+){1,3}-[1-9]\d?$/.test(region)
+
+function readRegistration(value: unknown, now: number) {
+  const data = body(value)
+  const clientId = text(data.clientId)
+  const clientSecret = text(data.clientSecret)
+  if (!clientId || !clientSecret) return
+  const expiresAt = data.clientSecretExpiresAt
+  if (expiresAt === undefined) return { clientId, clientSecret }
+  // Imports tolerate milliseconds and fractions. RegisterClient must already use whole Unix seconds.
+  if (typeof expiresAt !== 'number' ||
+      resolveOidcRegistrationExpiry({ clientSecretExpiresAt: expiresAt }) !== expiresAt ||
+      expiresAt <= now / 1000) return
+  return { clientId, clientSecret, clientSecretExpiresAt: expiresAt }
+}
+
 function validIssuer(value: string | null, provider: PortalProvider): string | undefined {
   if (!value || value.length > 2048) return
   try {
@@ -158,8 +177,10 @@ export class LoginSessionManager {
     this.clear(session)
     return { success: false, sessionId: session.id, error: message }
   }
-  private async post(session: LoginSession, url: string, payload: Record<string, unknown>): Promise<HttpResponse> {
-    if (session.kind !== 'portal') return this.deps.fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: session.controller.signal })
+  private async post(session: LoginSession, url: string, payload: Record<string, unknown>, userAgent?: string): Promise<HttpResponse> {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+    if (userAgent) headers['User-Agent'] = userAgent
+    if (session.kind !== 'portal') return this.deps.fetch(url, { method: 'POST', headers, body: JSON.stringify(payload), signal: session.controller.signal })
     const timeout = this.deps.requestTimeoutMs ?? 10000
     const controller = new AbortController()
     const aborted = () => controller.abort()
@@ -180,7 +201,7 @@ export class LoginSessionManager {
     }
     try {
       if (controller.signal.aborted) throw new Error('cancelled')
-      const response = await Promise.race([this.deps.fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: controller.signal, redirect: 'error' }), interrupted])
+      const response = await Promise.race([this.deps.fetch(url, { method: 'POST', headers, body: JSON.stringify(payload), signal: controller.signal, redirect: 'error' }), interrupted])
       if (!response.ok) finish()
       // Keep the deadline active while reading/parsing the response, not just until headers arrive.
       return { ok: response.ok, status: response.status, json: async () => {
@@ -255,7 +276,8 @@ export class LoginSessionManager {
   /** Current official portal flow; all networking and browser effects remain injected. */
   async startPortal(sessionId: string, expectedProvider?: PortalProvider, privateMode?: boolean): Promise<LoginResult> {
     if (typeof sessionId !== 'string' || !/^[A-Za-z0-9-]{1,128}$/.test(sessionId)) return { success: false, sessionId, error: '登录会话标识无效' }
-    if (expectedProvider && !Object.values(PORTAL_PROVIDERS).includes(expectedProvider)) return { success: false, sessionId, error: '不支持的登录方式' }
+    const method = Object.keys(PORTAL_PROVIDERS).find(key => PORTAL_PROVIDERS[key] === expectedProvider)
+    if (expectedProvider !== undefined && !method) return { success: false, sessionId, error: '不支持的登录方式' }
     const session = this.begin('portal', sessionId, 'us-east-1')
     session.expectedProvider = expectedProvider
     session.privateMode = privateMode
@@ -267,6 +289,7 @@ export class LoginSessionManager {
       if (!this.active(session)) return this.stopped(sessionId)
       const url = new URL(PORTAL_ENDPOINT)
       url.search = new URLSearchParams({ state: session.state!, code_challenge: createHash('sha256').update(session.verifier!).digest('base64url'), code_challenge_method: 'S256', redirect_uri: session.redirectUri!, redirect_from: 'KiroIDE' }).toString()
+      if (method) url.searchParams.set('signin_methods', method)
       const opened = await this.deps.openBrowser(url.toString(), privateMode)
       if (!this.active(session)) return this.stopped(sessionId)
       if (opened === false) return this.failure(session, '无法打开登录浏览器，请重试')
@@ -276,12 +299,15 @@ export class LoginSessionManager {
   pollPortal(sessionId: string): LoginResult {
     const session = this.find('portal', sessionId)
     if (!session) return this.stopped(sessionId)
-    if (session.result) {
-      const result = session.result
-      this.clear(session)
-      return result
-    }
+    if (session.result) return this.consumeCallbackResult(session, session.result)
     return { success: true, sessionId, completed: false, status: 'pending', interval: 1, provider: session.provider }
+  }
+  private consumeCallbackResult(session: LoginSession, result: LoginResult): LoginResult {
+    this.clear(session)
+    if (session.accessTokenExpiresAt === undefined) return result
+    const remaining = Math.floor((session.accessTokenExpiresAt - this.now()) / 1000)
+    if (remaining <= 0) return { success: false, completed: true, sessionId: session.id, error: '授权凭证已过期，请重新登录' }
+    return { ...result, expiresIn: remaining }
   }
   private validCallback(session: LoginSession, request: IncomingMessage, idc: boolean): URL | undefined {
     if (request.method !== 'GET' || !session.redirectUri || !request.url || request.url.length > 16384) return
@@ -302,6 +328,7 @@ export class LoginSessionManager {
     const refreshToken = text(data.refreshToken)?.trim()
     const expiresIn = positive(data.expiresIn, 0)
     if (!accessToken || !refreshToken || !expiresIn) return
+    session.accessTokenExpiresAt = this.now() + expiresIn * 1000
     return { success: true, completed: true, sessionId: session.id, accessToken, refreshToken, expiresIn, profileArn: text(data.profileArn), provider: session.provider, authMethod: session.provider === 'Google' || session.provider === 'Github' ? 'social' : 'IdC', ...(session.clientId ? { clientId: session.clientId, clientSecret: session.clientSecret, clientSecretExpiresAt: session.clientSecretExpiresAt, region: session.region, startUrl: session.startUrl } : {}) }
   }
   private async handlePortalCallback(session: LoginSession, request: IncomingMessage, response: ServerResponse, idc: boolean): Promise<void> {
@@ -341,7 +368,10 @@ export class LoginSessionManager {
       session.portalConsumed = true
       session.exchangeStarted = true
       try {
-        const result = await this.post(session, `${this.deps.authEndpoint}/oauth/token`, { code, code_verifier: session.verifier, redirect_uri: `${session.redirectUri}${url.pathname}?login_option=${url.searchParams.get('login_option')}` })
+        const result = await this.post(session, `${this.deps.authEndpoint}/oauth/token`, {
+          code, code_verifier: session.verifier,
+          redirect_uri: `${session.redirectUri}${url.pathname}?login_option=${option}`
+        }, getKiroSocialUserAgent(this.deps.getMachineId?.()))
         if (!this.active(session)) { this.reply(response, 410, 'Login session was cancelled'); return }
         if (!result.ok) throw new Error('token_exchange')
         const token = this.portalTokenResult(session, await result.json())
@@ -371,19 +401,17 @@ export class LoginSessionManager {
       const registration = await this.post(session, `${base}/client/register`, { clientName: 'Kiro Account Manager', clientType: 'public', scopes: SCOPES, grantTypes: ['authorization_code', 'refresh_token'], redirectUris: ['http://127.0.0.1/oauth/callback'], issuerUrl: session.startUrl })
       if (!this.active(session)) return
       if (!registration.ok) throw new Error('client_registration')
-      const client = body(await registration.json())
+      const client = readRegistration(await registration.json(), this.now())
       if (!this.active(session)) return
-      session.clientId = text(client.clientId)
-      session.clientSecret = text(client.clientSecret)
-      session.clientSecretExpiresAt = positive(client.clientSecretExpiresAt, 0) || undefined
-      if (!session.clientId || !session.clientSecret || session.clientSecretExpiresAt !== undefined && session.clientSecretExpiresAt * 1000 <= this.now()) throw new Error('invalid_client_registration')
+      if (!client) throw new Error('invalid_client_registration')
+      Object.assign(session, client)
       session.state = randomUUID()
       session.verifier = randomBytes(32).toString('base64url')
       session.exchangeStarted = false
       session.portalStage = 'idc'
       await this.listenPortal(session, true)
       if (!this.active(session)) return
-      const params = new URLSearchParams({ response_type: 'code', client_id: session.clientId, redirect_uri: session.redirectUri!, scopes: SCOPES.join(','), state: session.state, code_challenge: createHash('sha256').update(session.verifier).digest('base64url'), code_challenge_method: 'S256' })
+      const params = new URLSearchParams({ response_type: 'code', client_id: client.clientId, redirect_uri: session.redirectUri!, scopes: SCOPES.join(','), state: session.state, code_challenge: createHash('sha256').update(session.verifier).digest('base64url'), code_challenge_method: 'S256' })
       const opened = await this.deps.openBrowser(`${base}/authorize?${params}`, session.privateMode)
       if (!this.active(session)) return
       if (opened === false) throw new Error('browser_open_failed')
@@ -398,11 +426,10 @@ export class LoginSessionManager {
       const registration = await this.post(session, `${base}/client/register`, { clientName: 'Kiro Account Manager', clientType: 'public', scopes: SCOPES, grantTypes: ['urn:ietf:params:oauth:grant-type:device_code', 'refresh_token'], issuerUrl: startUrl })
       if (!this.active(session)) return this.stopped(sessionId)
       if (!registration.ok) return this.failure(session, '注册客户端失败，请重试')
-      const client = body(await registration.json())
+      const client = readRegistration(await registration.json(), this.now())
       if (!this.active(session)) return this.stopped(sessionId)
-      session.clientId = text(client.clientId)
-      session.clientSecret = text(client.clientSecret)
-      if (!session.clientId || !session.clientSecret) return this.failure(session, '注册响应缺少客户端凭证')
+      if (!client) return this.failure(session, '客户端注册无效或已到期，请重试')
+      Object.assign(session, client)
       const response = await this.post(session, `${base}/device_authorization`, { clientId: session.clientId, clientSecret: session.clientSecret, startUrl })
       if (!this.active(session)) return this.stopped(sessionId)
       if (!response.ok) return this.failure(session, '设备授权失败，请重试')
@@ -433,7 +460,13 @@ export class LoginSessionManager {
       if (!this.active(session)) return this.stopped(sessionId)
       if (response.ok) {
         if (!text(data.accessToken) || !text(data.refreshToken)) return this.failure(session, '授权响应缺少账户凭证')
-        const result: LoginResult = { success: true, sessionId, completed: true, accessToken: text(data.accessToken), refreshToken: text(data.refreshToken), clientId: session.clientId, clientSecret: session.clientSecret, region: session.region, expiresIn: positive(data.expiresIn, 3600) }
+        const result: LoginResult = {
+          success: true, sessionId, completed: true,
+          accessToken: text(data.accessToken), refreshToken: text(data.refreshToken),
+          clientId: session.clientId, clientSecret: session.clientSecret,
+          clientSecretExpiresAt: session.clientSecretExpiresAt,
+          region: session.region, expiresIn: positive(data.expiresIn, 0) || undefined
+        }
         this.clear(session)
         return result
       }
@@ -510,11 +543,10 @@ export class LoginSessionManager {
       const response = await this.post(session, `${base}/client/register`, { clientName: 'Kiro Account Manager', clientType: 'public', scopes: SCOPES, grantTypes: ['authorization_code', 'refresh_token'], redirectUris: ['http://127.0.0.1/oauth/callback'], issuerUrl: startUrl })
       if (!this.active(session)) return this.stopped(sessionId)
       if (!response.ok) return this.failure(session, '注册客户端失败，请确认组织的访问权限')
-      const data = body(await response.json())
+      const client = readRegistration(await response.json(), this.now())
       if (!this.active(session)) return this.stopped(sessionId)
-      session.clientId = text(data.clientId)
-      session.clientSecret = text(data.clientSecret)
-      if (!session.clientId || !session.clientSecret) return this.failure(session, '注册响应缺少客户端凭证')
+      if (!client) return this.failure(session, '客户端注册无效或已到期，请重试')
+      Object.assign(session, client)
       session.verifier = randomBytes(32).toString('base64url')
       session.state = randomUUID()
       const server = createServer((request, response) => {
@@ -540,7 +572,7 @@ export class LoginSessionManager {
       const address = server.address()
       if (!address || typeof address === 'string') return this.failure(session, '无法建立本地登录回调')
       session.redirectUri = `http://127.0.0.1:${address.port}/oauth/callback`
-      const params = new URLSearchParams({ response_type: 'code', client_id: session.clientId, redirect_uri: session.redirectUri, scopes: SCOPES.join(','), state: session.state, code_challenge: createHash('sha256').update(session.verifier).digest('base64url'), code_challenge_method: 'S256' })
+      const params = new URLSearchParams({ response_type: 'code', client_id: client.clientId, redirect_uri: session.redirectUri, scopes: SCOPES.join(','), state: session.state, code_challenge: createHash('sha256').update(session.verifier).digest('base64url'), code_challenge_method: 'S256' })
       return { success: true, sessionId, authorizeUrl: `${base}/authorize?${params}`, expiresIn: 600 }
     } catch { return this.failure(session, '启动 IAM SSO 登录失败，请重试') }
   }
@@ -564,7 +596,15 @@ export class LoginSessionManager {
       const data = body(await tokenResponse.json())
       if (!this.active(session)) { response.writeHead(410); response.end('Login session was cancelled'); return }
       if (!text(data.accessToken) || !text(data.refreshToken)) throw new Error('incomplete_token')
-      session.result = { success: true, completed: true, sessionId: session.id, accessToken: text(data.accessToken), refreshToken: text(data.refreshToken), clientId: session.clientId, clientSecret: session.clientSecret, region: session.region, expiresIn: positive(data.expiresIn, 3600) }
+      const expiresIn = positive(data.expiresIn, 0) || undefined
+      if (expiresIn !== undefined) session.accessTokenExpiresAt = this.now() + expiresIn * 1000
+      session.result = {
+        success: true, completed: true, sessionId: session.id,
+        accessToken: text(data.accessToken), refreshToken: text(data.refreshToken),
+        clientId: session.clientId, clientSecret: session.clientSecret,
+        clientSecretExpiresAt: session.clientSecretExpiresAt,
+        region: session.region, expiresIn
+      }
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
       response.end('<html><body><h1>授权完成</h1><p>请返回桌面应用。</p></body></html>')
     } catch {
@@ -575,11 +615,7 @@ export class LoginSessionManager {
   pollIam(sessionId: string): LoginResult {
     const session = this.find('iamsso', sessionId)
     if (!session) return this.stopped(sessionId)
-    if (session.result) {
-      const result = session.result
-      this.clear(session)
-      return result
-    }
+    if (session.result) return this.consumeCallbackResult(session, session.result)
     return { success: true, sessionId, completed: false, status: 'pending', interval: 3 }
   }
 }

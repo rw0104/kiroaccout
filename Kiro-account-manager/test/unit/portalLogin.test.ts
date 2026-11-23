@@ -20,9 +20,9 @@ function deferred<T>() {
 }
 function harness(overrides: Partial<ConstructorParameters<typeof LoginSessionManager>[0]> = {}) {
   const opened: Array<{ url: string; privateMode?: boolean }> = []
-  const calls: Array<{ url: string; init: { body: string; signal?: AbortSignal; redirect?: RequestRedirect } }> = []
+  const calls: Array<{ url: string; init: { headers: Record<string, string>; body: string; signal?: AbortSignal; redirect?: RequestRedirect } }> = []
   const manager = new LoginSessionManager({
-    authEndpoint: 'https://auth.example.invalid', portalPorts: [0],
+    authEndpoint: 'https://auth.example.invalid', portalPorts: [0], getMachineId: () => 'synthetic-machine',
     openBrowser(url, privateMode) { opened.push({ url, privateMode }) }, notifySocial() { assert.fail('portal must not depend on system protocol callbacks') },
     fetch: async (url, init) => { calls.push({ url, init }); return reply(url.endsWith('/client/register') ? registration : tokenData) },
     ...overrides
@@ -48,6 +48,7 @@ test('portal opens the official PKCE loopback flow and Social exchanges exactly 
     const login = new URL(started.loginUrl!)
     assert.equal(login.origin + login.pathname, 'https://app.kiro.dev/signin')
     assert.equal(login.searchParams.get('redirect_from'), 'KiroIDE')
+    assert.equal(login.searchParams.has('signin_methods'), false)
     assert.equal(login.searchParams.get('code_challenge_method'), 'S256')
     assert.match(login.searchParams.get('redirect_uri')!, /^http:\/\/localhost:\d+$/)
     assert.equal(h.opened[0].privateMode, true)
@@ -61,6 +62,7 @@ test('portal opens the official PKCE loopback flow and Social exchanges exactly 
     assert.equal(result.profileArn, tokenData.profileArn)
     assert.equal(h.calls.length, 1)
     assert.equal(h.calls[0].url, 'https://auth.example.invalid/oauth/token')
+    assert.deepEqual(h.calls[0].init.headers, { 'Content-Type': 'application/json', 'User-Agent': 'KiroIDE-1.5.11-synthetic-machine' })
     const payload = JSON.parse(h.calls[0].init.body)
     assert.equal(payload.code, 'SYNTHETIC_CODE')
     assert.equal(payload.redirect_uri, `${login.searchParams.get('redirect_uri')}${path}?login_option=${option}`)
@@ -68,6 +70,17 @@ test('portal opens the official PKCE loopback flow and Social exchanges exactly 
     assert.equal(createHash('sha256').update(payload.code_verifier).digest('base64url'), login.searchParams.get('code_challenge'))
     assert.equal(h.calls[0].init.redirect, 'error')
     assert.equal(h.manager.pollPortal(option).status, 'cancelled')
+  }
+})
+
+test('provider shortcuts request the selected sign-in method in the browser', async t => {
+  const h = harness()
+  const methods = { Google: 'google', Github: 'github', BuilderId: 'builderid', Enterprise: 'awsidc' } as const
+  for (const provider of Object.keys(methods) as (keyof typeof methods)[]) {
+    t.after(() => h.manager.cancel('portal', provider))
+    const started = await h.manager.startPortal(provider, provider)
+    assert.equal(started.success, true)
+    assert.equal(new URL(h.opened.at(-1)!.url).searchParams.get('signin_methods'), methods[provider])
   }
 })
 
@@ -150,6 +163,7 @@ test('Builder and Enterprise use a separate bound IdC callback with exact regist
     assert.equal(authorize.origin, `https://oidc.${region}.amazonaws.com`)
     assert.equal(authorize.pathname, '/authorize')
     assert.equal(h.opened[1].privateMode, true)
+    assert.deepEqual(h.calls[0].init.headers, { 'Content-Type': 'application/json' })
     const client = JSON.parse(h.calls[0].init.body)
     assert.equal(client.issuerUrl, issuer)
     assert.deepEqual(client.grantTypes, ['authorization_code', 'refresh_token'])
@@ -161,6 +175,7 @@ test('Builder and Enterprise use a separate bound IdC callback with exact regist
     assert.ok(Number(idcCallback.port) > 0)
     idcCallback.search = new URLSearchParams({ state: authorize.searchParams.get('state')!, code: 'SYNTHETIC_IDC_CODE' }).toString()
     assert.equal((await fetch(idcCallback)).status, 200)
+    assert.deepEqual(h.calls[1].init.headers, { 'Content-Type': 'application/json' })
     const payload = JSON.parse(h.calls[1].init.body)
     assert.equal(payload.redirectUri, authorize.searchParams.get('redirect_uri'))
     assert.equal(payload.grantType, 'authorization_code')

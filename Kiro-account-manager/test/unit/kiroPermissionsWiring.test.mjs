@@ -4,11 +4,13 @@ import { win32 } from 'node:path'
 import test from 'node:test'
 import vm from 'node:vm'
 import ts from 'typescript'
+import { shareKiroVersionInspection } from '../../src/main/kiroSettings.ts'
 
 const source = readFileSync(new URL('../../src/main/index.ts', import.meta.url), 'utf8')
 const ast = ts.createSourceFile('index.ts', source, ts.ScriptTarget.Latest, true)
-let initializer
+let versionInspector, initializer
 function visit(node) {
+  if (ts.isVariableDeclaration(node) && node.name.getText(ast) === 'inspectKiroSettingsVersion') versionInspector = node.getText(ast)
   if (ts.isVariableDeclaration(node) && node.name.getText(ast) === 'kiroPermissionsService') {
     initializer = node.initializer.getText(ast)
   }
@@ -16,7 +18,7 @@ function visit(node) {
 }
 visit(ast)
 assert.ok(initializer, 'Expected actual Kiro permissions service initialization')
-const compiled = ts.transpileModule('globalThis.service = ' + initializer, {
+const compiled = ts.transpileModule('const ' + versionInspector + '\nglobalThis.service = ' + initializer, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
 }).outputText
 
@@ -31,6 +33,7 @@ function wiring(options = {}) {
     ]
   }
   const context = vm.createContext({
+    shareKiroVersionInspection,
     KiroPermissionsService: class { constructor(deps) { this.deps = deps } },
     process: { platform: 'win32', env },
     os: { homedir: () => 'D:\\Synthetic\\home' },

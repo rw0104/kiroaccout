@@ -1,5 +1,6 @@
 import { applyEdits, modify, parse, parseTree, type ParseError } from 'jsonc-parser'
-import type { KiroMemoryMode, KiroSettingsTargetInfo } from '../shared/kiroSettings'
+import { isNewerVersion } from '../shared/version'
+import type { KiroMemoryLocation, KiroMemoryMode, KiroSettingsTargetInfo } from '../shared/kiroSettings'
 import { resolveKiroSettingsPath } from './kiroSettingsPath'
 
 export class KiroSettingsError extends Error {}
@@ -16,7 +17,7 @@ const FIELD_NAMES = {
   trustedCommands: 'kiroAgent.trustedCommands',
   trustedTools: 'kiroAgent.trustedTools',
   commandDenylist: 'kiroAgent.commandDenylist',
-  ignoreFiles: 'kiroAgent.ignoreFiles',
+  ignoreFiles: 'kiroAgent.agentIgnoreFiles',
   mcpApprovedEnvVars: 'kiroAgent.mcpApprovedEnvVars',
   notificationsActionRequired: 'kiroAgent.notifications.agent.actionRequired',
   notificationsFailure: 'kiroAgent.notifications.agent.failure',
@@ -68,29 +69,69 @@ function validateSetting(field: SettingField, value: unknown): void {
   } else if (typeof value !== 'boolean') invalid()
 }
 
-export function readKiroSettingsDocument(content: string): Record<string, unknown> {
+export function kiroMemoryLocation(version: string | undefined): KiroMemoryLocation {
+  // From 1.4.236 the IDE delegates Memory preferences to the agent.
+  if (!isNewerVersion(version, '0.0.0')) return 'unknown'
+  return isNewerVersion('1.4.236', version) ? 'settings-file' : 'ide'
+}
+
+type VersionTarget = Pick<KiroSettingsTargetInfo, 'type' | 'instanceId'>
+
+/** Concurrent settings and permissions reads can share one installation scan.
+ * The result is discarded on completion so subsequent edits detect IDE upgrades.
+ */
+export function shareKiroVersionInspection(inspect: (target: VersionTarget) => Promise<string | undefined>) {
+  const pending = new Map<string, Promise<string | undefined>>()
+  return (target: VersionTarget): Promise<string | undefined> => {
+    const key = target.instanceId ?? target.type
+    const current = pending.get(key)
+    if (current) return current
+    const task = inspect(target).finally(() => pending.delete(key))
+    pending.set(key, task)
+    return task
+  }
+}
+
+export function readKiroSettingsDocument(content: string, memoryLocation: KiroMemoryLocation = 'settings-file'): Record<string, unknown> {
   const parsed = parseKiroSettingsObject(content)
   const result: Record<string, unknown> = {}
   for (const [field, key] of Object.entries(FIELD_NAMES)) result[field] = parsed[key]
   for (const field of ARRAY_FIELDS) result[field] ??= []
+  validateSetting('ignoreFiles', result.ignoreFiles)
   result.trustedTools ??= {}
-  result.memory ??= 'off'
+  if (memoryLocation === 'settings-file') {
+    result.memory ??= 'off'
+    validateSetting('memory', result.memory)
+  } else {
+    delete result.memory
+  }
   result.workflowsEnabled ??= false
-  validateSetting('memory', result.memory)
   validateSetting('workflowsEnabled', result.workflowsEnabled)
   return result
 }
 
 /** Edit only supplied known settings; retain unknown keys, comments and formatting. */
-export function updateKiroSettingsDocument(content: string, updates: unknown): string {
-  parseKiroSettingsObject(content)
+export function updateKiroSettingsDocument(content: string, updates: unknown, memoryLocation: KiroMemoryLocation = 'settings-file'): string {
+  const parsed = parseKiroSettingsObject(content)
   if (!object(updates)) throw new KiroSettingsError('Kiro 设置更新必须是对象；原文件未更改。')
   const changes: Array<[SettingField, unknown]> = []
   for (const [field, value] of Object.entries(updates)) {
     if (!Object.hasOwn(FIELD_NAMES, field)) throw new KiroSettingsError('包含不支持的 Kiro 设置；原文件未更改。')
     if (value === undefined) continue
+    if (field === 'memory' && memoryLocation !== 'settings-file') {
+      throw new KiroSettingsError('请在所选 Kiro IDE 中更改记忆设置。新版使用 Memories 侧栏顶部的齿轮。')
+    }
     validateSetting(field as SettingField, value)
-    changes.push([field as SettingField, value])
+    if (field === 'ignoreFiles' && Array.isArray(value) && value.some((name: string) =>
+      !name || name !== name.trim() || name === '.' || name.includes('..') || /[/\\*?\[\]{}]/.test(name)
+    )) {
+      throw new KiroSettingsError('请每行填写一个忽略规则文件名，例如 .gitignore。文件名不能包含路径、通配符或首尾空格。')
+    }
+    if (field === 'modelSelection' && value === '') {
+      if (Object.hasOwn(parsed, FIELD_NAMES.modelSelection)) changes.push([field, undefined])
+    } else {
+      changes.push([field as SettingField, value])
+    }
   }
   if (!changes.length) return content
   const bom = content.startsWith('\uFEFF') ? '\uFEFF' : ''

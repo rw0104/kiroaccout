@@ -18,7 +18,7 @@ After upgrading to 1.10.3, close the CLI and explicitly reconnect an older CLI b
 
 Security update: HTTPS proxy traffic verifies destination certificates, remote images are restricted to public addresses, and inference keys cannot use HTTP admin endpoints. Account data migrates to an OS-protected encrypted store on first launch. Unlock your OS keychain before starting; migrate between computers using an explicit credential export.
 
-Kiro Settings now supports Memory and Workflows for the default IDE or a selected managed instance. Saves retain JSONC comments and unrelated settings. Account search also accepts original import names; model cards show documented context tiers when they match the current catalog rate.
+Kiro Settings supports Workflows and ignore pattern files for the default IDE or a selected managed instance. In Kiro IDE 1.4.236 and later, change Memory from the gear in the IDE’s Memories sidebar. Earlier versions retain the Memory selector in the manager. Saves retain JSONC comments and unrelated settings. Account search also accepts original import names. Model cards show documented context tiers when they match the current catalog rate.
 
 Open an account's details to read its model fallback preferences. Set one fallback for a primary model, or clear that setting, then save. Model consent metadata remains visible without automatic consent. Manage instance-bound accounts inside their official instance. Organization usage can be limited by a shared pool and user or group limits; use the Kiro console to confirm effective availability.
 

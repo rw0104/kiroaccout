@@ -10,7 +10,7 @@ function deferred<T>() {
   return { promise, resolve }
 }
 const response = (data: unknown, status = 200) => ({ ok: status < 400, status, json: async () => data })
-const registration = () => response({ clientId: 'synthetic-client', clientSecret: 'synthetic-secret' })
+const registration = (clientSecretExpiresAt?: number) => response({ clientId: 'synthetic-client', clientSecret: 'synthetic-secret', clientSecretExpiresAt })
 const authorization = () => response({ deviceCode: 'synthetic-device', userCode: 'TEST-CODE', verificationUri: 'https://example.invalid/device', interval: 5, expiresIn: 600 })
 const tokens = () => response({ accessToken: 'synthetic-access', refreshToken: 'synthetic-refresh', expiresIn: 3600 })
 const tick = () => new Promise<void>(resolve => setImmediate(resolve))
@@ -36,7 +36,8 @@ test('Builder enforces interval, single in-flight request and slow_down for ever
   let now = 0
   let tokenCalls = 0
   const delayed = deferred<ReturnType<typeof tokens>>()
-  const manager = new LoginSessionManager({ authEndpoint: 'https://example.invalid', now: () => now, openBrowser() {}, notifySocial() {}, fetch: async url => url.endsWith('/register') ? registration() : url.endsWith('/device_authorization') ? authorization() : (++tokenCalls === 1 ? delayed.promise : tokens()) })
+  const registrationExpiry = 4000000000
+  const manager = new LoginSessionManager({ authEndpoint: 'https://example.invalid', now: () => now, openBrowser() {}, notifySocial() {}, fetch: async url => url.endsWith('/register') ? registration(registrationExpiry) : url.endsWith('/device_authorization') ? authorization() : (++tokenCalls === 1 ? delayed.promise : tokens()) })
   await manager.startBuilder('builder')
   assert.equal((await manager.pollBuilder('builder')).retryAfter, 5)
   assert.equal(tokenCalls, 0)
@@ -51,7 +52,10 @@ test('Builder enforces interval, single in-flight request and slow_down for ever
   assert.equal((await manager.pollBuilder('builder')).completed, false)
   assert.equal(tokenCalls, 1)
   now = 15000
-  assert.equal((await manager.pollBuilder('builder')).completed, true)
+  const result = await manager.pollBuilder('builder')
+  assert.equal(result.completed, true)
+  assert.equal(result.clientSecretExpiresAt, registrationExpiry)
+  assert.equal(result.expiresIn, 3600)
   assert.equal(tokenCalls, 2)
   assert.equal((await manager.pollBuilder('builder')).success, false)
 })
@@ -183,8 +187,10 @@ test('Social callback arriving after expiry but before timer notifies exactly on
 
 test('IAM listens on the same dynamic server, rejects wrong state without consuming session and exchanges once', async () => {
   const delayed = deferred<ReturnType<typeof tokens>>()
+  let now = 1800000000000
   let tokenCalls = 0
-  const manager = new LoginSessionManager({ authEndpoint: 'https://example.invalid', openBrowser() {}, notifySocial() {}, fetch: async url => url.endsWith('/register') ? registration() : (tokenCalls++, delayed.promise) })
+  const registrationExpiry = 4000000000
+  const manager = new LoginSessionManager({ authEndpoint: 'https://example.invalid', now: () => now, openBrowser() {}, notifySocial() {}, fetch: async url => url.endsWith('/register') ? registration(registrationExpiry) : (tokenCalls++, delayed.promise) })
   const start = await manager.startIam('iam', 'https://example.invalid/start')
   assert.equal(start.success, true)
   const authorize = new URL(start.authorizeUrl!)
@@ -204,8 +210,32 @@ test('IAM listens on the same dynamic server, rejects wrong state without consum
   assert.equal(tokenCalls, 1)
   delayed.resolve(tokens())
   assert.equal((await first).status, 200)
-  assert.equal(manager.pollIam('iam').completed, true)
+  now += 60000 // The renderer may poll well after the loopback callback completed.
+  const result = manager.pollIam('iam')
+  assert.equal(result.completed, true)
+  assert.equal(result.clientSecretExpiresAt, registrationExpiry)
+  assert.equal(result.expiresIn, 3540)
   assert.equal(manager.pollIam('iam').success, false)
+})
+
+test('direct OIDC login rejects expired and malformed registration deadlines before requesting authorization', async t => {
+  const now = 1800000000000
+  let expiry = now / 1000
+  const requests: string[] = []
+  const manager = new LoginSessionManager({
+    authEndpoint: 'https://example.invalid', now: () => now, openBrowser() {}, notifySocial() {},
+    fetch: async url => {
+      requests.push(new URL(url).pathname)
+      return url.endsWith('/register') ? registration(expiry) : authorization()
+    }
+  })
+  t.after(() => { manager.cancel('builderid', 'builder'); manager.cancel('iamsso', 'iam') })
+  for (expiry of [now / 1000, now + 3600000, Number.MAX_SAFE_INTEGER]) {
+    requests.length = 0
+    assert.equal((await manager.startBuilder('builder')).success, false)
+    assert.equal((await manager.startIam('iam', 'https://example.invalid/start')).success, false)
+    assert.deepEqual(requests, ['/client/register', '/client/register'])
+  }
 })
 
 test('IAM cancelled callback cannot publish tokens into the next session', async () => {

@@ -1,3 +1,5 @@
+export type KiroMemoryLocation = 'settings-file' | 'ide' | 'unknown'
+
 export type KiroMemoryMode = 'useAndLearn' | 'useWithoutLearning' | 'useOnly' | 'off'
 
 /** The renderer selects a registered profile by ID, never by a filesystem path. */
@@ -11,6 +13,7 @@ export interface KiroSettingsTargetInfo {
 }
 
 export interface KiroSettingsReadResult {
+  memoryLocation?: KiroMemoryLocation
   settings?: Record<string, unknown>
   mcpConfig?: { mcpServers: Record<string, unknown> }
   steeringFiles?: string[]
