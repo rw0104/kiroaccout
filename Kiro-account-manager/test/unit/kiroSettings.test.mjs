@@ -9,7 +9,7 @@ import { pathToFileURL } from 'node:url'
 import { requireTrustedMainWindow } from '../../src/main/trustedIpc.ts'
 import {
   readKiroSettingsDocument, updateKiroSettingsDocument, parseKiroSettingsObject,
-  resolveKiroSettingsTarget, kiroSettingsFailure
+  resolveKiroSettingsTarget, kiroSettingsFailure, kiroMemoryLocation
 } from '../../src/main/kiroSettings.ts'
 
 const ts = createRequire(import.meta.url)('typescript')
@@ -40,6 +40,7 @@ function harness(fixture, initial, resolveInstance = async () => { throw new Err
     writeFileSync: (path, content) => { writes.push(path); files.set(path, content) }
   }
   const context = vm.createContext({
+    inspectKiroSettingsVersion: async () => fixture.version, kiroMemoryLocation,
     requireTrustedMainWindow, mainWindow, join, __dirname: dirname, is: { dev: false }, createSteeringFiles: () => ({ list: () => [] }),
     process: { platform: fixture.platform, env: fixture.env },
     readKiroSettingsDocument, updateKiroSettingsDocument, parseKiroSettingsObject,
@@ -59,13 +60,13 @@ function harness(fixture, initial, resolveInstance = async () => { throw new Err
   return { ...context, readSettings: (_event, target) => context.readSettings(_event ?? event, target), files, writes, reads, opened, ids }
 }
 
-const windows = { platform: 'win32', home: 'C:\\Synthetic\\home', env: { APPDATA: 'D:\\Synthetic\\Roaming' }, settingsPath: 'D:\\Synthetic\\Roaming\\Kiro\\User\\settings.json' }
+const windows = { version: '1.4.215', platform: 'win32', home: 'C:\\Synthetic\\home', env: { APPDATA: 'D:\\Synthetic\\Roaming' }, settingsPath: 'D:\\Synthetic\\Roaming\\Kiro\\User\\settings.json' }
 
 for (const fixture of [
   windows,
-  { platform: 'darwin', home: '/Users/synthetic', env: {}, settingsPath: '/Users/synthetic/Library/Application Support/Kiro/User/settings.json' },
-  { platform: 'linux', home: '/home/synthetic', env: {}, settingsPath: '/home/synthetic/.config/Kiro/User/settings.json' },
-  { platform: 'linux', home: '/home/synthetic', env: { XDG_CONFIG_HOME: '/synthetic/config' }, settingsPath: '/synthetic/config/Kiro/User/settings.json' }
+  { version: '1.4.215', platform: 'darwin', home: '/Users/synthetic', env: {}, settingsPath: '/Users/synthetic/Library/Application Support/Kiro/User/settings.json' },
+  { version: '1.4.215', platform: 'linux', home: '/home/synthetic', env: {}, settingsPath: '/home/synthetic/.config/Kiro/User/settings.json' },
+  { version: '1.4.215', platform: 'linux', home: '/home/synthetic', env: { XDG_CONFIG_HOME: '/synthetic/config' }, settingsPath: '/synthetic/config/Kiro/User/settings.json' }
 ]) {
   test(`actual Kiro settings IPC preserves JSONC and uses the same ${fixture.platform} target for read/save/open`, async () => {
     const ctx = harness(fixture, [[fixture.settingsPath, `\uFEFF{\n  // Synthetic Kiro configuration\n  "kiroAgent.modelSelection": "before",\n  "synthetic.url": "https://example.invalid/a/*literal*/?q=//text",\n  "synthetic.preserved": true,\n  "kiroAgent.memory": "useOnly",\n}\n`]])
@@ -166,4 +167,62 @@ test('JSONC edits preserve escaped strings, CRLF, tabs, comments and unrelated s
   assert.equal(parseKiroSettingsObject(updated)['synthetic.text'], parseKiroSettingsObject(content)['synthetic.text'])
   assert.equal(readKiroSettingsDocument(updated).memory, 'useAndLearn')
   assert.deepEqual(parseKiroSettingsObject(updateKiroSettingsDocument('// retained comment\n', { memory: 'off' })), { 'kiroAgent.memory': 'off' })
+})
+
+test('current IDE uses its Memory sidebar and leaves deprecated JSON intact when saving other settings', async () => {
+  const content = '{ "kiroAgent.memory": "former-mode", "kiroAgent.ignoreFiles": ["old"], "kiroAgent.agentIgnoreFiles": [".gitignore"] }'
+  for (const [version, location] of [['1.4.235', 'settings-file'], ['1.4.236', 'ide'], ['1.5.11', 'ide'], [undefined, 'unknown']]) {
+    const original = location === 'settings-file' ? content.replace('former-mode', 'useOnly') : content
+    const ctx = harness({ ...windows, version }, [[windows.settingsPath, original]])
+    const loaded = await ctx.readSettings()
+    assert.equal(loaded.memoryLocation, location)
+    assert.deepEqual(loaded.settings.ignoreFiles, ['.gitignore'])
+    if (location === 'settings-file') {
+      assert.equal(loaded.settings.memory, 'useOnly')
+      continue
+    }
+    assert.equal(Object.hasOwn(loaded.settings, 'memory'), false)
+    assert.equal((await ctx.saveSettings(undefined, { memory: 'off', workflowsEnabled: true })).success, false)
+    assert.equal(ctx.files.get(windows.settingsPath), original)
+    assert.equal((await ctx.saveSettings(undefined, { ignoreFiles: ['.customignore'] })).success, true)
+    const saved = parseKiroSettingsObject(ctx.files.get(windows.settingsPath))
+    assert.equal(saved['kiroAgent.memory'], 'former-mode')
+    assert.deepEqual(saved['kiroAgent.agentIgnoreFiles'], ['.customignore'])
+    assert.deepEqual(saved['kiroAgent.ignoreFiles'], ['old'])
+  }
+})
+
+test('clearing an initial model removes only that override from the actual settings file', async () => {
+  for (const content of ['', '// synthetic comment\n', '{"other": true}', '{"other": true, "kiroAgent.modelSelection": "synthetic"}']) {
+    const ctx = harness({ ...windows, version: '1.5.11' }, [[windows.settingsPath, content]])
+    assert.equal((await ctx.saveSettings(undefined, { modelSelection: '' })).success, true)
+    const saved = ctx.files.get(windows.settingsPath)
+    if (content.includes('kiroAgent.modelSelection')) assert.deepEqual(parseKiroSettingsObject(saved), { other: true })
+    else assert.equal(saved, content)
+  }
+})
+
+test('a target upgraded after settings were loaded cannot save a legacy Memory patch', async () => {
+  const fixture = { ...windows, version: '1.4.235' }
+  const ctx = harness(fixture, [[windows.settingsPath, '{}']])
+  assert.equal((await ctx.readSettings()).memoryLocation, 'settings-file')
+  fixture.version = '1.5.11'
+  assert.equal((await ctx.saveSettings(undefined, { memory: 'useOnly' })).success, false)
+  assert.equal(ctx.writes.length, 0)
+})
+
+test('workspace ignore filenames remain unset until changed, and an explicit empty list clears the profile override', async () => {
+  const content = '{ "other": true }'
+  const ctx = harness({ ...windows, version: undefined }, [[windows.settingsPath, content]])
+  assert.deepEqual((await ctx.readSettings()).settings.ignoreFiles, [])
+  assert.equal((await ctx.saveSettings(undefined, { workflowsEnabled: true })).success, true)
+  assert.equal(Object.hasOwn(parseKiroSettingsObject(ctx.files.get(windows.settingsPath)), 'kiroAgent.agentIgnoreFiles'), false)
+  assert.equal((await ctx.saveSettings(undefined, { ignoreFiles: ['.gitignore'] })).success, true)
+  const before = ctx.files.get(windows.settingsPath)
+  assert.equal((await ctx.saveSettings(undefined, { ignoreFiles: ['src/*.md'] })).success, false)
+  assert.equal(ctx.files.get(windows.settingsPath), before)
+  assert.equal((await ctx.saveSettings(undefined, { ignoreFiles: [] })).success, true)
+  assert.deepEqual(parseKiroSettingsObject(ctx.files.get(windows.settingsPath)), {
+    other: true, 'kiroAgent.workflows.enabled': true, 'kiroAgent.agentIgnoreFiles': []
+  })
 })

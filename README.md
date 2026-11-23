@@ -4,7 +4,7 @@ Kiro 账户管理桌面应用，用于管理账户、分组和标签，导入、
 
 [正式版下载](https://github.com/rw0104/kiroaccout/releases/latest) · [全部版本](https://github.com/rw0104/kiroaccout/releases) · [源码与问题反馈](https://github.com/rw0104/kiroaccout)
 
-当前源码目标为 **1.10.7 · Windows / macOS / Linux**，发布状态及附件以 Releases 为准。macOS / Linux 请手动下载安装和升级。升级前先备份原有资料。安装到其他目录或使用 ZIP 不会隔离账户管理器自身的数据，不要同时运行新旧管理器。
+当前源码目标为 **1.10.8 · Windows / macOS / Linux**，发布状态及附件以 Releases 为准。macOS / Linux 请手动下载安装和升级。升级前先备份原有资料。安装到其他目录或使用 ZIP 不会隔离账户管理器自身的数据，不要同时运行新旧管理器。
 
 账户迁移恢复：升级后若发现变化的旧版资料，可在恢复窗口选择“备份并使用现有安全库”。新旧资料会保留，旧文件中的新增账户或凭证不会自动合并；请保留整个数据目录与密钥供后续核对。
 
@@ -21,7 +21,7 @@ Kiro 账户管理桌面应用，用于管理账户、分组和标签，导入、
 - 导入 JSON：在“账户管理”导入文件，或在“添加账户 → OIDC 凭证 → 批量”粘贴凭证。
 - 导出 JSON：在“账户管理”或“设置 → 数据管理 → 导出”选择全部/选中账户、完整备份 JSON 或精简凭证 JSON。**默认不含登录凭证，只能恢复账户资料；要迁移登录信息，必须明确勾选“包含登录凭证”。** 含凭证文件为明文，请妥善保管。
 - 搜索支持邮箱、别名和原始导入账号名；旧账号可在“编辑账号 → 原始账号”中补充。
-- Kiro 设置：选择默认 IDE 或受管实例，配置 Memory 和 Workflows；会话使用频率在官方聊天面板中调整。
+- Kiro 设置：选择默认 IDE 或受管实例，配置 Workflows 和忽略规则文件。Kiro IDE 1.4.236 起，请在 IDE 的 Memories 侧栏点击齿轮更改记忆模式。
 - 工具自动批准：在“Kiro 设置 → 工具自动批准”中检查所选默认 IDE 或受管实例，主动点击“应用显式允许规则”后才写入；应用前备份，可在文件未被外部修改时恢复原配置。仅有 `permissions.json` 时保持只读，可导出 YAML 模板自行迁移。自动批准允许执行命令和修改文件，已有限制及内置保护仍可能要求确认；建议新建 Kiro 会话验证。
 
 显式允许规则与 Kiro 的 Approve for Me 不同：允许/询问/拒绝规则先匹配，未覆盖的操作才交给模型审核。请在官方聊天权限模式中启用 Approve for Me；管理器的此按钮不会替你启用该模式。
@@ -39,9 +39,9 @@ Kiro 账户管理桌面应用，用于管理账户、分组和标签，导入、
 
 若缓存丢失、过期或改登导致无法同步，可在停止实例后选择“恢复解绑”并确认。全部实例文件保留，原账户需重新授权，未核验凭证不会回写。
 
-[1.10.7 发布说明](docs/releases/v1.10.7.md)
+[1.10.8 发布说明](docs/releases/v1.10.8.md)
 
-macOS 提供 Intel / Apple Silicon 的 DMG 与 ZIP，Linux x64 提供 AppImage 与 DEB。macOS 安装包未签名及公证；macOS / Linux 尚未完成真实账户和桌面实机验收，多开仅支持 Windows。macOS / Linux 请手动升级。
+macOS 提供 Intel / Apple Silicon 的 DMG 与 ZIP，Linux x64 提供 AppImage 与 DEB。macOS 安装包使用临时签名（ad-hoc），没有 Developer ID 身份签名，也未经 Apple 公证；macOS / Linux 尚未完成真实账户和桌面实机验收，多开仅支持 Windows。macOS / Linux 请手动升级。
 
 账户绑定与轮换保护已做合成数据回归；双真实账户登录及刷新尚未完成验收，具体范围见发布说明。
 

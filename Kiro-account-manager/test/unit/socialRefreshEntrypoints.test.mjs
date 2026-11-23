@@ -36,7 +36,7 @@ const usage = { userInfo: { email: 'synthetic@example.invalid', userId: 'SYNTHET
   usageBreakdownList: [{ resourceType: 'CREDIT', currentUsage: 1, usageLimit: 50 }] }
 
 function fixture(entrypoint, { provider = 'Google', responseProfile = newProfile, activeIde = false,
-  queryFailure = false, existingProfile = oldProfile, needsTokenRefresh = true } = {}) {
+  historicalSwitch = false, queryFailure = false, existingProfile = oldProfile, needsTokenRefresh = true } = {}) {
   const social = ['Google', 'Github'].includes(provider)
   const queries = [], writes = [], events = [], refreshes = []
   const account = { id: 'SYNTHETIC_ACCOUNT', idp: provider, profileArn: existingProfile,
@@ -48,7 +48,7 @@ function fixture(entrypoint, { provider = 'Google', responseProfile = newProfile
     parseAccountUsage, normalizeSubscriptionType,
     console: { log() {}, warn() {}, error() {} }, proxyServer: null,
     instanceAccountOwnership: { assertAvailable() {}, isBound: () => false, beginOperation: () => () => {} },
-    poolRefreshInFlightIds: new Set(), lastSwitchedAccountId: undefined,
+    poolRefreshInFlightIds: new Set(), lastSwitchedAccountId: historicalSwitch ? account.id : undefined,
     lastWrittenTokenSignature: undefined, proactiveRenewalEnabled: false,
     scheduleProactiveRenewal: () => assert.fail('must not enable proactive renewal'),
     mainWindow: { webContents: { send: (name, value) => events.push({ name, value }) } },
@@ -57,9 +57,11 @@ function fixture(entrypoint, { provider = 'Google', responseProfile = newProfile
       return { success: true, accessToken: newAccess, refreshToken: newRefresh, expiresIn: 3600,
         ...(responseProfile === null ? {} : { profileArn: responseProfile }) }
     },
-    readKiroAuthTokenFile: async () => ({ refreshToken: activeIde ? oldRefresh : 'SYNTHETIC_OTHER_REFRESH', profileArn: oldProfile, provider }),
-    resolveProfileArnForWrite: input => input.profileArn,
-    writeKiroAuthTokenFile: async value => { writes.push(value) },
+    readMatchingKiroAuthToken: async () => activeIde ? { accessToken: oldAccess, refreshToken: oldRefresh, profileArn: oldProfile, provider } : null,
+    updateKiroAuthTokenFile: async (generation, rotation) => {
+      writes.push({ ...generation, ...rotation, profileArn: rotation.profileArn ?? generation.profileArn })
+      return true
+    },
     fetchEnterpriseProfileArn: async () => undefined,
     getUserInfo: async () => ({ status: 'Active', idp: provider }),
     getUsageAndLimits: async (...args) => {
@@ -168,4 +170,14 @@ test('background information-only checks do not refresh or invent new metadata',
   assert.equal(h.refreshes.length, 0)
   assert.equal(h.writes.length, 0)
   assert.notEqual(h.events.find(item => item.name === 'background-refresh-result').value.data.profileArn, newProfile)
+})
+
+
+test('delayed manual and background refresh cannot replace another IDE login using historical switch state', async () => {
+  for (const entrypoint of ['refresh-account-token', 'background']) {
+    const h = fixture(entrypoint, { historicalSwitch: true })
+    const result = await h.run()
+    assert.ok(result.success)
+    assert.equal(h.writes.length, 0, entrypoint)
+  }
 })

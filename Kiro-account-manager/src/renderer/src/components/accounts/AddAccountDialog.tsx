@@ -276,7 +276,9 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
         region: tokenData.region || 'us-east-1',
         authMethod: tokenData.authMethod,
         provider: tokenData.provider,
-        ...(attempt.kind === 'portal' ? { accessToken: tokenData.accessToken, expiresIn: tokenData.expiresIn, profileArn: tokenData.profileArn } : {})
+        accessToken: tokenData.accessToken,
+        expiresIn: tokenData.expiresIn,
+        profileArn: tokenData.profileArn
       })
 
       if (!isCurrentLogin(attempt)) return
@@ -308,7 +310,7 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
             clientSecretExpiresAt: tokenData.clientSecretExpiresAt,
             region: tokenData.region || 'us-east-1',
             startUrl: tokenData.startUrl,
-            expiresAt: attempt.kind === 'portal' && attempt.tokenExpiresAt ? attempt.tokenExpiresAt : result.data.expiresIn ? now + result.data.expiresIn * 1000 : now + 3600 * 1000,
+            expiresAt: attempt.tokenExpiresAt ?? now + (result.data.expiresIn || 3600) * 1000,
             authMethod: tokenData.authMethod as 'IdC' | 'social',
             provider: (tokenData.provider || 'BuilderId') as 'BuilderId' | 'Github' | 'Google',
             profileArn: result.data.profileArn || tokenData.profileArn
@@ -392,9 +394,11 @@ export function AddAccountDialog({ isOpen, onClose }: AddAccountDialogProps): Re
           if (!result.accessToken || !result.refreshToken) {
             setError('授权响应不完整，请重新开始')
           } else {
+            if (result.expiresIn && result.expiresIn > 0) {
+              attempt.tokenExpiresAt = Date.now() + result.expiresIn * 1000
+            }
             if (attempt.kind === 'portal') {
               attempt.pendingTokenData = { ...result, expiresIn: result.expiresIn }
-              attempt.tokenExpiresAt = Date.now() + (result.expiresIn || 0) * 1000
               if (attempt.expiryTimer) clearTimeout(attempt.expiryTimer)
             }
             await handleLoginSuccess(attempt, {

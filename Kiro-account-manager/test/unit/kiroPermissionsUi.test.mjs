@@ -88,7 +88,7 @@ function harness(overrides = {}) {
     },
     getKiroSettings: async target => {
       calls.getSettings.push(clean(target))
-      return { settings: {} }
+      return { settings: {}, memoryLocation: 'settings-file' }
     },
     getKiroAvailableModels: async () => ({ models: [{ id: 'auto', name: 'Auto', description: '' }] }),
     saveKiroSettings: async (patch, target) => {

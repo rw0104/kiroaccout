@@ -96,6 +96,7 @@ function mainHarness(registrationExpiry = expiry) {
     },
     getUserInfo: async () => ({ email: 'synthetic@example.invalid', userId: 'synthetic-user' }),
     getUsageAndLimits: async () => usage,
+    fetchEnterpriseProfileArn: async () => undefined,
     refreshTokenByMethod: async (...args) => {
       refreshes.push(args)
       return {
@@ -176,6 +177,7 @@ function dialogHarness(component, api, account) {
   const states = [],
     refs = [],
     effects = [],
+    polls = [],
     added = [],
     updated = []
   let stateIndex = 0,
@@ -220,7 +222,7 @@ function dialogHarness(component, api, account) {
   }
   const returnHandlers =
     component === 'AddAccountDialog'
-      ? 'return { handleSsoImport, handleImportFromLocal, handleOidcAdd };\n  if (!isOpen) return null'
+      ? 'return { handleSsoImport, handleImportFromLocal, handleOidcAdd, handleStartBuilderIdLogin, handleStartIamSsoLogin };\n  if (!isOpen) return null'
       : 'return { handleImportFromLocal, handleVerifyAndRefresh, handleSave };\n  if (!open || !account) return null'
   const code = source(file).replace(
     component === 'AddAccountDialog'
@@ -233,10 +235,11 @@ function dialogHarness(component, api, account) {
     exports,
     window: { api },
     Date: Clock,
+    crypto: { randomUUID: () => 'login-attempt' },
     console: { log() {}, error() {} },
     AbortController,
-    setTimeout(run) {
-      queueMicrotask(run)
+    setTimeout(run, delay) {
+      if (delay < 600000) queueMicrotask(run)
       return 1
     },
     clearTimeout() {},
@@ -248,6 +251,10 @@ function dialogHarness(component, api, account) {
       if (name.includes('shared/accountImport'))
         return { parseAccountImportText: () => ({ ok: false }) }
       if (name.includes('shared/accountSearch')) return { mergeSourceAccountNames }
+      if (name === '@/lib/loginPolling') return { startSerialLoginPolling(options) {
+        polls.push(options)
+        return () => {}
+      } }
       return {}
     }
   })
@@ -270,6 +277,7 @@ function dialogHarness(component, api, account) {
     set,
     added,
     updated,
+    polls,
     runEffects() {
       for (const effect of effects.splice(0)) effect()
     }
@@ -286,6 +294,38 @@ const local = {
   authMethod: 'IdC',
   provider: 'BuilderId'
 }
+
+test('direct Builder and IAM verification use the issued access token and preserve both deadlines without a refresh', async () => {
+  for (const provider of ['BuilderId', 'Enterprise']) {
+    const main = mainHarness()
+    const api = {
+      startBuilderIdLogin: async (_region, sessionId) => ({
+        success: true, sessionId, userCode: 'SYNTHETIC', verificationUri: 'https://example.invalid/'
+      }),
+      startIamSsoLogin: async (_url, _region, sessionId) => ({
+        success: true, sessionId, authorizeUrl: 'https://example.invalid/'
+      }),
+      cancelBuilderIdLogin: async () => {}, cancelIamSsoLogin: async () => {}, openExternal() {},
+      verifyAccountCredentials: preloadMethod('verifyAccountCredentials', (_, input) => main.verify(input))
+    }
+    const dialog = dialogHarness('AddAccountDialog', api)
+    dialog.render()
+    dialog.set('ssoStartUrl', 'https://example.invalid/start')
+    const actions = dialog.render()
+    if (provider === 'BuilderId') await actions.handleStartBuilderIdLogin()
+    else await actions.handleStartIamSsoLogin()
+    await dialog.polls[0].onResult({
+      ...local, success: true, completed: true, sessionId: 'login-attempt',
+      provider, accessToken: 'SYNTHETIC_ISSUED_ACCESS', expiresIn: 120
+    })
+    assert.equal(main.refreshes.length, 0)
+    const account = dialog.added[0]
+    assert.equal(account.idp, provider)
+    assert.equal(account.credentials.accessToken, 'SYNTHETIC_ISSUED_ACCESS')
+    assert.equal(account.credentials.expiresAt, now + 120000)
+    assert.equal(account.credentials.clientSecretExpiresAt, expiry)
+  }
+})
 
 test('real registration response retains its deadline through SSO IPC, preload and the actual add-account handler', async () => {
   const main = mainHarness()

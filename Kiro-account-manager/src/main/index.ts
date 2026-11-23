@@ -19,6 +19,11 @@ import {
 import { fetchKiroModels, fetchSubscriptionToken, fetchAvailableSubscriptions, setUserPreference, setUseKProxyForApiInProxy, setLogStreamEvents, setPayloadSizeLimitKB, setTokenBufferReserve, setEnableTokenBufferReserve, callKiroApi, fetchEnterpriseProfileArn, setProfileArnPersistCallback, setAgentMode } from './proxy/kiroApi'
 import {
   writeKiroAuthTokenFile,
+  readMatchingKiroAuthToken,
+  readKiroWatcherRegistration,
+  computeClientIdHash,
+  type KiroAuthTokenFile,
+  updateKiroAuthTokenFile,
   validateKiroClientRegistration,
   readKiroAuthTokenFile,
   parseAccessTokenClaims,
@@ -34,7 +39,7 @@ import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
 import { createWindowsKiroInstanceService, KiroInstanceError } from './kiroInstances'
 import { createWindowsKiroRuntime } from './kiroInstanceWindows'
 import { createWindowsKiroInstallationDiscovery } from './kiroInstanceDiscovery'
-import { readKiroSettingsDocument, updateKiroSettingsDocument, parseKiroSettingsObject, resolveKiroSettingsTarget, kiroSettingsFailure } from './kiroSettings'
+import { readKiroSettingsDocument, updateKiroSettingsDocument, parseKiroSettingsObject, resolveKiroSettingsTarget, kiroSettingsFailure, kiroMemoryLocation, shareKiroVersionInspection } from './kiroSettings'
 import { createSteeringFiles, steeringFileFailure } from './steeringFiles'
 import { requireTrustedMainWindow } from './trustedIpc'
 import { isMcpCommandServer, type KiroSettingsTarget, type McpCommandServer } from '../shared/kiroSettings'
@@ -1611,131 +1616,77 @@ async function initStore(): Promise<void> {
 //   - 把新 access/refresh/expiresAt 同步回反代 store
 //   - 通过 webContents.send 通知 renderer 重新 loadAccounts，UI 立刻刷新
 //
-// 账号匹配优先级（任一命中即视为同一账号）：
-//   1) accessToken JWT 解 sub，与反代 store 里某账号 cached accessToken claims 的 sub 一致
-//   2) lastSwitchedAccountId（反代刚 switch-account 过的那一个）
-//   3) refreshToken 旧值匹配（IDE 第一次自刷新前，磁盘 refresh 还等于 store 里的）
+// 仅回写能通过凭证或同一签发方的账户身份唯一匹配的记录。
 let stopKiroAuthTokenWatcher: (() => void) | null = null
 
 function startKiroAuthTokenWatcher(): void {
   if (stopKiroAuthTokenWatcher) return
-  stopKiroAuthTokenWatcher = watchKiroAuthTokenFile(async (token) => {
-    const sig = `${token.accessToken}|${token.refreshToken}`
-    if (sig === lastWrittenTokenSignature) {
-      // 反代自己刚写的，跳过避免回环
-      return
-    }
-    if (sig === lastSyncedFromIdeSignature) {
-      // 之前一次 IDE 同步已处理过这份内容，跳过
-      return
-    }
-    lastSyncedFromIdeSignature = sig
-    try {
-      await syncIdeTokenChangeToStore(token)
-    } catch (e) {
-      console.warn('[KiroAuthSync] syncIdeTokenChangeToStore failed:', e)
-    }
+  stopKiroAuthTokenWatcher = watchKiroAuthTokenFile(async (token, previous) => {
+    if (`${token.accessToken}|${token.refreshToken}` === lastWrittenTokenSignature) return
+    await syncIdeTokenChangeToStore(token, previous)
   })
   console.log('[KiroAuthSync] Watching:', KIRO_AUTH_TOKEN_PATH)
 }
 
-async function syncIdeTokenChangeToStore(token: {
-  accessToken: string
-  refreshToken: string
-  expiresAt: string
-  provider?: string
-  authMethod?: string
-  region?: string
-  profileArn?: string
-}): Promise<void> {
-  if (!store) {
-    try {
-      await initStore()
-    } catch (e) {
-      console.warn('[KiroAuthSync] initStore failed, cannot sync back:', e)
-      return
-    }
-  }
-  const accountData = store?.get('accountData') as
-    | { accounts?: Record<string, { id?: string; email?: string; credentials?: { accessToken?: string; refreshToken?: string; expiresAt?: number } }> }
-    | null
-    | undefined
-  if (!accountData?.accounts) {
-    console.log('[KiroAuthSync] No accounts in store, skip')
-    return
-  }
+async function syncIdeTokenChangeToStore(token: KiroAuthTokenFile, previous: KiroAuthTokenFile): Promise<void> {
+  if (!store) await initStore()
+  if (!store || typeof token.accessToken !== 'string' || !token.accessToken.trim() ||
+      typeof token.refreshToken !== 'string' || !token.refreshToken.trim() || typeof token.expiresAt !== 'string') return
+  const expiresAt = Date.parse(token.expiresAt)
+  if (!Number.isFinite(expiresAt) || expiresAt <= 0) return
+  const identity = resolveIdentity(token)
+  const before = resolveIdentity(previous)
+  if (!identity.ok || !before.ok || identity.provider !== before.provider) return
 
-  // 1) JWT sub 匹配（最准）
-  const newClaims = parseAccessTokenClaims(token.accessToken)
-  let matchedId: string | null = null
-  let matchedReason = ''
-  if (newClaims?.sub) {
-    for (const [id, acc] of Object.entries(accountData.accounts)) {
-      const oldClaims = acc.credentials?.accessToken
-        ? parseAccessTokenClaims(acc.credentials.accessToken)
-        : null
-      if (oldClaims?.sub && oldClaims.sub === newClaims.sub) {
-        matchedId = id
-        matchedReason = `JWT sub match (${newClaims.sub.slice(0, 12)}…)`
-        break
-      }
-    }
-  }
+  const claims = parseAccessTokenClaims(token.accessToken)
+  const oldClaims = parseAccessTokenClaims(previous.accessToken)
+  if (claims?.iss && oldClaims?.iss && claims.iss !== oldClaims.iss ||
+      claims?.sub && oldClaims?.sub && claims.sub !== oldClaims.sub ||
+      claims?.iat !== undefined && oldClaims?.iat !== undefined && claims.iat < oldClaims.iat) return
+  const overlap = token.refreshToken === previous.refreshToken || token.accessToken === previous.accessToken
+  if (!overlap && !(claims?.iss && claims.sub && claims.iss === oldClaims?.iss && claims.sub === oldClaims?.sub)) return
 
-  // 2) lastSwitchedAccountId 兜底
-  if (!matchedId && lastSwitchedAccountId && accountData.accounts[lastSwitchedAccountId]) {
-    matchedId = lastSwitchedAccountId
-    matchedReason = 'lastSwitchedAccountId fallback'
+  // A second OIDC login for the same subject can issue tokens under a different registration.
+  let registration: { clientId: string; clientSecret: string } | null = null
+  if (identity.authMethod === 'IdC' && token.refreshToken !== previous.refreshToken) {
+    if (!token.clientIdHash || previous.clientIdHash !== token.clientIdHash || !token.region ||
+        previous.region !== token.region || !/^[a-z]{2}(?:-[a-z]+){1,3}-[1-9]\d?$/.test(token.region)) return
+    registration = await readKiroWatcherRegistration(token.clientIdHash)
+    if (!registration) return
   }
+  // A sign-out, late notification or manager refresh may supersede this observation during I/O.
+  const disk = await readKiroAuthTokenFile()
+  if (!disk || disk.accessToken !== token.accessToken || disk.refreshToken !== token.refreshToken ||
+      disk.expiresAt !== token.expiresAt || disk.provider !== token.provider || disk.authMethod !== token.authMethod ||
+      disk.region !== token.region || disk.clientIdHash !== token.clientIdHash) return
+  const accountData = store.get('accountData') as {
+    accounts?: Record<string, { idp?: string; lastError?: string; credentials?: {
+      provider?: string; authMethod?: string; accessToken?: string; refreshToken?: string; expiresAt?: number
+      clientId?: string; clientSecret?: string; region?: string; startUrl?: string
+    } }>
+  } | undefined
+  if (!accountData?.accounts) return
+  const entries = Object.entries(accountData.accounts)
+  const matches = entries.filter(([, account]) => account.credentials?.accessToken === previous.accessToken &&
+    account.credentials?.refreshToken === previous.refreshToken)
+  if (matches.length !== 1) return
+  const [matchedId, account] = matches[0]
+  const stored = account.credentials!
+  const storedIdentity = resolveIdentity({ ...stored, idp: account.idp })
+  if (!storedIdentity.ok || storedIdentity.provider !== identity.provider ||
+      account.lastError === INSTANCE_ACCOUNT_REAUTH_REQUIRED ||
+      instanceAccountOwnership.isBound({ accountId: matchedId, accessToken: token.accessToken, refreshToken: token.refreshToken })) return
+  if (entries.some(([id, other]) => id !== matchedId && (other.credentials?.accessToken === token.accessToken ||
+      other.credentials?.refreshToken === token.refreshToken))) return
+  if (registration && (stored.clientId !== registration.clientId || stored.clientSecret !== registration.clientSecret ||
+      (stored.region || 'us-east-1') !== token.region || computeClientIdHash(stored.startUrl) !== token.clientIdHash)) return
 
-  // 3) 旧 refreshToken 匹配
-  if (!matchedId) {
-    for (const [id, acc] of Object.entries(accountData.accounts)) {
-      if (acc.credentials?.accessToken === token.accessToken) {
-        // store 和 disk access 完全一致，无需同步
-        return
-      }
-      if (acc.credentials?.refreshToken && acc.credentials.refreshToken === token.refreshToken) {
-        matchedId = id
-        matchedReason = 'refreshToken exact match (no rotation yet)'
-        break
-      }
-    }
-  }
-
-  if (!matchedId) {
-    console.warn(
-      '[KiroAuthSync] IDE token file changed but no matching account in store. ' +
-        'This usually means the user signed in directly inside Kiro IDE without going through 反代切号. ' +
-        'sub=',
-      newClaims?.sub
-    )
-    return
-  }
-
-  if (instanceAccountOwnership.isBound({ accountId: matchedId })) return
-  const accountToUpdate = accountData.accounts[matchedId]
-  if (!accountToUpdate) return
-  accountToUpdate.credentials = {
-    ...accountToUpdate.credentials,
-    accessToken: token.accessToken,
-    refreshToken: token.refreshToken,
-    expiresAt: Date.parse(token.expiresAt) || Date.now() + 3600 * 1000
-  }
-
-  store!.set('accountData', accountData)
-  console.log(
-    `[KiroAuthSync] Synced IDE-refreshed token back to account ${accountToUpdate.email || matchedId} (${matchedReason})`
-  )
-
-  try {
-    mainWindow?.webContents.send('kiro-ide-token-changed', {
-      accountId: matchedId,
-      reason: matchedReason
-    })
-  } catch (e) {
-    console.warn('[KiroAuthSync] failed to notify renderer:', e)
-  }
+  const credentials = { ...stored, accessToken: token.accessToken, refreshToken: token.refreshToken, expiresAt }
+  const updated = { ...accountData, accounts: { ...accountData.accounts, [matchedId]: { ...account, credentials } } }
+  store.set('accountData', updated)
+  pendingStoreWrites.delete('accountData')
+  lastSavedData = updated
+  mainWindow?.webContents.send('kiro-ide-token-changed', { accountId: matchedId, reason: 'ide-token-rotation' })
 }
 
 // ============ 主动续期实现 ============
@@ -1814,8 +1765,10 @@ async function runUnboundProactiveRenewal(accountId: string): Promise<void> {
     console.log(`[ProactiveRenewal] Account ${accountId} has no refreshToken, stop`)
     return
   }
+  const ideToken = await readMatchingKiroAuthToken(creds)
+  if (!ideToken) return
   console.log(
-    `[ProactiveRenewal] Renewing token for IDE active account ${account.email || accountId}...`
+    '[ProactiveRenewal] 正在续期当前 IDE 账户'
   )
   let refreshResult
   try {
@@ -1843,67 +1796,32 @@ async function runUnboundProactiveRenewal(accountId: string): Promise<void> {
   const expiresIn = refreshResult.expiresIn ?? 3600
   const newExpiresAt = Date.now() + expiresIn * 1000
 
-  const resolvedProfileArn = resolveProfileArnForWrite({
-    profileArn: account.profileArn,
-    authMethod: creds.authMethod,
-    provider: creds.provider,
-    region: creds.region
-  })
-
-  // 1. 写磁盘（同步给 IDE）
+  // The timer has no IPC caller to save a rotation if the first local commit failed.
+  if (refreshResult.persistenceError && store) {
+    try {
+      const rotation = applyManagerTokenRotation(store.get('accountData'), creds.refreshToken, refreshResult)
+      if (rotation.updates.length) {
+        store.set('accountData', rotation.data)
+        pendingStoreWrites.delete('accountData')
+        lastSavedData = rotation.data
+      }
+    } catch {
+      console.warn('[ProactiveRenewal] 账户凭证保存失败')
+    }
+  }
+  // A delayed timer must not replace a newer store snapshot or restart a superseded timer.
   try {
-    await writeKiroAuthTokenFile({
-      accessToken: newAccess,
-      refreshToken: newRefresh,
-      expiresAtIso: new Date(newExpiresAt).toISOString(),
-      authMethod: (creds.authMethod === 'social' ? 'social' : 'IdC'),
-      provider: creds.provider || 'BuilderId',
-      region: creds.region,
-      startUrl: creds.startUrl,
-      clientId: creds.clientId || undefined,
-      clientSecret: creds.clientSecret || undefined,
-      clientSecretExpiresAt: creds.clientSecretExpiresAt,
-      profileArn: resolvedProfileArn
+    const synced = await updateKiroAuthTokenFile(ideToken, {
+      accessToken: newAccess, refreshToken: newRefresh, expiresAt: new Date(newExpiresAt).toISOString(),
+      profileArn: creds.authMethod === 'social' ? refreshResult.profileArn : undefined
     })
+    if (!synced) return
     lastWrittenTokenSignature = `${newAccess}|${newRefresh}`
     lastSwitchedAccountId = accountId
-  } catch (e) {
-    console.warn('[ProactiveRenewal] Failed to write IDE token file (will still try store sync):', e)
-  }
-
-  // 2. 写 store（同步反代/UI）
-  if (store) {
-    const current = store.get('accountData') as typeof accountData
-    const currentAccount = current?.accounts?.[accountId]
-    if (!current?.accounts || !currentAccount) return
-    const credentials = {
-      ...creds,
-      accessToken: newAccess,
-      refreshToken: newRefresh,
-      expiresAt: newExpiresAt
-    }
-    const updated = { ...current, accounts: { ...current.accounts, [accountId]: { ...currentAccount, credentials } } }
-    store.set('accountData', updated)
-    lastSavedData = updated
-  }
-
-  // 3. 通知 renderer reload
-  try {
-    mainWindow?.webContents.send('kiro-ide-token-changed', {
-      accountId,
-      reason: 'proactive-renewal'
-    })
+    scheduleProactiveRenewal(accountId, newExpiresAt)
   } catch {
-    /* renderer 可能已关闭 */
+    console.warn('[ProactiveRenewal] IDE 凭证同步失败，已停止该次续期调度')
   }
-
-  console.log(
-    `[ProactiveRenewal] Renewed OK for ${account.email || accountId}. ` +
-      `Next renewal in ${expiresIn - PROACTIVE_RENEWAL_LEAD_MS / 1000}s`
-  )
-
-  // 4. 调度下一次
-  scheduleProactiveRenewal(accountId, newExpiresAt)
 }
 
 /**
@@ -2005,13 +1923,11 @@ let mainWindow: BrowserWindow | null = null
 let mainWindowVisibility: ReturnType<typeof trackWindowVisibility> | null = null
 
 // ============ Kiro IDE Auth 同步状态 ============
-// 账号管理器上一次写入 kiro-auth-token.json 时对应的 accountId，watcher 反向同步时优先用它
+// 最近主动切换的账户，用于安排续期定时器。
 let lastSwitchedAccountId: string | null = null
 // 账号管理器上一次写入时的 token 签名（access|refresh）。
 // watcher 触发时若签名一致，说明是账号管理器自己写的，跳过反向同步，避免回环。
 let lastWrittenTokenSignature: string | null = null
-// 上一次反向同步成功时刷写过的 store 数据签名，用于 dedupe webContents.send
-let lastSyncedFromIdeSignature: string | null = null
 
 // ============ 主动续期（Proactive Token Renewal） ============
 // 思路：在 Kiro IDE 内部 refresh loop 触发之前（token 剩 10 分钟时）抢先 refresh，
@@ -2706,56 +2622,57 @@ app.whenReady().then(async () => {
       return result.canceled ? null : result.filePaths[0] || null
     }
   })
+  const inspectKiroSettingsVersion = shareKiroVersionInspection(async target => {
+    try {
+      if (target.type === 'instance' && target.instanceId) {
+        await initStore()
+        const records = store?.get('kiroInstances')
+        const record = Array.isArray(records)
+          ? records.find(row => row?.schemaVersion === 2 && row.id === target.instanceId && typeof row.executablePath === 'string')
+          : undefined
+        if (!record?.executablePath) return undefined
+        const info = await kiroInstanceRuntime.inspectInstallation(record.executablePath)
+        return info.version
+      }
+      if (process.platform === 'win32') {
+        const discovery = await kiroInstallationDiscovery.discover()
+        // Discovery already ranks verified running, registry and common-path installations.
+        return discovery.candidates[0]?.version
+      }
+      const productCandidates = process.platform === 'darwin'
+        ? [
+            '/Applications/Kiro.app/Contents/Resources/app/product.json',
+            join(os.homedir(), 'Applications/Kiro.app/Contents/Resources/app/product.json')
+          ]
+        : [
+            '/usr/share/kiro/resources/app/product.json',
+            '/opt/Kiro/resources/app/product.json',
+            '/opt/kiro/resources/app/product.json'
+          ]
+      const fsPromises = await import('fs/promises')
+      for (const candidate of productCandidates) {
+        try {
+          const stat = await fsPromises.lstat(candidate)
+          if (stat.isSymbolicLink() || !stat.isFile()) continue
+          const raw = await fsPromises.readFile(candidate, 'utf-8')
+          const parsed = JSON.parse(raw) as { version?: unknown }
+          if (typeof parsed.version === 'string' && parsed.version.trim()) return parsed.version.trim()
+        } catch {
+          // Ignore missing or unreadable candidate
+        }
+      }
+      return undefined
+    } catch {
+      return undefined
+    }
+  })
   const kiroPermissionsService = new KiroPermissionsService({
     platform: process.platform,
     homeDir: os.homedir(),
     env: process.env,
     backupRoot: join(app.getPath('userData'), 'kiro-permissions-backups'),
     resolveInstance: id => kiroInstanceService.resolveSettingsTarget(id),
-    inspectVersion: async target => {
-      try {
-        if (target.type === 'instance' && target.instanceId) {
-          await initStore()
-          const records = store?.get('kiroInstances')
-          const record = Array.isArray(records)
-            ? records.find(row => row?.schemaVersion === 2 && row.id === target.instanceId && typeof row.executablePath === 'string')
-            : undefined
-          if (!record?.executablePath) return undefined
-          const info = await kiroInstanceRuntime.inspectInstallation(record.executablePath)
-          return info.version
-        }
-        if (process.platform === 'win32') {
-          const discovery = await kiroInstallationDiscovery.discover()
-          // Discovery already ranks verified running, registry and common-path installations.
-          return discovery.candidates[0]?.version
-        }
-        const productCandidates = process.platform === 'darwin'
-          ? [
-              '/Applications/Kiro.app/Contents/Resources/app/product.json',
-              join(os.homedir(), 'Applications/Kiro.app/Contents/Resources/app/product.json')
-            ]
-          : [
-              '/usr/share/kiro/resources/app/product.json',
-              '/opt/Kiro/resources/app/product.json',
-              '/opt/kiro/resources/app/product.json'
-            ]
-        const fsPromises = await import('fs/promises')
-        for (const candidate of productCandidates) {
-          try {
-            const stat = await fsPromises.lstat(candidate)
-            if (stat.isSymbolicLink() || !stat.isFile()) continue
-            const raw = await fsPromises.readFile(candidate, 'utf-8')
-            const parsed = JSON.parse(raw) as { version?: unknown }
-            if (typeof parsed.version === 'string' && parsed.version.trim()) return parsed.version.trim()
-          } catch {
-            // Ignore missing or unreadable candidate
-          }
-        }
-        return undefined
-      } catch {
-        return undefined
-      }
-    },
+    inspectVersion: inspectKiroSettingsVersion,
     chooseExportPath: async () => {
       if (!mainWindow || mainWindow.isDestroyed()) return null
       const result = await dialog.showSaveDialog(mainWindow, {
@@ -3191,7 +3108,7 @@ app.whenReady().then(async () => {
   registerUnboundAccountHandler('refresh-account-token', async (_event, account) => {
     try {
       instanceAccountOwnership.assertAvailable({ accountId: account.id, ...account.credentials })
-      const { refreshToken, clientId, clientSecret, region, authMethod, startUrl, provider } = account.credentials || {}
+      const { refreshToken, clientId, clientSecret, region, authMethod, provider } = account.credentials || {}
 
       if (!refreshToken) {
         return { success: false, error: { message: '缺少 Refresh Token' } }
@@ -3210,6 +3127,7 @@ app.whenReady().then(async () => {
       console.log(`[IPC] Refreshing token (authMethod: ${authMethod || 'IdC'})...${boundProxyUrl ? ' [via bound proxy]' : ''}`)
 
       // 根据 authMethod 选择刷新方式（透传账号绑定代理）
+      const ideToken = await readMatchingKiroAuthToken(account.credentials)
       const refreshResult = await refreshTokenByMethod(
         refreshToken,
         clientId || '',
@@ -3229,54 +3147,25 @@ app.whenReady().then(async () => {
       const expiresIn = refreshResult.expiresIn ?? 3600
       const refreshedSocialProfileArn = authMethod === 'social' ? refreshResult.profileArn : undefined
 
-      // bug B 修复：仅当该账号是 Kiro IDE 当前激活账号时，同步写入磁盘 token 文件
-      // 判定优先级（任一命中即视为"是当前激活账号"）：
-      //   1) 磁盘 token 的 refreshToken === renderer 传入的 account.credentials.refreshToken（最准）
-      //   2) account.id === lastSwitchedAccountId（反代刚切过号的兜底）
-      // 不同步的场景：用户在反代里刷新的是"非当前激活账号"，避免误覆盖 IDE 当前账号
       let syncedToIde = false
       let syncSkipReason: string | undefined
       try {
-        const diskToken = await readKiroAuthTokenFile()
-        const matchByRefresh = !!diskToken && diskToken.refreshToken === refreshToken
-        const matchByLastSwitch = !!account.id && lastSwitchedAccountId === account.id
-        if (matchByRefresh || matchByLastSwitch) {
-          const resolvedProfileArn = resolveProfileArnForWrite({
-            profileArn: refreshedSocialProfileArn || account.profileArn || account.credentials?.profileArn,
-            authMethod,
-            provider,
-            region
+        const expiresAt = Date.now() + expiresIn * 1000
+        if (ideToken) {
+          syncedToIde = await updateKiroAuthTokenFile(ideToken, {
+            accessToken: newAccess, refreshToken: newRefresh, expiresAt: new Date(expiresAt).toISOString(),
+            profileArn: refreshedSocialProfileArn
           })
-          await writeKiroAuthTokenFile({
-            accessToken: newAccess,
-            refreshToken: newRefresh,
-            expiresAtIso: new Date(Date.now() + expiresIn * 1000).toISOString(),
-            authMethod: (authMethod === 'social' ? 'social' : 'IdC'),
-            provider: provider || (diskToken?.provider as string | undefined) || 'BuilderId',
-            region: region || diskToken?.region,
-            startUrl,
-            clientId: clientId || undefined,
-            clientSecret: clientSecret || undefined,
-            clientSecretExpiresAt: account.credentials?.clientSecretExpiresAt,
-            profileArn: resolvedProfileArn
-          })
-          // 记录刚写入的签名，避免 watcher 触发反向同步回环
+        }
+        if (syncedToIde) {
           lastWrittenTokenSignature = `${newAccess}|${newRefresh}`
           if (account.id) lastSwitchedAccountId = account.id
-          syncedToIde = true
-          console.log(`[Refresh] Synced refreshed token to Kiro IDE for account ${account.email || account.id}`)
-          // 重新 schedule 主动续期 timer（基于新 expiresAt，覆盖任何旧 timer）
-          if (proactiveRenewalEnabled && account.id) {
-            scheduleProactiveRenewal(account.id, Date.now() + expiresIn * 1000)
-          }
+          if (proactiveRenewalEnabled && account.id) scheduleProactiveRenewal(account.id, expiresAt)
         } else {
-          syncSkipReason = diskToken
-            ? '该账号不是 Kiro IDE 当前激活账号，跳过磁盘同步'
-            : '磁盘上未找到 kiro-auth-token.json（IDE 未登录），跳过磁盘同步'
+          syncSkipReason = '当前 IDE 未使用本次刷新的凭证，已跳过磁盘同步'
         }
-      } catch (e) {
-        syncSkipReason = `磁盘同步异常：${e instanceof Error ? e.message : String(e)}`
-        console.warn('[Refresh] Failed to sync token to IDE:', e)
+      } catch {
+        syncSkipReason = 'IDE 凭证文件同步失败'
       }
 
       // 刷新后自动获取 profileArn（仅 Enterprise 需要调 API，其他类型不调）
@@ -3859,6 +3748,7 @@ app.whenReady().then(async () => {
               }
 
               // 刷新 Token（透传账号绑定代理）
+              const ideToken = await readMatchingKiroAuthToken(account.credentials)
               const refreshResult = await refreshTokenByMethod(
                 refreshToken,
                 clientId || '',
@@ -3888,43 +3778,20 @@ app.whenReady().then(async () => {
               newExpiresIn = refreshResult.expiresIn
               refreshedSocialProfileArn = authMethod === 'social' ? refreshResult.profileArn : undefined
 
-              // 仅当该账号是 Kiro IDE 当前激活账号时，同步新 token 到磁盘 token 文件。
-              // 否则 IDE 在 ~50min 后会用磁盘上"被自动刷新作废"的旧 refreshToken 调 OIDC → 401 → logoutAndForget。
-              // 判定优先级（任一命中）：1) 磁盘 refresh 匹配账号  2) lastSwitchedAccountId 匹配
-              if (newAccessToken && newRefreshToken && newExpiresIn) {
+              if (ideToken && newAccessToken && newRefreshToken && newExpiresIn) {
+                const expiresAt = Date.now() + newExpiresIn * 1000
                 try {
-                  const diskToken = await readKiroAuthTokenFile()
-                  const matchByRefresh = !!diskToken && diskToken.refreshToken === refreshToken
-                  const matchByLastSwitch = lastSwitchedAccountId === account.id
-                  if (matchByRefresh || matchByLastSwitch) {
-                    const resolvedProfileArn = resolveProfileArnForWrite({
-                      profileArn: refreshedSocialProfileArn || diskToken?.profileArn,
-                      authMethod,
-                      provider,
-                      region
-                    })
-                    await writeKiroAuthTokenFile({
-                      accessToken: newAccessToken,
-                      refreshToken: newRefreshToken,
-                      expiresAtIso: new Date(Date.now() + newExpiresIn * 1000).toISOString(),
-                      authMethod: (authMethod === 'social' ? 'social' : 'IdC'),
-                      provider: provider || (diskToken?.provider as string | undefined) || 'BuilderId',
-                      region: region || diskToken?.region,
-                      startUrl: account.credentials?.startUrl,
-                      clientId: clientId || undefined,
-                      clientSecret: clientSecret || undefined,
-                      clientSecretExpiresAt: account.credentials?.clientSecretExpiresAt,
-                      profileArn: resolvedProfileArn
-                    })
+                  const synced = await updateKiroAuthTokenFile(ideToken, {
+                    accessToken: newAccessToken, refreshToken: newRefreshToken,
+                    expiresAt: new Date(expiresAt).toISOString(), profileArn: refreshedSocialProfileArn
+                  })
+                  if (synced) {
                     lastWrittenTokenSignature = `${newAccessToken}|${newRefreshToken}`
-                    if (account.id) lastSwitchedAccountId = account.id
-                    console.log(`[BackgroundRefresh] Synced refreshed token to Kiro IDE for account ${account.id}`)
-                    if (proactiveRenewalEnabled && account.id) {
-                      scheduleProactiveRenewal(account.id, Date.now() + newExpiresIn * 1000)
-                    }
+                    lastSwitchedAccountId = account.id
+                    if (proactiveRenewalEnabled) scheduleProactiveRenewal(account.id, expiresAt)
                   }
-                } catch (e) {
-                  console.warn(`[BackgroundRefresh] sync to IDE failed for ${account.id}:`, e)
+                } catch {
+                  console.warn('[BackgroundRefresh] IDE 凭证文件同步失败')
                 }
               }
             }
@@ -4551,8 +4418,8 @@ app.whenReady().then(async () => {
       const { refreshToken, clientId = '', clientSecret = '', region, authMethod, provider } = normalized.credential
       const idp = provider
       
-      // Step 1: 使用合适的方式刷新获取 accessToken
-      console.log(`[Verify] Step 1: Refreshing token (authMethod: ${authMethod || 'IdC'})...`)
+      // A freshly completed login supplies the access token and its remaining lifetime.
+      console.log(`[Verify] Step 1: Resolving access token (authMethod: ${authMethod || 'IdC'})...`)
       const refreshResult: OidcRefreshResult = normalized.credential.accessToken && typeof credentials.expiresIn === 'number' && Number.isFinite(credentials.expiresIn) && credentials.expiresIn > 0
         ? { success: true, accessToken: normalized.credential.accessToken, refreshToken, expiresIn: credentials.expiresIn }
         : await refreshTokenByMethod(refreshToken, clientId, clientSecret, region, authMethod, undefined, normalized.credential.clientSecretExpiresAt)
@@ -4894,7 +4761,7 @@ app.whenReady().then(async () => {
   //   2. (bug C 修复) expiresAt 用 OIDC 返回的真实 expiresIn，不再硬编码 3600
   //   3. (bug D 修复) refresh 失败时直接报错并拒绝写入文件，避免埋雷
   //   4. (bug F 支持) 通过 refreshedCredentials 把新 refresh 回传 renderer，让反代 store 同步
-  //   5. 记录 lastSwitchedAccountId，供 fs.watch 反向同步时用作账号匹配兜底
+  //   5. 记录所选账户以安排主动续期。
   registerUnboundAccountHandler('switch-account', async (_event, credentials: {
     accessToken: string
     refreshToken: string
@@ -5009,7 +4876,7 @@ app.whenReady().then(async () => {
         console.log('[Switch Account] Client registration written to:', clientRegPath)
       }
 
-      // 记录 lastSwitchedAccountId（供 watcher 反向同步时识别 IDE 当前账号）
+      // 记录本次选择及写入内容，避免 watcher 回写同一代凭证。
       if (accountId) {
         lastSwitchedAccountId = accountId
         // 同步记录 access/refresh 的"信任源头"，避免 watcher 把刚写的同一份数据再回写一次
@@ -5247,6 +5114,7 @@ app.whenReady().then(async () => {
   const loginSessions = new LoginSessionManager({
     fetch: fetchWithAppProxy,
     authEndpoint: KIRO_AUTH_ENDPOINT,
+    getMachineId: getCurrentMachineId,
     openBrowser: (url, privateMode) => privateMode ? openBrowserInPrivateMode(url) : shell.openExternal(url),
     notifySocial: (callback) => {
       if (mainWindow && !mainWindow.isDestroyed()) {
@@ -5311,7 +5179,8 @@ app.whenReady().then(async () => {
       const target = { type: selected.type, instanceId: selected.instanceId, label: selected.label, settingsPath: kiroSettingsPath }
       const kiroMcpUserPath = path.join(homeDir, '.kiro', 'settings', 'mcp.json')
       
-      const settings = readKiroSettingsDocument(fs.existsSync(kiroSettingsPath) ? fs.readFileSync(kiroSettingsPath, 'utf-8') : '')
+      const memoryLocation = kiroMemoryLocation(await inspectKiroSettingsVersion(selected))
+      const settings = readKiroSettingsDocument(fs.existsSync(kiroSettingsPath) ? fs.readFileSync(kiroSettingsPath, 'utf-8') : '', memoryLocation)
       let mcpConfig = { mcpServers: {} }
       let steeringFiles: string[] = []
       
@@ -5325,7 +5194,7 @@ app.whenReady().then(async () => {
       // 读取 Steering 文件列表
       if (target.type === 'default') steeringFiles = createSteeringFiles(homeDir).list()
       
-      return { settings, mcpConfig, steeringFiles, target: { ...target, settingsPath: kiroSettingsPath } }
+      return { settings, memoryLocation, mcpConfig, steeringFiles, target: { ...target, settingsPath: kiroSettingsPath } }
     } catch (error) {
       return { error: kiroSettingsFailure(error) }
     }
@@ -5386,8 +5255,10 @@ app.whenReady().then(async () => {
         resolveInstance: id => kiroInstanceService.resolveSettingsTarget(id)
       })
       const kiroSettingsPath = selected.settingsPath
+      const memoryLocation = settings && Object.hasOwn(settings, 'memory')
+        ? kiroMemoryLocation(await inspectKiroSettingsVersion(selected)) : undefined
       const content = fs.existsSync(kiroSettingsPath) ? fs.readFileSync(kiroSettingsPath, 'utf-8') : ''
-      const updated = updateKiroSettingsDocument(content, settings)
+      const updated = updateKiroSettingsDocument(content, settings, memoryLocation)
       if (updated === content) return { success: true }
       
       // 确保目录存在

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { Card, CardContent, CardHeader, CardTitle, Button, Toggle, Select } from '../ui'
 import { useTranslation } from '@/hooks/useTranslation'
 import { SteeringEditor, McpServerEditor, KiroPermissionsSection } from '../kiro'
-import { isMcpCommandServer, type McpCommandServer, type KiroMemoryMode, type KiroSettingsTarget, type KiroSettingsTargetInfo } from '../../../../shared/kiroSettings'
+import { isMcpCommandServer, type McpCommandServer, type KiroMemoryLocation, type KiroMemoryMode, type KiroSettingsTarget, type KiroSettingsTargetInfo } from '../../../../shared/kiroSettings'
 import type { KiroPermissionsState } from '../../../../shared/kiroPermissions'
 import type { KiroManagedInstanceView } from '../../../../shared/kiroInstances'
 import { 
@@ -77,7 +77,7 @@ const defaultSettings: KiroSettings = {
   memory: 'off',
   workflowsEnabled: false,
   agentAutonomy: 'Autopilot',
-  modelSelection: 'auto',
+  modelSelection: '',
   enableDebugLogs: false,
   enableTabAutocomplete: false,
   enableCodebaseIndexing: false,
@@ -116,6 +116,7 @@ const mcpOptionsEn = [
 ]
 
 export function KiroSettingsPage() {
+  const [memoryLocation, setMemoryLocation] = useState<KiroMemoryLocation>('unknown')
   const [settings, setSettings] = useState<KiroSettings>(defaultSettings)
   const baselineRef = useRef<KiroSettings>(defaultSettings)
   const [targetValue, setTargetValue] = useState('default')
@@ -206,6 +207,7 @@ export function KiroSettingsPage() {
     targetRef.current = nextTarget
     setTargetValue(value)
     setLoaded(false)
+    setMemoryLocation('unknown')
     setLoading(true)
     setSaved(false)
     setError(null)
@@ -252,12 +254,14 @@ export function KiroSettingsPage() {
       const result = await window.api.getKiroSettings(target)
       if (requestId !== requestRef.current) return
       if (result.error || !result.settings) {
+        setMemoryLocation('unknown')
         setError(result.error || (isEn ? 'Failed to load Kiro settings' : '加载 Kiro 设置失败'))
         setSettings(defaultSettings)
         setMcpConfig({ mcpServers: {} })
         setSteeringFiles([])
         return
       }
+      setMemoryLocation(result.memoryLocation ?? 'unknown')
       {
         // 过滤掉 undefined 值，避免覆盖默认值
         const filteredSettings = Object.fromEntries(
@@ -442,7 +446,11 @@ export function KiroSettingsPage() {
     if (!loaded || loading || savingRef.current || !dirty) return
     const target = { ...targetRef.current }
     const requestId = requestRef.current
-    const patch = Object.fromEntries(Object.entries(settings).filter(([key, value]) =>
+    const nextSettings = { ...settings }
+    if (settings.ignoreFiles !== baselineRef.current.ignoreFiles) {
+      nextSettings.ignoreFiles = settings.ignoreFiles.filter(name => name.trim().length > 0)
+    }
+    const patch = Object.fromEntries(Object.entries(nextSettings).filter(([key, value]) =>
       JSON.stringify(value) !== JSON.stringify(baselineRef.current[key as keyof KiroSettings])
     ))
     savingRef.current = true
@@ -456,7 +464,8 @@ export function KiroSettingsPage() {
         setError(result.error || (isEn ? 'Failed to save settings' : '保存设置失败'))
         return
       }
-      baselineRef.current = { ...baselineRef.current, ...patch }
+      baselineRef.current = nextSettings
+      setSettings(nextSettings)
       setSaved(true)
     } catch {
       if (requestId === requestRef.current) setError(isEn ? 'Failed to save settings' : '保存设置失败')
@@ -719,24 +728,35 @@ export function KiroSettingsPage() {
             <fieldset disabled={loading || saving || !loaded} className="space-y-4 disabled:opacity-60">
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div className="flex-1 min-w-[220px]">
-                <label htmlFor="kiro-memory" className="font-medium">{isEn ? 'Memory' : '记忆'}</label>
-                <p id="kiro-memory-hint" className="text-sm text-muted-foreground mt-1">{isEn
-                  ? 'This setting applies to the selected IDE. The CLI has its own Memory setting. Start a new session when entering or leaving either the disabled or read-only mode. Changes between the two creation modes apply immediately to local sessions.'
-                  : '此设置适用于所选 IDE。CLI 有独立的记忆设置。启用或停用记忆、进入或退出只读模式后，请新建会话。在两种创建方式之间切换会立即应用到本地会话。'}</p>
-                <p className="text-sm text-muted-foreground mt-1">{isEn
-                  ? 'Cloud sync is managed separately in Kiro and may be limited by your organization.'
-                  : '云端同步在 Kiro 中单独管理，并可能受组织设置限制。'}</p>
+                <p className="font-medium">{isEn ? 'Memory' : '记忆'}</p>
+                <p id="kiro-memory-hint" className="text-sm text-muted-foreground mt-1">{memoryLocation === 'settings-file'
+                  ? (isEn
+                    ? 'Start a new session when turning Memory on or off or switching to or from read-only mode. Switching between the two creation modes applies immediately to local sessions.'
+                    : '启用或停用记忆、进入或退出只读模式后，请新建会话。在两种创建方式之间切换会立即应用到本地会话。')
+                  : memoryLocation === 'ide'
+                    ? (isEn
+                      ? 'In the selected Kiro IDE, open Memories in the activity bar and choose a level from the gear menu at the top of the sidebar.'
+                      : '在所选 Kiro IDE 的活动栏打开 Memories（记忆），点击侧栏顶部的齿轮，选择记忆模式。')
+                    : (isEn
+                      ? 'Open Memories in the selected Kiro IDE and use its settings gear. Older versions open the Kiro Agent: Memory setting.'
+                      : '请在所选 Kiro IDE 中打开 Memories（记忆）并点击设置齿轮。较早版本会打开 Kiro Agent: Memory 设置。')}</p>
+                {memoryLocation === 'settings-file' && <p className="text-sm text-muted-foreground mt-1">{isEn
+                  ? 'The CLI has its own Memory setting. Cloud sync is managed separately in Kiro and may be limited by your organization.'
+                  : 'CLI 的记忆设置独立管理。云同步可在 Kiro 中设置，并可能受组织限制。'}</p>}
                 <button type="button" className="text-sm text-primary hover:underline mt-1" onClick={() => window.api.openExternal('https://kiro.dev/docs/memory/')}>{isEn ? 'Memory guide' : '记忆使用说明'}</button>
               </div>
-              <Select
-                id="kiro-memory"
-                aria-describedby="kiro-memory-hint"
-                disabled={loading || saving || !loaded}
-                value={settings.memory}
-                options={memoryOptions}
-                onChange={value => setSettings(prev => ({ ...prev, memory: value as KiroMemoryMode }))}
-                className="w-[240px]"
-              />
+              {memoryLocation === 'settings-file' && (
+                <Select
+                  id="kiro-memory"
+                  aria-label={isEn ? 'Memory' : '记忆'}
+                  aria-describedby="kiro-memory-hint"
+                  disabled={loading || saving || !loaded}
+                  value={settings.memory}
+                  options={memoryOptions}
+                  onChange={value => setSettings(prev => ({ ...prev, memory: value as KiroMemoryMode }))}
+                  className="w-[240px]"
+                />
+              )}
             </div>
 
             <div className="space-y-2 border-t pt-4">
@@ -800,27 +820,34 @@ export function KiroSettingsPage() {
             {/* Model Selection */}
             <div className="flex items-center justify-between border-t pt-4">
               <div className="flex-1 mr-4">
-                <p className="font-medium">{isEn ? 'Model Selection' : '模型选择'}</p>
-                <p className="text-sm text-muted-foreground">{isEn ? 'Select model to use for agent operations.' : '选择 Agent 操作使用的模型'}</p>
+                <label htmlFor="kiro-session-model" className="font-medium">{isEn ? 'Initial session model' : '会话初始模型'}</label>
+                <p id="kiro-session-model-hint" className="text-sm text-muted-foreground">{isEn
+                  ? 'This file sets the initial model for new sessions until you choose one in Kiro. Use Default Session Model in Kiro settings for later sessions, or choose a model in an open chat.'
+                  : '此文件的初始模型用于尚未在 Kiro 中选择模型时的新会话。之后可在 Kiro 设置的 Default Session Model 中更改新会话默认值，也可在已打开的聊天中选择模型。'}</p>
               </div>
               <div className="flex items-center gap-2">
                 {availableModels.length > 0 ? (
                   <Select
+                    id="kiro-session-model"
+                    aria-describedby="kiro-session-model-hint"
                     value={settings.modelSelection}
-                    options={availableModels.map(m => ({
-                      value: m.id,
-                      label: m.name || m.id,
-                      description: m.description
-                    }))}
+                    options={[
+                      { value: '', label: isEn ? 'Use IDE default' : '使用 IDE 默认值' },
+                      ...(settings.modelSelection && !availableModels.some(m => m.id === settings.modelSelection)
+                        ? [{ value: settings.modelSelection, label: settings.modelSelection }] : []),
+                      ...availableModels.map(m => ({ value: m.id, label: m.name || m.id, description: m.description }))
+                    ]}
                     onChange={(value) => setSettings(prev => ({ ...prev, modelSelection: value }))}
                     className="w-[240px]"
                   />
                 ) : (
                   <input
                     type="text"
+                    id="kiro-session-model"
+                    aria-describedby="kiro-session-model-hint"
                     value={settings.modelSelection}
                     onChange={(e) => setSettings(prev => ({ ...prev, modelSelection: e.target.value }))}
-                    placeholder="claude-haiku-4.5"
+                    placeholder={isEn ? 'Use IDE default' : '使用 IDE 默认值'}
                     className="w-[240px] px-3 py-1.5 rounded-md border bg-background text-sm"
                   />
                 )}
@@ -834,6 +861,22 @@ export function KiroSettingsPage() {
                   <RefreshCw className={`h-4 w-4 ${loadingModels ? 'animate-spin' : ''}`} />
                 </Button>
               </div>
+            </div>
+
+            <div className="space-y-1 border-t pt-4">
+              <label htmlFor="kiro-ignore-files" className="font-medium">{isEn ? 'Ignore pattern files' : '忽略规则文件'}</label>
+              <p id="kiro-ignore-files-hint" className="text-sm text-muted-foreground">{isEn
+                ? 'Enter one workspace ignore filename per line, such as .gitignore. Clearing the list and saving sets this profile’s workspace ignore list to empty. Global ignore files apply separately.'
+                : '每行填写一个工作区忽略规则文件名，例如 .gitignore。清空后保存会将此用户配置中的工作区忽略列表设为空。全局忽略文件单独生效。'}</p>
+              <textarea
+                id="kiro-ignore-files"
+                aria-describedby="kiro-ignore-files-hint"
+                placeholder={isEn ? 'No filenames listed in this profile' : '此用户配置未列出文件名'}
+                value={settings.ignoreFiles.join('\n')}
+                onChange={event => setSettings(prev => ({ ...prev, ignoreFiles: event.target.value.split(/\r?\n/) }))}
+                rows={2}
+                className="w-full px-3 py-2 rounded-md border bg-background text-sm font-mono"
+              />
             </div>
 
             {/* Toggle Options */}

@@ -6,6 +6,7 @@ import { posix, win32, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import vm from 'node:vm'
 import { createSteeringFiles, steeringFileFailure, validateSteeringFilename } from '../../src/main/steeringFiles.ts'
+import { kiroMemoryLocation, readKiroSettingsDocument } from '../../src/main/kiroSettings.ts'
 import { requireTrustedMainWindow } from '../../src/main/trustedIpc.ts'
 
 const ts = createRequire(import.meta.url)('typescript')
@@ -58,7 +59,7 @@ function harness(fixture) {
   const context = vm.createContext({ handlers: {}, requireTrustedMainWindow, createSteeringFiles: home => createSteeringFiles(home, fs, fixture.path), steeringFileFailure,
     mainWindow: window, join, __dirname: dirname, is: { dev: false }, process: { env: {} },
     resolveKiroSettingsTarget: async () => ({ homeDir: fixture.home, type: 'default', settingsPath: fixture.path.join(fixture.home, 'settings.json') }),
-    readKiroSettingsDocument: () => ({}), parseKiroSettingsObject: () => ({}), kiroSettingsFailure: () => 'Cannot load settings',
+    inspectKiroSettingsVersion: async () => undefined, kiroMemoryLocation, readKiroSettingsDocument, parseKiroSettingsObject: () => ({}), kiroSettingsFailure: () => 'Cannot load settings',
     kiroInstanceService: {}, console: { log() {}, error() {} }, shell: { openPath: async () => { calls.push('open-shell'); return '' } },
     require: name => name === 'fs' ? fs : name === 'path' ? fixture.path : { homedir: () => fixture.home } })
   const code = [...handlers].map(([channel, handler]) => `handlers[${JSON.stringify(channel)}] = ${handler};`).join('\n')
@@ -84,7 +85,10 @@ for (const fixture of [{ platform: 'win32', path: win32, home: 'C:\\Synthetic\\h
     assert.equal((await h.invoke('open-kiro-steering-file', ['规则.md'])).success, true)
     assert.equal((await h.invoke('open-kiro-steering-folder')).success, true)
     assert.equal((await h.invoke('create-kiro-default-rules')).success, true)
-    assert.equal((await h.invoke('get-kiro-settings')).steeringFiles.length, 2)
+    const settings = await h.invoke('get-kiro-settings')
+    assert.equal(settings.memoryLocation, 'unknown')
+    assert.equal(settings.settings.workflowsEnabled, false)
+    assert.equal(settings.steeringFiles.length, 2)
     assert.equal((await h.invoke('delete-kiro-steering-file', ['规则.md'])).success, true)
     assert.equal((await h.invoke('read-kiro-steering-file', ['规则.md'])).success, false)
     assert.deepEqual(h.files.list(), ['rules.md'])

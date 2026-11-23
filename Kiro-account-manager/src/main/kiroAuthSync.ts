@@ -116,7 +116,7 @@ export interface WriteKiroAuthTokenResult extends KiroReconnectState {
   connectionPath?: string
 }
 
-function computeClientIdHash(startUrl?: string): string {
+export function computeClientIdHash(startUrl?: string): string {
   return crypto
     .createHash('sha1')
     .update(JSON.stringify({ startUrl: startUrl || KIRO_DEFAULT_START_URL }))
@@ -183,6 +183,55 @@ export async function writeKiroAuthTokenFile(
   return task
 }
 
+/** Read the exact IDE generation before starting a manager refresh. */
+export async function readMatchingKiroAuthToken(credentials: {
+  accessToken?: string; refreshToken?: string
+}): Promise<KiroAuthTokenFile | null> {
+  const current = await readKiroAuthTokenFile()
+  return current && current.accessToken === credentials.accessToken &&
+    current.refreshToken === credentials.refreshToken ? current : null
+}
+
+async function publishKiroToken(
+  data: object,
+  current: () => boolean | Promise<boolean>
+): Promise<boolean> {
+  const temporary = `${KIRO_AUTH_TOKEN_PATH}.${crypto.randomUUID()}.tmp`
+  try {
+    await fs.writeFile(temporary, JSON.stringify(data, null, 2), { flag: 'wx', mode: 0o600 })
+    for (let attempt = 1; ; attempt++) {
+      if (!await current()) return false
+      try {
+        await fs.rename(temporary, KIRO_AUTH_TOKEN_PATH)
+        return true
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (process.platform !== 'win32' || attempt >= 3 || (code !== 'EPERM' && code !== 'EACCES')) throw error
+        await new Promise(resolve => setTimeout(resolve, attempt * 10))
+      }
+    }
+  } finally {
+    await fs.unlink(temporary).catch(() => {})
+  }
+}
+
+/** A renewal updates only the observed login. Preserve the IDE's registration and reconnect hint. */
+export async function updateKiroAuthTokenFile(
+  expected: KiroAuthTokenFile,
+  rotation: Pick<KiroAuthTokenFile, 'accessToken' | 'refreshToken' | 'expiresAt' | 'profileArn'>
+): Promise<boolean> {
+  const unchanged = async (): Promise<boolean> => {
+    const disk = await readKiroAuthTokenFile()
+    return disk !== null && JSON.stringify(disk) === JSON.stringify(expected)
+  }
+  const task = cacheWriteQueue.then(async () => {
+    if (!await unchanged()) return false
+    return publishKiroToken({ ...expected, ...rotation, profileArn: rotation.profileArn ?? expected.profileArn }, unchanged)
+  })
+  cacheWriteQueue = task.then(() => undefined, () => undefined)
+  return task
+}
+
 async function writePreparedKiroAuthTokenFile(
   input: WriteKiroAuthTokenInput,
   registration: KiroClientRegistration | undefined,
@@ -231,16 +280,10 @@ async function writePreparedKiroAuthTokenFile(
       /* ignore */
     }
   }
-  assertCurrent?.()
-  await fs.writeFile(KIRO_AUTH_TOKEN_PATH, JSON.stringify(tokenData, null, 2), {
-    mode: 0o600
+  await publishKiroToken(tokenData, () => {
+    assertCurrent?.()
+    return true
   })
-  // Windows 上 chmod 对 0o600 是 no-op 但不抛错；Linux/macOS 上保证权限正确
-  try {
-    await fs.chmod(KIRO_AUTH_TOKEN_PATH, 0o600)
-  } catch {
-    /* ignore */
-  }
 
   let reconnectReady = false
   let connectionWarning: KiroReconnectState['connectionWarning']
@@ -280,12 +323,29 @@ export async function readKiroAuthTokenFile(): Promise<KiroAuthTokenFile | null>
   }
 }
 
+/** Compare the registration in this cache, never a path supplied by the token file. */
+export async function readKiroWatcherRegistration(hash: string) {
+  if (typeof hash !== 'string' || hash.length !== 40 || !/^[0-9a-f]{40}$/.test(hash)) return null
+  const file = path.join(KIRO_SSO_CACHE_DIR, hash + '.json')
+  try {
+    const stat = await fs.lstat(file)
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024) return null
+    const data: unknown = JSON.parse(await fs.readFile(file, 'utf8'))
+    if (!data || typeof data !== 'object' || !('clientId' in data) || !('clientSecret' in data) ||
+        typeof data.clientId !== 'string' || !data.clientId.trim() ||
+        typeof data.clientSecret !== 'string' || !data.clientSecret.trim()) return null
+    return { clientId: data.clientId, clientSecret: data.clientSecret }
+  } catch { return null }
+}
+
 /**
  * 解 accessToken 的 JWT 第二段（payload）拿 sub / email / aud / preferred_username。
  * - 如果不是 JWT 格式返回 null
  * - 不验证签名（只用于反向匹配账号）
  */
 export interface AccessTokenClaims {
+  iat?: number
+  iss?: string
   sub?: string
   email?: string
   aud?: string
@@ -309,7 +369,9 @@ export function parseAccessTokenClaims(accessToken: string): AccessTokenClaims |
           ? (audRaw[0] as string)
           : undefined
     return {
-      sub: typeof claims.sub === 'string' ? (claims.sub as string) : undefined,
+      iat: typeof claims.iat === 'number' && Number.isFinite(claims.iat) ? claims.iat : undefined,
+      iss: typeof claims.iss === 'string' ? claims.iss : undefined,
+      sub: typeof claims.sub === 'string' ? claims.sub : undefined,
       email: typeof claims.email === 'string' ? (claims.email as string) : undefined,
       aud,
       preferredUsername:
@@ -328,40 +390,40 @@ export function parseAccessTokenClaims(accessToken: string): AccessTokenClaims |
  * - 内部做内容防抖（同一对 accessToken+refreshToken 不重复触发）
  * - 返回 dispose 函数
  */
-export type WatchCallback = (token: KiroAuthTokenFile) => void | Promise<void>
+export type WatchCallback = (token: KiroAuthTokenFile, previous: KiroAuthTokenFile) => void | Promise<void>
 
 export function watchKiroAuthTokenFile(onChange: WatchCallback, intervalMs = 2000): () => void {
   let debounceTimer: NodeJS.Timeout | null = null
-  let lastSeenSig = ''
+  let previous: KiroAuthTokenFile | null = null
   let disposed = false
-
+  const retired = new Set<string>()
+  const fingerprint = (token: KiroAuthTokenFile): string => crypto.createHash('sha256')
+    .update(JSON.stringify([token.accessToken, token.refreshToken])).digest('hex')
+  // Serialize the baseline and notifications, including asynchronous registration checks.
+  let pending = readKiroAuthTokenFile().then(token => { previous = token })
   const tick = async (): Promise<void> => {
     if (disposed) return
-    try {
-      const token = await readKiroAuthTokenFile()
-      if (!token) return
-      const sig = `${token.accessToken}|${token.refreshToken}`
-      if (sig === lastSeenSig) return
-      lastSeenSig = sig
-      await onChange(token)
-    } catch (e) {
-      // 静默：watcher 不应该 throw 影响主进程
-      console.warn('[kiroAuthSync] watcher tick failed:', e)
+    const token = await readKiroAuthTokenFile()
+    if (disposed) return
+    if (previous && token && (token.accessToken !== previous.accessToken || token.refreshToken !== previous.refreshToken)) {
+      // A cache restored from a backup can have a later expiry than the current generation.
+      if (!retired.has(fingerprint(token))) await onChange(token, previous)
+      retired.add(fingerprint(previous))
+      if (retired.size > 256) retired.delete(retired.values().next().value!)
     }
+    // A logout or unreadable file breaks the chain of observed credentials.
+    previous = token
   }
 
   const listener = (): void => {
     if (debounceTimer) clearTimeout(debounceTimer)
     debounceTimer = setTimeout(() => {
       debounceTimer = null
-      void tick()
+      pending = pending.then(tick).catch(() => {
+        console.warn('[kiroAuthSync] 无法同步 IDE 凭证变更')
+      })
     }, 600)
   }
-
-  // 先做一次基线读，避免启动后第一次"虚假变更"
-  void readKiroAuthTokenFile().then((t) => {
-    if (t) lastSeenSig = `${t.accessToken}|${t.refreshToken}`
-  })
 
   fsSync.watchFile(KIRO_AUTH_TOKEN_PATH, { interval: intervalMs }, listener)
 
