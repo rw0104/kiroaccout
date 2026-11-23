@@ -83,7 +83,7 @@ export function AccountDetailDialog({
       window.api.accountGetModels(
         account.credentials.accessToken,
         account.credentials?.region,
-        account.profileArn,
+        account.profileArn || account.credentials.profileArn,
         account.machineId,
         account.credentials.provider || account.idp,
         account.credentials.authMethod,
@@ -103,7 +103,7 @@ export function AccountDetailDialog({
       setModelsLoading(false)
     }
     return () => { cancelled = true }
-  }, [open, account?.credentials?.accessToken, account?.credentials?.region, account?.profileArn, account?.machineId, account?.credentials?.provider, account?.idp, account?.credentials?.authMethod, account?.id])
+  }, [open, account?.credentials?.accessToken, account?.credentials?.region, account?.profileArn, account?.credentials?.profileArn, account?.machineId, account?.credentials?.provider, account?.idp, account?.credentials?.authMethod, account?.id])
 
   if (!open || !account) return null
 

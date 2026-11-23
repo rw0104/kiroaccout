@@ -66,7 +66,7 @@ import { assertCrewStopped } from './clientProcessGuard'
 import { registerClientModelRepairIpc } from './ipc/clientModelRepair'
 import type { ClientModelRepairState } from '../shared/clientModelRepair'
 import { trackWindowVisibility } from './windowVisibility'
-import { filterAvailableModels, toAccountModel } from '../shared/modelCatalog'
+import { toAccountModels } from '../shared/modelCatalog'
 import { KiroModelPreferencesService, ModelPreferencesError, type ModelPreferenceAccount } from './kiroModelPreferences'
 import type { ModelPreferencesWrite } from '../shared/modelPreferences'
 import { normalizeProvider, resolveIdentity } from '../shared/authIdentity'
@@ -5236,7 +5236,7 @@ app.whenReady().then(async () => {
 
       const models = await fetchKiroModels(proxyAccount)
       return {
-        models: filterAvailableModels(models).map(toAccountModel)
+        models: toAccountModels(models)
       }
     } catch {
       return { models: [], error: '无法读取所选账户的模型目录，请检查账户状态后重试。' }
@@ -6015,7 +6015,7 @@ app.whenReady().then(async () => {
       } as ProxyAccount)
       return {
         success: true,
-        models: filterAvailableModels(models).map(toAccountModel)
+        models: toAccountModels(models)
       }
     } catch (error) {
       return { success: false, error: error instanceof Error ? error.message : 'Failed to get models', models: [] }

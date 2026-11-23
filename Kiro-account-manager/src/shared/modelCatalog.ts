@@ -112,6 +112,19 @@ export function filterAvailableModels(models: KiroModel[], origin = 'AI_EDITOR')
   })
 }
 
+/** IDE 1.5.11 displays the returned catalog without interpreting origin/status
+ * metadata as an additional access check. Keep those fields for presentation;
+ * proxy request admission and fallback selection use their own checks.
+ */
+export function toAccountModels(models: KiroModel[]): AccountModelInfo[] {
+  const ids = new Set<string>()
+  return models.filter(model => {
+    if (!model.modelId?.trim() || ids.has(model.modelId)) return false
+    ids.add(model.modelId)
+    return true
+  }).map(toAccountModel)
+}
+
 export function toAccountModel(model: KiroModel): AccountModelInfo {
   const thinking = extractThinkingSchema(model.additionalModelRequestFieldsSchema)
   return {
