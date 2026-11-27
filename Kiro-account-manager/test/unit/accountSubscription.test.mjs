@@ -88,7 +88,7 @@ const ts = createRequire(import.meta.url)('typescript')
 const source = readFileSync(new URL('../../src/renderer/src/store/accounts.ts', import.meta.url), 'utf8')
 const tree = ts.createSourceFile('accounts.ts', source, ts.ScriptTarget.Latest, true)
 const actionNames = ['addAccount', 'updateAccount', 'getFilteredAccounts', 'getStats', 'loadFromStorage', 'checkAccountStatus', 'applyBackgroundRefreshResults', 'applyBackgroundCheckResults']
-const helperNames = ['credentialVersion', 'credentialResultDisposition', 'isDeferredAccountOperation', 'isBannedAccountError', 'accountOperationCountsAfter', 'receivedProfileArn']
+const helperNames = ['failedCheckHealth', 'credentialVersion', 'credentialResultDisposition', 'isDeferredAccountOperation', 'isBannedAccountError', 'accountOperationCountsAfter', 'receivedProfileArn']
 const actions = [], helpers = []
 function visit(node) {
   if (ts.isPropertyAssignment(node) && actionNames.includes(node.name?.getText(tree))) actions.push(node.getText(tree))
@@ -112,7 +112,7 @@ function storeFixture(accounts = [], api = {}) {
   const effects = { saveToStorage: async () => { saves++ }, applyTheme() {}, startAutoSave() {}, updateAccountStatus() { throw new Error('Unexpected error path') } }
   const get = () => ({ ...state, ...storeActions, ...effects })
   const set = update => Object.assign(state, typeof update === 'function' ? update(state) : update)
-  const context = vm.createContext({ ...subscriptions, get, set, window: { api }, console: { log() {}, error() {} },
+  const context = vm.createContext({ pendingRotationHealth: new WeakMap(), ...subscriptions, get, set, window: { api }, console: { log() {}, error() {} },
     uuidv4: () => `synthetic-${++nextId}`, generateRandomMachineId: () => 'synthetic-machine', DEFAULT_PROXY_POOL_CONFIG: {},
     queueMicrotask() {}, Map, Set })
   vm.runInContext(script, context)

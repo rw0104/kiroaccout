@@ -7,6 +7,7 @@ import path from 'node:path'
 import { parseAccountUsage, normalizeUsageDate } from '../../src/shared/accountUsage.ts'
 import { normalizeSubscriptionType } from '../../src/shared/accountSubscription.ts'
 import { SwitchHandoffStore } from '../../src/main/switchHandoff.ts'
+import { userInfoFailure } from '../../src/main/accountProbe.ts'
 import { applyManagerTokenRotation } from '../../src/main/managerAccountRefresh.ts'
 import { inspectKiroCliRegistration, KiroCliRegistrationError, resolveKiroCliDatabasePath, writeKiroCliRegisteredToken } from '../../src/main/kiroCliStorage.ts'
 import { resolveIdentity } from '../../src/shared/authIdentity.ts'
@@ -26,7 +27,7 @@ const transpile = code => ts.transpileModule(code, { compilerOptions: { module: 
 
 test('actual single-account status parser preserves Max title, Plus/Power categories and purchased balances', () => {
   const callback = find(node => ts.isVariableDeclaration(node) && node.name.getText(tree) === 'parseUsageResponse').initializer.getText(tree)
-  const context = vm.createContext({ parseAccountUsage, normalizeSubscriptionType, Date, account: { subscription: { type: 'Pro' } }, console: { log() {} } })
+  const context = vm.createContext({ userInfoFailure, parseAccountUsage, normalizeSubscriptionType, Date, account: { subscription: { type: 'Pro' } }, console: { log() {} } })
   vm.runInContext(transpile(`globalThis.run = ${callback}`), context)
   for (const [title, expected] of [['KIRO PRO MAX', 'Pro_Max'], ['KIRO PRO+', 'Pro_Plus'], ['KIRO POWER', 'Power'], ['KIRO FREE', 'Free']]) {
     const result = context.run({

@@ -5,19 +5,32 @@ import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import { mergeAccountSubscription, normalizeAccountSubscription, normalizeSubscriptionType } from '../../src/shared/accountSubscription.ts'
 
+import { applyManagerTokenRotation } from '../../src/main/managerAccountRefresh.ts'
+
 const require = createRequire(import.meta.url)
 const ts = require('typescript')
 const source = readFileSync(new URL('../../src/renderer/src/store/accounts.ts', import.meta.url), 'utf8')
 const tree = ts.createSourceFile('accounts.ts', source, ts.ScriptTarget.Latest, true)
-const names = ['refreshAccountToken', 'checkAccountStatus', 'applyBackgroundRefreshResults', 'applyBackgroundCheckResults', 'updateAccountStatus', 'saveToStorage', 'flushSaveImmediately']
+const names = ['refreshAccountToken', 'checkAccountStatus', 'applyBackgroundRefreshResults', 'applyBackgroundCheckResults', 'updateAccount', 'updateAccountStatus', 'moveAccountsToGroup', 'removeGroup', 'addTagToAccounts', 'removeTagFromAccounts', 'removeTag', 'saveToStorage', 'flushSaveImmediately']
 const properties = []
 const helpers = []
 function visit(node) {
   if (ts.isPropertyAssignment(node) && names.includes(node.name?.getText(tree))) properties.push(node.getText(tree))
-  if (ts.isFunctionDeclaration(node) && ['credentialVersion', 'credentialResultDisposition', 'isDeferredAccountOperation', 'accountOperationCountsAfter', 'enqueueAccountPersistence', 'accountStorageSnapshot', 'receivedProfileArn'].includes(node.name?.text)) helpers.push(node.getText(tree).replace(/^export /, ''))
+  if (ts.isFunctionDeclaration(node) && ['isBannedAccountError', 'failedCheckHealth', 'credentialVersion', 'credentialResultDisposition', 'isDeferredAccountOperation', 'accountOperationCountsAfter', 'enqueueAccountPersistence', 'accountStorageSnapshot', 'receivedProfileArn'].includes(node.name?.text)) helpers.push(node.getText(tree).replace(/^export /, ''))
   ts.forEachChild(node, visit)
 }
 visit(tree)
+const appSource = readFileSync(new URL('../../src/renderer/src/App.tsx', import.meta.url), 'utf8')
+const appTree = ts.createSourceFile('App.tsx', appSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+let receiveRotation
+function findRotationListener(node) {
+  if (ts.isCallExpression(node) && node.expression.getText(appTree) === 'window.api.onKiroInstanceAccountUpdate') {
+    receiveRotation = node.arguments[0].getText(appTree)
+  }
+  ts.forEachChild(node, findRotationListener)
+}
+findRotationListener(appTree)
+assert.ok(receiveRotation)
 assert.equal(properties.length, names.length)
 const factory = ts.transpileModule(`
 let saveDebounceTimer = null, saveMaxWaitTimer = null, saveInFlight = null, lastSaveError = null;
@@ -28,7 +41,7 @@ ${helpers.join('\n')}\nconst actions = {${properties.join(',\n')}}`, { compilerO
 const account = (accessToken = 'SYNTHETIC_ACCESS_0', refreshToken = 'SYNTHETIC_REFRESH_0') => ({
   id: 'synthetic', email: 'synthetic@example.invalid', userId: 'synthetic-user', idp: 'BuilderId',
   credentials: { accessToken, refreshToken, expiresAt: 12345, clientId: 'SYNTHETIC_CLIENT', clientSecret: 'SYNTHETIC_SECRET', region: 'us-east-1', authMethod: 'IdC', provider: 'BuilderId' },
-  usage: { current: 1, limit: 10, percentUsed: 0.1, lastUpdated: 1 }, subscription: { type: 'Free' }, status: 'active', lastError: undefined
+  usage: { current: 1, limit: 10, percentUsed: 0.1, lastUpdated: 1 }, subscription: { type: 'Free' }, tags: ['original-tag'], groupId: 'original-group', status: 'active', lastError: undefined
 })
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no }); return { promise, resolve, reject } }
 function fixture(api = {}) {
@@ -39,13 +52,16 @@ function fixture(api = {}) {
   let actions
   const get = () => ({ ...state, ...actions, saveToStorage() { saves++; return actions.saveToStorage() } })
   const set = value => Object.assign(state, typeof value === 'function' ? value(state) : value)
-  const context = vm.createContext({ get, set, window: { api: { saveAccounts: async data => { writes.push(JSON.parse(JSON.stringify(data))) }, ...api } }, console: { log() {}, warn() {}, error() {} }, Date,
+  const context = vm.createContext({ pendingRotationHealth: new WeakMap(), get, set, window: { api: { saveAccounts: async data => { writes.push(JSON.parse(JSON.stringify(data))) }, ...api } }, console: { log() {}, warn() {}, error() {} }, Date,
     mergeAccountSubscription, normalizeAccountSubscription, normalizeSubscriptionType,
     setTimeout: callback => { const id = ++timerId; timers.set(id, callback); return id }, clearTimeout: id => timers.delete(id),
-    triggerWebhook: (...args) => hooks.push(args), isBannedAccountError: () => false })
+    triggerWebhook: (...args) => hooks.push(args) })
   vm.runInContext(factory, context)
   actions = vm.runInContext('actions', context)
-  return { state, actions, hooks, writes, get saves() { return saves }, replace: value => state.accounts.set('synthetic', value), current: () => state.accounts.get('synthetic') }
+  context.useAccountsStore = { getState: get }
+  context.updateAccount = actions.updateAccount
+  const notify = vm.runInContext(ts.transpileModule('(' + receiveRotation + ')', { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context)
+  return { state, actions, hooks, writes, notify, get saves() { return saves }, replace: value => state.accounts.set('synthetic', value), current: () => state.accounts.get('synthetic') }
 }
 const success = (accessToken = 'SYNTHETIC_ACCESS_1', refreshToken = 'SYNTHETIC_REFRESH_1') => ({ success: true, data: { accessToken, refreshToken, expiresIn: 3600 } })
 const expected = { expectedRefreshToken: 'SYNTHETIC_REFRESH_0', expectedAccessToken: 'SYNTHETIC_ACCESS_0' }
@@ -338,7 +354,8 @@ test('manual operation success and real errors persist their outcome and always 
       else wait.resolve(method === 'refreshAccountToken' ? success() : { success: true, data: { status: 'expired' } })
       await operation
       assert.equal(ctx.state.accountOperationCounts.has('synthetic'), false)
-      assert.equal(ctx.current().status, outcome === 'success' ? method === 'refreshAccountToken' ? 'active' : 'expired' : 'error')
+      assert.equal(ctx.current().status, outcome === 'success' ? method === 'refreshAccountToken' ? 'active' : 'expired' : outcome === 'throw' ? 'active' : 'error')
+      assert.equal(!!ctx.current().lastCheckInconclusive, outcome === 'throw')
       assert.ok(ctx.saves > 0)
       await ctx.actions.flushSaveImmediately()
       assert.equal(ctx.writes.at(-1).accounts.synthetic.status, ctx.current().status)
@@ -360,5 +377,170 @@ test('missing accounts do not start progress and late deleted-account replies re
     await operation
     assert.equal(ctx.state.accountOperationCounts.size, 0)
     assert.equal(ctx.current(), undefined)
+  }
+})
+
+test('inconclusive checks and renewals preserve the previous health until a confirmed result arrives', async () => {
+  for (const [method, diagnostic] of [
+    ['refreshAccountToken', 'HTTP 403: refresh rejected'],
+    ['checkAccountStatus', 'missing_profile'],
+    ['applyBackgroundRefreshResults', 'connection timed out'],
+    ['applyBackgroundCheckResults', 'HTTP 429: rate limited']
+  ]) {
+    for (const previousStatus of ['active', 'expired']) {
+      const manual = method === 'refreshAccountToken' || method === 'checkAccountStatus'
+      let response = { success: false, preserveStatus: true, error: manual ? { message: diagnostic } : diagnostic }
+      const ctx = fixture({ [method]: async () => response })
+      const original = { ...account(), status: previousStatus, lastError: previousStatus === 'expired' ? 'Token expired' : undefined }
+      ctx.replace(original)
+      const deliver = () => manual
+        ? ctx.actions[method]('synthetic')
+        : ctx.actions[method]([{ id: 'synthetic', ...expected, ...response }])
+      await deliver()
+      assert.equal(ctx.current().status, previousStatus, method)
+      assert.equal(ctx.current().lastError, original.lastError, method)
+      assert.equal(ctx.current().lastCheckInconclusive, true, method)
+      assert.equal(ctx.current().credentials.expiresAt, original.credentials.expiresAt, method)
+      assert.equal(ctx.hooks.length, 0, method)
+      await ctx.actions.flushSaveImmediately()
+      assert.equal(ctx.writes.at(-1).accounts.synthetic.lastCheckInconclusive, true, method)
+
+      response = method === 'refreshAccountToken' ? success() : { success: true, data: { status: 'active' } }
+      await deliver()
+      assert.equal(ctx.current().status, 'active', method)
+      assert.equal(ctx.current().lastError, undefined, method)
+      assert.ok(!ctx.current().lastCheckInconclusive, method)
+    }
+  }
+})
+
+test('a failed batch check carrying an explicit token rejection persists expired status', () => {
+  const ctx = fixture()
+  ctx.replace({ ...account(), lastCheckInconclusive: true })
+  ctx.actions.applyBackgroundCheckResults([{
+    id: 'synthetic', ...expected, success: false, data: { status: 'expired' }, error: 'Token expired'
+  }])
+  assert.equal(ctx.current().status, 'expired')
+  assert.equal(ctx.current().lastError, 'Token expired')
+  assert.ok(!ctx.current().lastCheckInconclusive)
+})
+
+test('an inconclusive background information check still saves a successful credential rotation exactly once', () => {
+  const ctx = fixture()
+  ctx.replace({ ...account(), status: 'expired', lastError: 'Previous expiry' })
+  const result = { id: 'synthetic', ...expected, ...success(), success: false, credentialsRefreshed: true, preserveStatus: true }
+  const before = Date.now()
+  ctx.actions.applyBackgroundRefreshResults([result])
+  assert.equal(ctx.current().status, 'expired')
+  assert.equal(ctx.current().lastError, 'Previous expiry')
+  assert.equal(ctx.current().lastCheckInconclusive, true)
+  assert.equal(ctx.current().credentials.accessToken, result.data.accessToken)
+  assert.equal(ctx.current().credentials.refreshToken, result.data.refreshToken)
+  const deadline = ctx.current().credentials.expiresAt
+  assert.ok(deadline >= before + result.data.expiresIn * 1000 && deadline <= Date.now() + result.data.expiresIn * 1000)
+  ctx.actions.applyBackgroundRefreshResults([{ ...result, data: { ...result.data, expiresIn: 7200 } }])
+  assert.equal(ctx.current().credentials.expiresAt, deadline)
+})
+
+test('a manager credential push followed by its health result recovers immediately and retains the absolute expiry', async () => {
+  for (const kind of ['manual', 'background', 'check-success', 'check-error']) {
+    const wait = deferred()
+    const ctx = fixture({ refreshAccountToken: () => wait.promise, checkAccountStatus: () => wait.promise })
+    const original = { ...account(), nickname: 'keep', status: 'error', lastError: 'previous error' }
+    ctx.replace(original)
+    const pending = kind === 'background' ? undefined : applyProfileResult(ctx, kind)
+    const response = profileResponse(kind, undefined)
+    const { updates } = applyManagerTokenRotation({ accounts: { synthetic: original } }, expected.expectedRefreshToken, { success: true, ...success().data }, 1200)
+    const notification = updates[0]
+    ctx.notify(notification)
+    assert.equal(ctx.current().credentials.expiresAt, notification.credentials.expiresAt)
+    assert.equal(ctx.current().status, 'error')
+    ctx.actions.updateAccount('synthetic', { nickname: 'edited while the result is in flight' })
+    if (kind === 'background') await applyProfileResult(ctx, kind, response)
+    else { wait.resolve(response); await pending }
+    if (kind === 'check-error') assert.equal(ctx.current().lastError, 'Synthetic follow-up failure')
+    else { assert.equal(ctx.current().status, 'active', kind); assert.equal(ctx.current().lastError, undefined) }
+    assert.equal(ctx.current().credentials.expiresAt, notification.credentials.expiresAt, kind)
+    assert.equal(ctx.current().nickname, 'edited while the result is in flight')
+    const latest = ctx.current()
+    ctx.notify(notification)
+    assert.equal(ctx.current(), latest, 'replayed main event')
+    if (kind === 'background') {
+      await applyProfileResult(ctx, kind, response)
+      assert.equal(ctx.current(), latest, 'replayed result')
+    }
+  }
+})
+
+test('an intervening health check supersedes the buffered result for an already published rotation', () => {
+  const ctx = fixture()
+  const { updates } = applyManagerTokenRotation({ accounts: { synthetic: ctx.current() } }, expected.expectedRefreshToken, { success: true, ...success().data })
+  ctx.notify(updates[0])
+  ctx.actions.updateAccountStatus('synthetic', 'error', 'HTTP 423: AccountSuspendedException')
+  const banned = ctx.current()
+  ctx.actions.applyBackgroundRefreshResults([{ id: 'synthetic', ...expected, ...success() }])
+  assert.equal(ctx.current(), banned)
+})
+
+
+test('metadata changes do not discard a matching rotation health result', () => {
+  for (const mutate of [
+    actions => actions.moveAccountsToGroup(['synthetic'], 'new-group'),
+    actions => actions.removeGroup('original-group'),
+    actions => actions.addTagToAccounts(['synthetic'], 'new-tag'),
+    actions => actions.removeTagFromAccounts(['synthetic'], 'original-tag'),
+    actions => actions.removeTag('original-tag'),
+    (actions, current) => actions.updateAccount('synthetic', { credentials: { ...current.credentials, profileArn: newProfile } })
+  ]) {
+    const ctx = fixture()
+    ctx.replace({ ...account(), status: 'error', lastError: 'Previous token failure' })
+    const { updates } = applyManagerTokenRotation({ accounts: { synthetic: ctx.current() } }, expected.expectedRefreshToken, { success: true, ...success().data }, 1200)
+    ctx.notify(updates[0])
+    mutate(ctx.actions, ctx.current())
+    const edited = ctx.current()
+    ctx.actions.applyBackgroundRefreshResults([{ id: 'synthetic', ...expected, ...success() }])
+    assert.equal(ctx.current().status, 'active')
+    assert.equal(ctx.current().lastError, undefined)
+    assert.equal(ctx.current().credentials.expiresAt, updates[0].credentials.expiresAt)
+    assert.equal(ctx.current().groupId, edited.groupId)
+    assert.deepEqual(ctx.current().tags, edited.tags)
+  }
+})
+
+test('token-only renewal never clears a confirmed suspension but a successful status query can', async () => {
+  for (const kind of ['manual', 'background']) {
+    const response = success()
+    const ctx = fixture({ refreshAccountToken: async () => response })
+    ctx.replace({ ...account(), status: 'error', lastError: 'HTTP 423: AccountSuspendedException' })
+    await applyProfileResult(ctx, kind, response)
+    assert.equal(ctx.current().status, 'error', kind)
+    assert.equal(ctx.current().lastError, 'HTTP 423: AccountSuspendedException', kind)
+    ctx.actions.applyBackgroundCheckResults([{
+      id: 'synthetic', expectedAccessToken: ctx.current().credentials.accessToken,
+      expectedRefreshToken: ctx.current().credentials.refreshToken,
+      success: true, data: { status: 'active' }
+    }])
+    assert.equal(ctx.current().status, 'active')
+    assert.equal(ctx.current().lastError, undefined)
+  }
+})
+
+
+test('all newer health entry points consume a pending rotation before its older buffered result arrives', async () => {
+  for (const kind of ['manual', 'background-check', 'background-refresh', 'update']) {
+    const ctx = fixture({ checkAccountStatus: async () => ({ success: true, data: { status: 'expired' } }) })
+    const { updates } = applyManagerTokenRotation({ accounts: { synthetic: ctx.current() } }, expected.expectedRefreshToken, { success: true, ...success().data })
+    ctx.notify(updates[0])
+    if (kind === 'manual') await ctx.actions.checkAccountStatus('synthetic')
+    else if (kind === 'update') ctx.actions.updateAccount('synthetic', { status: 'expired' })
+    else ctx.actions[kind === 'background-check' ? 'applyBackgroundCheckResults' : 'applyBackgroundRefreshResults']([{
+      id: 'synthetic', expectedAccessToken: ctx.current().credentials.accessToken,
+      expectedRefreshToken: ctx.current().credentials.refreshToken,
+      success: false, data: { status: 'expired' }, error: 'Token expired'
+    }])
+    const newer = ctx.current()
+    assert.equal(newer.status, 'expired', kind)
+    ctx.actions.applyBackgroundRefreshResults([{ id: 'synthetic', ...expected, ...success() }])
+    assert.equal(ctx.current(), newer, kind)
   }
 })

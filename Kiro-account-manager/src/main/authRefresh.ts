@@ -10,6 +10,8 @@ export interface AuthRefreshResult {
   profileArn?: string
   error?: string
   errorCode?: 'invalid-input' | 'invalid-response' | 'http' | 'timeout' | 'network' | 'busy'
+  /** A refused operation can leave credential validity unconfirmed. */
+  preserveStatus?: boolean
   failureKind?: 'temporary' | 'reauth-required' | 'uncertain'
 }
 export interface AuthRefreshInput {
@@ -226,7 +228,15 @@ export class TokenRefreshService {
               : response.status === 429 || code === 'slow_down' ? '请求过于频繁，请稍后重试' : '凭证刷新失败，请检查登录状态和网络'
           const permanent = ['invalid_grant', 'expired_token', 'invalid_client', 'unauthorized_client', 'access_denied'].includes(code) || response.status === 401 || response.status === 403
           const kind = permanent ? 'reauth-required' : response.status === 429 || code === 'slow_down' || response.status >= 500 ? 'temporary' : 'reauth-required'
-          return failure('http', `HTTP ${response.status}: ${reason}`, kind)
+          const result = failure('http', `HTTP ${response.status}: ${reason}`, kind)
+          // A refused operation can require user intervention without proving
+          // that the credential is invalid. Keep the existing retry policy, but
+          // only change account health for an explicit credential rejection.
+          if (kind === 'reauth-required' && response.status !== 401 &&
+              !['invalid_grant', 'expired_token', 'invalid_client', 'unauthorized_client'].includes(code)) {
+            result.preserveStatus = true
+          }
+          return result
         }
         const data = record(await response.json())
         if (!nonempty(data.accessToken) || typeof data.expiresIn !== 'number' || !Number.isFinite(data.expiresIn) || data.expiresIn <= 0 ||

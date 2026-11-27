@@ -1,3 +1,4 @@
+import type { AccountCredentialsUpdate } from '../shared/accountCheckResult'
 import { normalizeProvider, resolveIdentity } from '../shared/authIdentity'
 import { normalizeRefreshProfileArn } from './authRefresh'
 
@@ -6,12 +7,6 @@ export interface ManagerTokenRotationResult {
   accessToken?: string
   refreshToken?: string
   expiresIn?: number
-  profileArn?: string
-}
-
-export interface ManagerTokenRotationUpdate {
-  id: string
-  credentials: Record<string, unknown>
   profileArn?: string
 }
 
@@ -27,8 +22,8 @@ export function applyManagerTokenRotation(
   expectedRefreshToken: string,
   result: ManagerTokenRotationResult,
   now = Date.now()
-): { data: unknown; updates: ManagerTokenRotationUpdate[] } {
-  const unchanged = { data, updates: [] as ManagerTokenRotationUpdate[] }
+): { data: unknown; updates: AccountCredentialsUpdate[] } {
+  const unchanged = { data, updates: [] as AccountCredentialsUpdate[] }
   if (!record(data) || !record(data.accounts) || !result || result.success !== true ||
       typeof expectedRefreshToken !== 'string' || !expectedRefreshToken.trim() ||
       typeof result.accessToken !== 'string' || !result.accessToken.trim() ||
@@ -42,7 +37,7 @@ export function applyManagerTokenRotation(
   const expiresAt = now + expiresIn * 1000
   if (!Number.isFinite(expiresAt) || Math.abs(expiresAt) > 8.64e15 || expiresAt <= now) return unchanged
 
-  const updates: ManagerTokenRotationUpdate[] = []
+  const updates: AccountCredentialsUpdate[] = []
   let accounts: Record<string, unknown> | undefined
   for (const [id, account] of Object.entries(data.accounts)) {
     if (!record(account) || !record(account.credentials) ||
@@ -64,7 +59,13 @@ export function applyManagerTokenRotation(
     }
     accounts ??= { ...data.accounts }
     accounts[id] = { ...account, credentials, ...(profileArn ? { profileArn } : {}) }
-    updates.push({ id, credentials, ...(profileArn ? { profileArn } : {}) })
+    updates.push({
+      id, credentials, ...(profileArn ? { profileArn } : {}),
+      previous: {
+        expectedAccessToken: typeof account.credentials.accessToken === 'string' ? account.credentials.accessToken : undefined,
+        expectedRefreshToken
+      }
+    })
   }
   return accounts ? { data: { ...data, accounts }, updates } : unchanged
 }

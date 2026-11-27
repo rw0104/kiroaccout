@@ -1,3 +1,4 @@
+import type { BackgroundAccountResult } from '../../shared/accountCheckResult'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { useShallow } from 'zustand/react/shallow'
 import { motion, AnimatePresence } from 'framer-motion'
@@ -8,7 +9,7 @@ import { useWebhookStore } from './store/webhooks'
 import { UpdateDialog } from './components/UpdateDialog'
 import { KiroInstancesPanel } from './components/kiro/KiroInstancesPanel'
 import { CloseConfirmDialog } from './components/CloseConfirmDialog'
-import { useAccountsStore, isBannedAccountError } from './store/accounts'
+import { useAccountsStore, isBannedAccountError, pendingRotationHealth } from './store/accounts'
 import { useWindowVisibility } from './hooks/useWindowVisibility'
 
 // 托盘信息防抖延迟：后台刷新风暴时合并多次跨进程 IPC 为单次
@@ -256,7 +257,7 @@ function App(): React.JSX.Element {
 
   // 监听后台刷新结果：缓冲 + 批量化 flush，N 条结果合并为一次 set，消除 Map 复制风暴
   useEffect(() => {
-    const refreshBuffer: Array<{ id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }> = []
+    const refreshBuffer: Array<BackgroundAccountResult> = []
     let flushTimer: ReturnType<typeof setTimeout> | null = null
 
     const flush = (): void => {
@@ -284,7 +285,7 @@ function App(): React.JSX.Element {
 
   // 监听后台检查结果：同样的批量化策略
   useEffect(() => {
-    const checkBuffer: Array<{ id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }> = []
+    const checkBuffer: Array<BackgroundAccountResult> = []
     let flushTimer: ReturnType<typeof setTimeout> | null = null
 
     const flush = (): void => {
@@ -341,6 +342,9 @@ function App(): React.JSX.Element {
   useEffect(() => window.api.onKiroInstanceAccountUpdate(info => {
     const account = useAccountsStore.getState().accounts.get(info.id)
     if (!account) return
+    const previous = info.previous
+    if (previous && (account.credentials.refreshToken !== previous.expectedRefreshToken ||
+        account.credentials.accessToken !== previous.expectedAccessToken)) return
     const { profileArn: receivedCredentialProfile, ...credentials } = info.credentials
     const receivedProfile = typeof info.profileArn === 'string' ? info.profileArn.trim() : ''
     const credentialProfile = typeof receivedCredentialProfile === 'string' ? receivedCredentialProfile.trim() : ''
@@ -354,6 +358,10 @@ function App(): React.JSX.Element {
         ...(credentialProfileArn ? { profileArn: credentialProfileArn } : {})
       }
     })
+    if (previous) {
+      const updated = useAccountsStore.getState().accounts.get(info.id)
+      if (updated) pendingRotationHealth.set(updated.credentials, previous)
+    }
   }), [updateAccount])
 
   const renderPage = () => {

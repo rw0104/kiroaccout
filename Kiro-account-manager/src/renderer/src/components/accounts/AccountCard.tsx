@@ -87,7 +87,7 @@ interface AccountCardProps {
 
 const StatusLabelsZh: Record<string, string> = {
   active: '正常',
-  expired: '已过期',
+  expired: '令牌需刷新',
   error: '错误',
   refreshing: '刷新中',
   unknown: '未知'
@@ -95,7 +95,7 @@ const StatusLabelsZh: Record<string, string> = {
 
 const StatusLabelsEn: Record<string, string> = {
   active: 'Active',
-  expired: 'Expired',
+  expired: 'Token needs refresh',
   error: 'Error',
   refreshing: 'Refreshing',
   unknown: 'Unknown'
@@ -518,6 +518,11 @@ export const AccountCard = memo(function AccountCard({
                     displayStatus === 'refreshing' ? "text-primary bg-primary/10" :
                     "text-muted-foreground bg-muted"
                  )}>
+                    {account.lastCheckInconclusive && !isAccountOperationPending && (
+                      <span title={isEn ? 'Latest check was inconclusive. Showing last known status.' : '本次检查未能确认状态，显示上次结果。'}>
+                        {isEn ? 'Last known' : '上次'}
+                      </span>
+                    )}
                     {isAccountOperationPending && <Loader2 className="h-3 w-3 animate-spin" />}
                     {isUnauthorized && <AlertCircle className="h-3 w-3" />}
                     {isUnauthorized ? (

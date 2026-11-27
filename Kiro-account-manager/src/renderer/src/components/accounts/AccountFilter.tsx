@@ -18,14 +18,14 @@ const SubscriptionOptions: { value: SubscriptionType; label: string; color: stri
 
 const StatusOptionsZh: { value: AccountStatus; label: string }[] = [
   { value: 'active', label: '正常' },
-  { value: 'expired', label: '已过期' },
+  { value: 'expired', label: '令牌需刷新' },
   { value: 'error', label: '错误' },
   { value: 'unknown', label: '未知' }
 ]
 
 const StatusOptionsEn: { value: AccountStatus; label: string }[] = [
   { value: 'active', label: 'Active' },
-  { value: 'expired', label: 'Expired' },
+  { value: 'expired', label: 'Token needs refresh' },
   { value: 'error', label: 'Error' },
   { value: 'unknown', label: 'Unknown' }
 ]

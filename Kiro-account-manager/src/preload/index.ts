@@ -1,3 +1,4 @@
+import type { BackgroundAccountResult, AccountCredentialsUpdate } from '../shared/accountCheckResult'
 import type { AccountModelInfo } from '../shared/modelCatalog'
 import type { ClientSwitchApi } from '../shared/clientSwitch'
 import type { ClientModelRepairApi } from '../shared/clientModelRepair'
@@ -112,8 +113,8 @@ const api = {
   },
 
   // 监听后台刷新结果（单个账号）
-  onBackgroundRefreshResult: (callback: (data: { id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }) => void): (() => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, data: { id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }): void => {
+  onBackgroundRefreshResult: (callback: (data: BackgroundAccountResult) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: BackgroundAccountResult): void => {
       callback(data)
     }
     ipcRenderer.on('background-refresh-result', handler)
@@ -126,8 +127,11 @@ const api = {
   backgroundBatchCheck: (accounts: Array<{
     id: string
     email: string
+    profileArn?: string
+    machineId?: string
     credentials: {
       accessToken: string
+      profileArn?: string
       refreshToken?: string
       clientId?: string
       clientSecret?: string
@@ -152,8 +156,8 @@ const api = {
   },
 
   // 监听后台检查结果（单个账号）
-  onBackgroundCheckResult: (callback: (data: { id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }) => void): (() => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, data: { id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }): void => {
+  onBackgroundCheckResult: (callback: (data: BackgroundAccountResult) => void): (() => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, data: BackgroundAccountResult): void => {
       callback(data)
     }
     ipcRenderer.on('background-check-result', handler)
@@ -341,8 +345,8 @@ const api = {
     discover: () => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.discover),
     chooseExecutable: () => ipcRenderer.invoke(KIRO_INSTANCE_CHANNELS.chooseExecutable)
   } satisfies KiroInstancesApi,
-  onKiroInstanceAccountUpdate: (callback: (info: { id: string; credentials: Record<string, unknown>; profileArn?: string }) => void): (() => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, info: { id: string; credentials: Record<string, unknown>; profileArn?: string }) => callback(info)
+  onKiroInstanceAccountUpdate: (callback: (info: AccountCredentialsUpdate) => void): (() => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, info: AccountCredentialsUpdate) => callback(info)
     ipcRenderer.on('kiro-instance-account-update', listener)
     return () => ipcRenderer.removeListener('kiro-instance-account-update', listener)
   },

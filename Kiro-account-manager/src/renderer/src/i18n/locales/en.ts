@@ -342,7 +342,7 @@ const en = {
     active: 'Active',
     error: 'Error',
     banned: 'Banned',
-    expired: 'Expired',
+    expired: 'Token needs refresh',
     unknown: 'Unknown'
   },
 

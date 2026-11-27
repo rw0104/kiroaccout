@@ -375,3 +375,28 @@ test('unknown failures, mixed connection outcomes and response read failures rem
     }
   }
 })
+
+test('a bare HTTP 403 does not diagnose a permanently invalid account credential', async () => {
+  for (const [body, preserveStatus] of [[{}, true], [{ error: 'invalid_grant' }, false]] as const) {
+    const service = new TokenRefreshService(dependencies(async () => response(body, 403)))
+    const result = await service.refresh(credential)
+    assert.equal(result.failureKind, 'reauth-required')
+    assert.equal(!!result.preserveStatus, preserveStatus)
+  }
+})
+
+test('other inconclusive HTTP refusals preserve health without changing the explicit retry policy', async () => {
+  for (const status of [400, 403, 404, 422]) {
+    for (const body of [{}, { error: 'access_denied' }, { error: 'unsupported_grant_type' }]) {
+      const service = new TokenRefreshService(dependencies(async () => response(body, status)))
+      const result = await service.refresh(credential)
+      assert.equal(result.success, false)
+      assert.equal(result.failureKind, 'reauth-required')
+      assert.equal(result.preserveStatus, true, `unconfirmed HTTP ${status}`)
+    }
+  }
+  for (const [status, body] of [[401, {}], [400, { error: 'invalid_grant' }], [403, { error: 'invalid_client' }]] as const) {
+    const service = new TokenRefreshService(dependencies(async () => response(body, status)))
+    assert.equal(!!(await service.refresh(credential)).preserveStatus, false)
+  }
+})
