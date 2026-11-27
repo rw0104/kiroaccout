@@ -9,7 +9,7 @@ import { resolveIdentity } from '../../src/shared/authIdentity.ts'
 import { parseAccountUsage } from '../../src/shared/accountUsage.ts'
 import { normalizeSubscriptionType } from '../../src/shared/accountSubscription.ts'
 import { ControlPlaneError } from '../../src/main/kiroControlPlane.ts'
-import { TokenRefreshService } from '../../src/main/authRefresh.ts'
+import { TokenRefreshService, refreshFailureDiagnostic } from '../../src/main/authRefresh.ts'
 
 const ts = createRequire(import.meta.url)('typescript')
 const source = readFileSync(new URL('../../src/main/index.ts', import.meta.url), 'utf8')
@@ -42,16 +42,16 @@ const usage = { userInfo: { email: 'synthetic@example.invalid', userId: 'SYNTHET
 function fixture(entrypoint, { provider = 'Google', responseProfile = newProfile, activeIde = false,
   historicalSwitch = false, queryFailure = false, existingProfile = oldProfile, needsTokenRefresh = true, probeError, userInfoError, refreshFailure } = {}) {
   const social = ['Google', 'Github'].includes(provider)
-  const queries = [], writes = [], events = [], refreshes = []
+  const queries = [], writes = [], events = [], refreshes = [], logs = []
   const account = { id: 'SYNTHETIC_ACCOUNT', idp: provider, profileArn: existingProfile,
     credentials: { provider, authMethod: social ? 'social' : 'IdC', accessToken: oldAccess,
       refreshToken: oldRefresh, region: 'us-east-1', profileArn: existingProfile,
       ...(!social ? { clientId: 'SYNTHETIC_CLIENT', clientSecret: 'SYNTHETIC_SECRET' } : {}) }, needsTokenRefresh }
   const context = vm.createContext({
-    accountProbeFailure, userInfoFailure, preserveRefreshStatus,
+    accountProbeFailure, userInfoFailure, preserveRefreshStatus, refreshFailureDiagnostic,
     Error, Date, Set, Promise, setTimeout, ControlPlaneError, resolveIdentity, normalizeCredentialRecord,
     parseAccountUsage, normalizeSubscriptionType,
-    console: { log() {}, warn() {}, error() {} }, proxyServer: null,
+    console: { log: (...args) => logs.push(args), warn: (...args) => logs.push(args), error: (...args) => logs.push(args) }, proxyServer: null,
     instanceAccountOwnership: { assertAvailable() {}, isBound: () => false, beginOperation: () => () => {} },
     poolRefreshInFlightIds: new Set(), lastSwitchedAccountId: historicalSwitch ? account.id : undefined,
     lastWrittenTokenSignature: undefined, proactiveRenewalEnabled: false,
@@ -59,7 +59,7 @@ function fixture(entrypoint, { provider = 'Google', responseProfile = newProfile
     mainWindow: { webContents: { send: (name, value) => events.push({ name, value }) } },
     refreshTokenByMethod: async (...args) => {
       refreshes.push(args)
-      if (refreshFailure) return refreshFailure
+      if (refreshFailure) return typeof refreshFailure === 'function' ? refreshFailure() : refreshFailure
       return { success: true, accessToken: newAccess, refreshToken: newRefresh, expiresIn: 3600,
         ...(responseProfile === null ? {} : { profileArn: responseProfile }) }
     },
@@ -82,8 +82,8 @@ function fixture(entrypoint, { provider = 'Google', responseProfile = newProfile
   vm.runInContext(ts.transpileModule(`globalThis.run = ${entrypoint === 'batch-check' ? batchCheck : callbacks.get(entrypoint)}`, {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
   }).outputText, context)
-  return { account, queries, writes, events, refreshes,
-    run: () => entrypoint === 'batch-check' ? context.run(undefined, [account], 1) : entrypoint === 'background' ? context.run([account], 1, true)
+  return { account, queries, writes, events, refreshes, logs,
+    run: (items = [account]) => entrypoint === 'batch-check' ? context.run(undefined, items, items.length) : entrypoint === 'background' ? context.run(items, items.length, true)
       : context.run(undefined, entrypoint === 'verify-account-credentials'
         ? { ...account.credentials, accessToken: undefined } : account) }
 }
@@ -133,6 +133,11 @@ test('actual background refresh carries Social profile into usage, IDE sync and 
     const result = await h.run()
     assert.equal(result.successCount, queryFailure ? 0 : 1)
     assert.equal(result.failedCount, queryFailure ? 1 : 0)
+    const summary = h.logs.find(args => args[0] === '[BackgroundRefresh] Failure summary:')
+    if (queryFailure) {
+      assert.equal(JSON.parse(summary[1])[0].stage, 'probe')
+      assert.equal(JSON.parse(summary[1])[0].count, 1)
+    } else assert.equal(summary, undefined)
     assert.equal(h.queries[0][2], newProfile)
     assert.equal(h.writes.length, activeIde ? 1 : 0)
     if (activeIde) assert.equal(h.writes[0].profileArn, newProfile)
@@ -275,4 +280,56 @@ test('batch queries retain profiles when older records populate only one saved p
       assert.equal(h.refreshes.length, 0)
     }
   }
+})
+
+test('actual manual refusal logs only safe diagnostic fields from the current operation', async () => {
+  const h = fixture('refresh-account-token', { refreshFailure: {
+    success: false, errorCode: 'http', httpStatus: 403, serviceCode: 'access_denied',
+    failureKind: 'reauth-required', preserveStatus: true, error: 'SYNTHETIC_PRIVATE', refreshToken: oldRefresh
+  } })
+  const result = await h.run()
+  assert.equal(result.success, false)
+  const entries = h.logs.filter(args => args[0] === '[AccountRefresh] Failed:')
+  assert.equal(entries.length, 1)
+  const diagnostic = JSON.parse(entries[0][1])
+  assert.equal(diagnostic.httpStatus, 403)
+  assert.equal(diagnostic.serviceCode, 'access_denied')
+  assert.equal(diagnostic.preserveStatus, true)
+  assert.doesNotMatch(JSON.stringify(entries), /SYNTHETIC|profile|refreshToken|accessToken|email/)
+})
+
+test('actual batch refusal diagnostics aggregate repeated failures without account identifiers', async () => {
+  const h = fixture('background', { refreshFailure: {
+    success: false, errorCode: 'http', httpStatus: 403, responseFormat: 'html',
+    failureKind: 'reauth-required', preserveStatus: true, error: 'SYNTHETIC_PRIVATE'
+  } })
+  const result = await h.run(Array.from({ length: 5 }, (_, i) => ({ ...h.account, id: `SYNTHETIC_${i}` })))
+  assert.equal(result.failedCount, 5)
+  const entries = h.logs.filter(args => args[0] === '[BackgroundRefresh] Failure summary:')
+  assert.equal(entries.length, 1)
+  const summary = JSON.parse(entries[0][1])
+  assert.equal(summary.length, 1)
+  assert.equal(summary[0].count, 5)
+  assert.equal(summary[0].stage, 'refresh')
+  assert.equal(summary[0].authMethod, 'social')
+  assert.equal(summary[0].httpStatus, 403)
+  assert.equal(summary[0].responseFormat, 'html')
+  assert.equal(summary[0].serviceCode, undefined)
+  assert.doesNotMatch(JSON.stringify(entries), /SYNTHETIC|profile|refreshToken|accessToken|email/)
+})
+
+test('batch diagnostic categories are capped and unknown fields never enter logs', async () => {
+  let index = 0
+  const h = fixture('background', { refreshFailure: () => ({
+    success: false, errorCode: 'SYNTHETIC_PRIVATE', httpStatus: 400 + index++,
+    serviceCode: 'SYNTHETIC_PRIVATE', responseFormat: 'SYNTHETIC_PRIVATE', failureKind: 'SYNTHETIC_PRIVATE', error: 'SYNTHETIC_PRIVATE'
+  }) })
+  const result = await h.run(Array.from({ length: 40 }, (_, i) => ({ ...h.account, id: `SYNTHETIC_${i}` })))
+  assert.equal(result.failedCount, 40)
+  const entries = h.logs.filter(args => args[0] === '[BackgroundRefresh] Failure summary:')
+  assert.equal(entries.length, 1)
+  const summary = JSON.parse(entries[0][1])
+  assert.ok(summary.length <= 33)
+  assert.equal(summary.reduce((total, item) => total + item.count, 0), 40)
+  assert.doesNotMatch(JSON.stringify(entries), /SYNTHETIC|profile|refreshToken|accessToken|email/)
 })

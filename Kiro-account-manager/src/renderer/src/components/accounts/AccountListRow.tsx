@@ -99,6 +99,7 @@ function AccountListRowComponent({
   const isEn = t('common.unknown') === 'Unknown'
 
   const [isRefreshing, setIsRefreshing] = useState(false)
+  const [tokenRefreshFeedback, setTokenRefreshFeedback] = useState<{ success: boolean; message: string } | null>(null)
   const [isClearingSuspended, setIsClearingSuspended] = useState(false)
   const [emailCopied, setEmailCopied] = useState(false)
   const [showClientSwitchDialog, setShowClientSwitchDialog] = useState(false)
@@ -164,13 +165,19 @@ function AccountListRowComponent({
     e.stopPropagation()
     if (isRefreshing || isAccountOperationPending) return
     setIsRefreshing(true)
+    setTokenRefreshFeedback(null)
     try {
-      await refreshAccountToken(account.id)
+      let error: string | undefined
+      const success = await refreshAccountToken(account.id, result => { error = result.error })
+      setTokenRefreshFeedback({ success, message: success
+        ? (isEn ? 'Access token renewed.' : '访问令牌已续期。')
+        : error || (isEn ? 'Token was not renewed. Please retry or sign in again.' : '本次令牌未续期，请重试或重新登录。') })
+      if (!success) return
       await checkAccountStatus(account.id)
     } finally {
       setIsRefreshing(false)
     }
-  }, [account.id, isRefreshing, isAccountOperationPending, refreshAccountToken, checkAccountStatus])
+  }, [account.id, isEn, isRefreshing, isAccountOperationPending, refreshAccountToken, checkAccountStatus])
 
   const handleDelete = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation()
@@ -300,6 +307,11 @@ function AccountListRowComponent({
           )}
 
           {/* 错误信息（非封禁，因为封禁已用红色徽章显示） */}
+          {tokenRefreshFeedback && (
+            <span role="status" className={cn('truncate min-w-0', tokenRefreshFeedback.success ? 'text-success' : 'text-destructive')} title={tokenRefreshFeedback.message}>
+              {isEn ? 'Latest renewal: ' : '本次续期：'}{tokenRefreshFeedback.message}
+            </span>
+          )}
           {account.lastError && !isUnauthorized && (
             <span className="text-destructive truncate flex-1 min-w-0 italic" title={account.lastError}>
               {account.lastError}

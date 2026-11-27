@@ -52,7 +52,7 @@ function fixture(initial = []) {
   const deps = {
     get, set, emptyOutcome, planBackupRestore, executeCredentialImport, matchesAccountSearch, mergeSourceAccountNames,
     resolveExistingDuplicate, normalizeCredentialRecord, normalizeAccountSubscription,
-    window, consumedImportTokens: new Map(), lastSaveError: null,
+    window, consumedImportTokens: new Map(), lastSaveError: null, pendingRotationHealth: new WeakMap(),
     enqueueAccountImport: work => work(), uuidv4: () => 'generated-id', generateRandomMachineId: () => 'f'.repeat(64),
     DEFAULT_PROXY_POOL_CONFIG: {}, syncLocalSsoAccountAsync: async () => {},
     console: { log() {}, error(...errors) { throw errors.at(-1) } }

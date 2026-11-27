@@ -1,6 +1,13 @@
 import { createHash } from 'node:crypto'
 import { resolveOidcRegistrationExpiry } from '../shared/oidcRegistration'
 
+const REFRESH_SERVICE_CODES = [
+  'invalid_grant', 'expired_token', 'invalid_client', 'unauthorized_client',
+  'access_denied', 'slow_down', 'invalid_request', 'invalid_scope',
+  'unsupported_grant_type', 'temporarily_unavailable', 'server_error'
+] as const
+type RefreshServiceCode = typeof REFRESH_SERVICE_CODES[number]
+
 export interface AuthRefreshResult {
   success: boolean
   accessToken?: string
@@ -10,6 +17,10 @@ export interface AuthRefreshResult {
   profileArn?: string
   error?: string
   errorCode?: 'invalid-input' | 'invalid-response' | 'http' | 'timeout' | 'network' | 'busy'
+  /** Safe diagnostics only; never include response text, identities or credentials. */
+  httpStatus?: number
+  serviceCode?: RefreshServiceCode
+  responseFormat?: 'json' | 'html' | 'unknown'
   /** A refused operation can leave credential validity unconfirmed. */
   preserveStatus?: boolean
   failureKind?: 'temporary' | 'reauth-required' | 'uncertain'
@@ -24,7 +35,12 @@ export interface AuthRefreshInput {
   region?: string
   proxyUrl?: string
 }
-interface RefreshResponse { ok: boolean; status: number; json(): Promise<unknown> }
+interface RefreshResponse {
+  ok: boolean
+  status: number
+  headers?: { get(name: string): string | null }
+  json(): Promise<unknown>
+}
 interface RefreshDependencies {
   fetch: (url: string, init: RequestInit, proxyUrl?: string) => Promise<RefreshResponse>
   socialEndpoint: string
@@ -47,6 +63,35 @@ interface RefreshEntry {
 const nonempty = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0
 const record = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 const failure = (errorCode: AuthRefreshResult['errorCode'], error: string, failureKind: AuthRefreshResult['failureKind'] = 'reauth-required'): AuthRefreshResult => ({ success: false, errorCode, error, failureKind })
+
+function refreshServiceCode(value: unknown): RefreshServiceCode | undefined {
+  if (typeof value !== 'string' || value.length > 64) return undefined
+  const code = value.toLowerCase()
+  return REFRESH_SERVICE_CODES.includes(code as RefreshServiceCode) ? code as RefreshServiceCode : undefined
+}
+
+/** Revalidate at the logging boundary, even when a caller supplies a custom result. */
+export function refreshFailureDiagnostic(result: AuthRefreshResult): {
+  errorCode: NonNullable<AuthRefreshResult['errorCode']> | 'unknown'
+  failureKind: NonNullable<AuthRefreshResult['failureKind']> | 'unknown'
+  httpStatus?: number
+  serviceCode?: RefreshServiceCode
+  responseFormat?: AuthRefreshResult['responseFormat']
+  preserveStatus: boolean
+} {
+  const errorCode = result.errorCode && ['invalid-input', 'invalid-response', 'http', 'timeout', 'network', 'busy'].includes(result.errorCode)
+    ? result.errorCode : 'unknown'
+  const failureKind = result.failureKind && ['temporary', 'reauth-required', 'uncertain'].includes(result.failureKind)
+    ? result.failureKind : 'unknown'
+  const serviceCode = refreshServiceCode(result.serviceCode)
+  return {
+    errorCode, failureKind,
+    ...(Number.isInteger(result.httpStatus) && result.httpStatus! >= 100 && result.httpStatus! <= 599 ? { httpStatus: result.httpStatus } : {}),
+    ...(serviceCode ? { serviceCode } : {}),
+    ...(result.responseFormat && ['json', 'html', 'unknown'].includes(result.responseFormat) ? { responseFormat: result.responseFormat } : {}),
+    preserveStatus: result.preserveStatus === true || result.failureKind !== 'reauth-required'
+  }
+}
 
 /** An invalid optional profile must not discard an already completed token rotation. */
 export function normalizeRefreshProfileArn(value: unknown): string | undefined {
@@ -215,20 +260,30 @@ export class TokenRefreshService {
         responseReceived = true
         if (!response.ok) {
           // Do not return server bodies, URLs, tokens or transport exception text to the UI.
-          const data = await response.json().catch(() => ({}))
-          const rawCode = record(data).error
-          const code = typeof rawCode === 'string' ? rawCode.toLowerCase() : ''
+          let data: unknown = {}
+          let responseFormat: NonNullable<AuthRefreshResult['responseFormat']> = 'unknown'
+          try {
+            data = await response.json()
+            responseFormat = 'json'
+          } catch {
+            // Classify the envelope without retaining HTML or arbitrary headers.
+            const contentType = response.headers?.get('content-type')?.split(';', 1)[0].trim().toLowerCase()
+            if (contentType === 'text/html') responseFormat = 'html'
+          }
+          const serviceCode = refreshServiceCode(record(data).error)
+          const code = serviceCode || ''
+          const diagnostic = { httpStatus: response.status, responseFormat, ...(serviceCode ? { serviceCode } : {}) }
           // A gateway timeout or lost upstream response cannot tell us whether
           // the authorization service already consumed the input credential.
           if ([408, 502, 504].includes(response.status)) {
-            return failure('http', `HTTP ${response.status}: 刷新结果尚不确定，请重新授权或同步最新凭证`, 'uncertain')
+            return { ...failure('http', `HTTP ${response.status}: 刷新结果尚不确定，请重新授权或同步最新凭证`, 'uncertain'), ...diagnostic }
           }
           const reason = code === 'invalid_grant' || code === 'expired_token' ? '刷新凭证已失效，请重新登录'
             : code === 'invalid_client' || code === 'unauthorized_client' ? '客户端注册已失效，请重新登录'
               : response.status === 429 || code === 'slow_down' ? '请求过于频繁，请稍后重试' : '凭证刷新失败，请检查登录状态和网络'
           const permanent = ['invalid_grant', 'expired_token', 'invalid_client', 'unauthorized_client', 'access_denied'].includes(code) || response.status === 401 || response.status === 403
           const kind = permanent ? 'reauth-required' : response.status === 429 || code === 'slow_down' || response.status >= 500 ? 'temporary' : 'reauth-required'
-          const result = failure('http', `HTTP ${response.status}: ${reason}`, kind)
+          const result = { ...failure('http', `HTTP ${response.status}: ${reason}`, kind), ...diagnostic }
           // A refused operation can require user intervention without proving
           // that the credential is invalid. Keep the existing retry policy, but
           // only change account health for an explicit credential rejection.
