@@ -147,6 +147,8 @@ const SHARED_AGENT_LIMIT = 32
 const SHARED_AGENT_TOTAL_LIMIT = 64
 const SHARED_AGENT_IDLE_MS = 5 * 60_000
 const sharedAgents = new Map<string, { agent: Dispatcher; lastUsed: number }>()
+// Stable logical route identity survives idle/LRU dispatcher replacement. No URL or CA is exposed.
+const sharedAgentRouteIds = new WeakMap<Dispatcher, string>()
 const drainingAgents = new Set<Dispatcher>()
 let sharedAgentTimer: ReturnType<typeof setInterval> | undefined
 
@@ -194,6 +196,7 @@ export function getSharedProxyAgent(
   }
   const agent = safeCreateProxyAgent(proxyUrl, trust)
   if (!agent) return undefined
+  sharedAgentRouteIds.set(agent, key)
   while (sharedAgents.size >= SHARED_AGENT_LIMIT) retireSharedAgent(sharedAgents.keys().next().value!)
   sharedAgents.set(key, { agent, lastUsed: Date.now() })
   if (!sharedAgentTimer) {
@@ -201,6 +204,10 @@ export function getSharedProxyAgent(
     sharedAgentTimer.unref()
   }
   return agent
+}
+
+export function getSharedProxyRouteId(agent: Dispatcher): string | undefined {
+  return sharedAgentRouteIds.get(agent)
 }
 
 /** Application shutdown only: release both cached pools and draining streams. */

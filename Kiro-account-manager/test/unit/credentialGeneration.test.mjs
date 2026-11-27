@@ -11,26 +11,28 @@ const require = createRequire(import.meta.url)
 const ts = require('typescript')
 const source = readFileSync(new URL('../../src/renderer/src/store/accounts.ts', import.meta.url), 'utf8')
 const tree = ts.createSourceFile('accounts.ts', source, ts.ScriptTarget.Latest, true)
-const names = ['loadFromStorage', 'refreshAccountToken', 'checkAccountStatus', 'applyBackgroundRefreshResults', 'applyBackgroundCheckResults', 'updateAccount', 'updateAccountStatus', 'moveAccountsToGroup', 'removeGroup', 'addTagToAccounts', 'removeTagFromAccounts', 'removeTag', 'saveToStorage', 'flushSaveImmediately']
+const names = ['checkAndRefreshExpiringTokens', 'refreshExpiredTokensOnly', 'setAutoRefresh', 'startAutoTokenRefresh', 'stopAutoTokenRefresh', 'loadFromStorage', 'refreshAccountToken', 'checkAccountStatus', 'applyBackgroundRefreshResults', 'applyBackgroundCheckResults', 'updateAccount', 'updateAccountStatus', 'moveAccountsToGroup', 'removeGroup', 'addTagToAccounts', 'removeTagFromAccounts', 'removeTag', 'saveToStorage', 'flushSaveImmediately']
 const properties = []
 const helpers = []
 function visit(node) {
   if (ts.isPropertyAssignment(node) && names.includes(node.name?.getText(tree))) properties.push(node.getText(tree))
-  if (ts.isFunctionDeclaration(node) && ['isBannedAccountError', 'failedCheckHealth', 'credentialVersion', 'credentialResultDisposition', 'isDeferredAccountOperation', 'accountOperationCountsAfter', 'enqueueAccountPersistence', 'accountStorageSnapshot', 'receivedProfileArn'].includes(node.name?.text)) helpers.push(node.getText(tree).replace(/^export /, ''))
+  if (ts.isFunctionDeclaration(node) && ['tokenRefreshLeadMs', 'isBannedAccountError', 'failedCheckHealth', 'credentialVersion', 'credentialResultDisposition', 'isDeferredAccountOperation', 'accountOperationCountsAfter', 'enqueueAccountPersistence', 'accountStorageSnapshot', 'receivedProfileArn'].includes(node.name?.text)) helpers.push(node.getText(tree).replace(/^export /, ''))
   ts.forEachChild(node, visit)
 }
 visit(tree)
 const appSource = readFileSync(new URL('../../src/renderer/src/App.tsx', import.meta.url), 'utf8')
 const appTree = ts.createSourceFile('App.tsx', appSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
-let receiveRotation
+let receiveRotation, receiveIdeChange
 function findRotationListener(node) {
   if (ts.isCallExpression(node) && node.expression.getText(appTree) === 'window.api.onKiroInstanceAccountUpdate') {
     receiveRotation = node.arguments[0].getText(appTree)
   }
+  if (ts.isCallExpression(node) && node.expression.getText(appTree) === 'window.api.onKiroIdeTokenChanged') receiveIdeChange = node.arguments[0].getText(appTree)
   ts.forEachChild(node, findRotationListener)
 }
 findRotationListener(appTree)
 assert.ok(receiveRotation)
+assert.ok(receiveIdeChange)
 function uiHandler(relativePath, name) {
   const uiSource = readFileSync(new URL(relativePath, import.meta.url), 'utf8')
   const uiTree = ts.createSourceFile(relativePath, uiSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
@@ -50,10 +52,10 @@ const cardRefreshHandler = uiHandler('../../src/renderer/src/components/accounts
 const rowRefreshHandler = uiHandler('../../src/renderer/src/components/accounts/AccountListRow.tsx', 'handleRefresh')
 assert.equal(properties.length, names.length)
 const factory = ts.transpileModule(`
-let saveDebounceTimer = null, saveMaxWaitTimer = null, saveInFlight = null, lastSaveError = null;
+let saveDebounceTimer = null, saveMaxWaitTimer = null, saveInFlight = null, lastSaveError = null, tokenRefreshTimer = null;
 let savePendingResolvers = [], accountPersistenceQueue = Promise.resolve();
 const saveQueuedFlushes = new Map();
-const SAVE_DEBOUNCE_MS = 500, SAVE_MAX_WAIT_MS = 5000;
+const SAVE_DEBOUNCE_MS = 500, SAVE_MAX_WAIT_MS = 5000, TOKEN_REFRESH_MIN_LEAD_MS = 600000;
 ${helpers.join('\n')}\nconst actions = {${properties.join(',\n')}}`, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText
 const account = (accessToken = 'SYNTHETIC_ACCESS_0', refreshToken = 'SYNTHETIC_REFRESH_0') => ({
   id: 'synthetic', email: 'synthetic@example.invalid', userId: 'synthetic-user', idp: 'BuilderId',
@@ -63,17 +65,18 @@ const account = (accessToken = 'SYNTHETIC_ACCESS_0', refreshToken = 'SYNTHETIC_R
 function deferred() { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no }); return { promise, resolve, reject } }
 function fixture(api = {}) {
   const state = { accounts: new Map([['synthetic', account()]]), accountOperationCounts: new Map(), groups: new Map(), tags: new Map(), proxyPool: new Map() }
-  let saves = 0
+  let saves = 0, autoRefreshRequests = 0, reloadPromise
   let feedback = null, spinning = false
-  const hooks = [], writes = [], timers = new Map()
+  const hooks = [], writes = [], timers = new Map(), intervals = new Map()
   let timerId = 0
   let actions
-  const get = () => ({ ...state, ...actions, applyTheme() {}, startAutoSave() {}, saveToStorage() { saves++; return actions.saveToStorage() } })
+  const get = () => ({ ...state, ...actions, applyTheme() {}, startAutoSave() {}, triggerBackgroundRefresh() { autoRefreshRequests++ }, saveToStorage() { saves++; return actions.saveToStorage() } })
   const set = value => Object.assign(state, typeof value === 'function' ? value(state) : value)
   const context = vm.createContext({ pendingRotationHealth: new WeakMap(), get, set, window: { api: { saveAccounts: async data => { writes.push(JSON.parse(JSON.stringify(data))) }, getAppVersion: async () => 'synthetic', ...api } }, console: { log() {}, warn() {}, error() {} }, Date,
     mergeAccountSubscription, normalizeAccountSubscription, normalizeSubscriptionType,
     DEFAULT_PROXY_POOL_CONFIG: {}, generateRandomMachineId: () => 'f'.repeat(64), queueMicrotask() {},
     setTimeout: callback => { const id = ++timerId; timers.set(id, callback); return id }, clearTimeout: id => timers.delete(id),
+    setInterval: callback => { const id = ++timerId; intervals.set(id, callback); return id }, clearInterval: id => intervals.delete(id),
     triggerWebhook: (...args) => hooks.push(args) })
   vm.runInContext(factory, context)
   actions = vm.runInContext('actions', context)
@@ -84,10 +87,13 @@ function fixture(api = {}) {
     setIsRefreshingToken: value => { spinning = value }, setIsRefreshing: value => { spinning = value },
     setTokenRefreshFeedback: value => { feedback = value } })
   const compileUi = handler => vm.runInContext(ts.transpileModule('(' + handler + ')', { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context)
+  context.loadFromStorage = () => { reloadPromise = actions.loadFromStorage(); return reloadPromise }
+  const receiveIde = compileUi(receiveIdeChange)
+  const notifyIde = () => { receiveIde({ accountId: 'synthetic', reason: 'ide-token-rotation' }); return reloadPromise }
   const cardRefresh = compileUi(cardRefreshHandler)
   const rowRefresh = () => compileUi(rowRefreshHandler)({ stopPropagation() {} })
   const notify = vm.runInContext(ts.transpileModule('(' + receiveRotation + ')', { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context)
-  return { state, actions, hooks, writes, notify, cardRefresh, rowRefresh, get feedback() { return feedback }, get spinning() { return spinning }, get saves() { return saves }, replace: value => state.accounts.set('synthetic', value), current: () => state.accounts.get('synthetic') }
+  return { state, actions, hooks, writes, notify, notifyIde, get autoRefreshRequests() { return autoRefreshRequests }, get intervals() { return intervals.size }, cardRefresh, rowRefresh, get feedback() { return feedback }, get spinning() { return spinning }, get saves() { return saves }, replace: value => state.accounts.set('synthetic', value), current: () => state.accounts.get('synthetic') }
 }
 const success = (accessToken = 'SYNTHETIC_ACCESS_1', refreshToken = 'SYNTHETIC_REFRESH_1') => ({ success: true, data: { accessToken, refreshToken, expiresIn: 3600 } })
 const expected = { expectedRefreshToken: 'SYNTHETIC_REFRESH_0', expectedAccessToken: 'SYNTHETIC_ACCESS_0' }
@@ -717,5 +723,94 @@ test('reloads with newer confirmed health or different credentials still superse
     await pending
     assert.equal(ctx.current(), newer, change)
     assert.equal(ctx.current().lastError, 'Historical token expiry', change)
+  }
+})
+
+
+test('turning automatic refresh off survives an IDE reload before its pending save flushes', async () => {
+  let stored = { accounts: {}, autoRefreshEnabled: true, autoRefreshInterval: 5 }
+  const ctx = fixture({ loadAccounts: async () => structuredClone(stored), saveAccounts: async data => { stored = structuredClone(data) } })
+  ctx.state.autoRefreshEnabled = true
+  ctx.state.autoRefreshInterval = 5
+  ctx.actions.startAutoTokenRefresh()
+  assert.equal(ctx.intervals, 1)
+  ctx.actions.setAutoRefresh(false)
+  assert.equal(ctx.intervals, 0)
+  const pendingSave = ctx.actions.saveToStorage()
+  await ctx.notifyIde()
+  assert.equal(ctx.state.autoRefreshEnabled, false)
+  await ctx.actions.flushSaveImmediately()
+  await pendingSave
+  assert.equal(stored.autoRefreshEnabled, false)
+  assert.equal(Object.hasOwn(stored, 'autoRefreshPreferenceEdited'), false)
+  assert.equal(ctx.intervals, 0)
+})
+
+test('a stale in-flight IDE load cannot overwrite a later explicit enable and interval change', async () => {
+  const pendingLoad = deferred()
+  let stored = { accounts: {}, autoRefreshEnabled: false, autoRefreshInterval: 5 }
+  const ctx = fixture({ loadAccounts: () => pendingLoad.promise, saveAccounts: async data => { stored = structuredClone(data) } })
+  ctx.state.autoRefreshEnabled = false
+  ctx.state.autoRefreshInterval = 5
+  const reload = ctx.notifyIde()
+  ctx.actions.setAutoRefresh(true, 10)
+  assert.equal(ctx.intervals, 1)
+  assert.equal(ctx.autoRefreshRequests, 1)
+  await ctx.actions.flushSaveImmediately()
+  pendingLoad.resolve({ accounts: {}, autoRefreshEnabled: false, autoRefreshInterval: 5 })
+  await reload
+  assert.equal(ctx.state.autoRefreshEnabled, true)
+  assert.equal(ctx.state.autoRefreshInterval, 10)
+  await ctx.actions.flushSaveImmediately()
+  assert.equal(stored.autoRefreshEnabled, true)
+  assert.equal(stored.autoRefreshInterval, 10)
+})
+
+test('initial storage preferences are honored and explicit re-enable still starts its timer after pausing', async () => {
+  let stored = { accounts: {}, autoRefreshEnabled: false, autoRefreshInterval: 15 }
+  const ctx = fixture({ loadAccounts: async () => structuredClone(stored), saveAccounts: async data => { stored = structuredClone(data) } })
+  await ctx.actions.loadFromStorage()
+  ctx.actions.startAutoTokenRefresh()
+  assert.equal(ctx.state.autoRefreshEnabled, false)
+  assert.equal(ctx.state.autoRefreshInterval, 15)
+  assert.equal(ctx.intervals, 0)
+  assert.equal(ctx.autoRefreshRequests, 0)
+  ctx.actions.setAutoRefresh(true, 3)
+  ctx.actions.setAutoRefresh(false)
+  ctx.actions.setAutoRefresh(true, 10)
+  await ctx.notifyIde()
+  await ctx.actions.flushSaveImmediately()
+  assert.equal(ctx.intervals, 1)
+  assert.equal(ctx.autoRefreshRequests, 2)
+  assert.equal(ctx.state.autoRefreshEnabled, true)
+  assert.equal(stored.autoRefreshEnabled, true)
+  assert.equal(stored.autoRefreshInterval, 10)
+})
+
+
+test('only direct account clicks request a manual retry across the real preload IPC bridge', async () => {
+  const preloadSource = readFileSync(new URL('../../src/preload/index.ts', import.meta.url), 'utf8')
+  const preloadTree = ts.createSourceFile('preload.ts', preloadSource, ts.ScriptTarget.Latest, true)
+  let bridgeSource
+  const visit = node => {
+    if (ts.isPropertyAssignment(node) && node.name.getText(preloadTree) === 'refreshAccountToken') bridgeSource = node.initializer.getText(preloadTree)
+    ts.forEachChild(node, visit)
+  }
+  visit(preloadTree)
+  assert.ok(bridgeSource)
+  for (const entry of ['card', 'row', 'checkAndRefreshExpiringTokens', 'refreshExpiredTokensOnly', 'store-default']) {
+    const requests = []
+    const bridge = vm.runInNewContext(ts.transpileModule('(' + bridgeSource + ')', { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText,
+      { ipcRenderer: { invoke: async (...args) => { requests.push(args); return success() } } })
+    const ctx = fixture({ refreshAccountToken: bridge, checkAccountStatus: async () => ({ success: true, data: { status: 'active' } }) })
+    Object.assign(ctx.state, { autoRefreshInterval: 5, autoRefreshConcurrency: 1, autoRefreshSyncInfo: false, autoSwitchEnabled: false })
+    if (entry === 'card') await ctx.cardRefresh()
+    else if (entry === 'row') await ctx.rowRefresh()
+    else if (entry === 'store-default') await ctx.actions.refreshAccountToken('synthetic')
+    else await ctx.actions[entry]()
+    assert.equal(requests.length, 1, entry)
+    assert.equal(requests[0][0], 'refresh-account-token')
+    assert.equal(requests[0][1].id, 'synthetic')
+    assert.equal(requests[0][2]?.manualRetry, entry === 'card' || entry === 'row', entry)
   }
 })

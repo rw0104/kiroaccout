@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import vm from 'node:vm'
 import { accountProbeFailure, userInfoFailure, preserveRefreshStatus } from '../../src/main/accountProbe.ts'
+import { resolveAccountProxyUrl } from '../../src/main/accountProxyBinding.ts'
 import { requestControlPlane, ControlPlaneError } from '../../src/main/kiroControlPlane.ts'
 import { resolveIdentity } from '../../src/shared/authIdentity.ts'
 import { parseAccountUsage, normalizeUsageDate } from '../../src/shared/accountUsage.ts'
@@ -30,7 +31,7 @@ function fixture(provider, profileArn, region = 'us-east-1', options = {}) {
   let refreshes = 0
   const expectedProfile = profileArn || (['Github', 'Google'].includes(provider) ? socialProfile : builderProfile)
   const context = vm.createContext({
-    accountProbeFailure, userInfoFailure, preserveRefreshStatus,
+    accountProbeFailure, userInfoFailure, preserveRefreshStatus, resolveAccountProxyUrl, store: undefined,
     Error, Date, ControlPlaneError, resolveIdentity, requestControlPlane, normalizeUsageDate, parseAccountUsage, normalizeSubscriptionType,
     currentUsageApiType: 'rest', proxyServer: null, getKProxyAgent: () => undefined,
     console: { log() {}, error() {}, warn() {} },

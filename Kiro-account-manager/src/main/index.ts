@@ -1,4 +1,5 @@
 import { accountProbeFailure, userInfoFailure, preserveRefreshStatus, type AccountProbeFailure } from './accountProbe'
+import { resolveAccountProxyUrl } from './accountProxyBinding'
 import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut, safeStorage, autoUpdater as nativeAutoUpdater } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
@@ -33,7 +34,7 @@ import {
   KIRO_AUTH_TOKEN_PATH
 } from './kiroAuthSync'
 import { openaiToKiro } from './proxy/translator'
-import { getSystemProxy, safeCreateProxyAgent, getSharedProxyAgent, closeSharedProxyAgents } from './proxy/systemProxy'
+import { getSystemProxy, safeCreateProxyAgent, getSharedProxyAgent, getSharedProxyRouteId, closeSharedProxyAgents } from './proxy/systemProxy'
 import { proxyLogStore, interceptConsole } from './proxy/logger'
 import { registerIPCHandlers as registerRegistrationHandlers } from './registration/ipc-handlers'
 import { registerProxyPoolIpcHandlers } from './ipc/proxyPool'
@@ -200,23 +201,34 @@ function getNetworkAgent(): Dispatcher | undefined {
  *
  * 优先级：overrideProxyUrl > K-Proxy > 用户设置代理 > 系统代理 > 直连
  */
-async function fetchWithAppProxy(
-  url: string,
-  options: RequestInit,
-  overrideProxyUrl?: string
-): Promise<Response> {
-  // 优先尝试账号绑定代理
+function getAppProxyDispatcher(overrideProxyUrl?: string): Dispatcher | undefined {
   if (overrideProxyUrl) {
     const accountAgent = getSharedProxyAgent(overrideProxyUrl)
-    if (accountAgent) {
-      return await undiciFetch(url, { ...options, dispatcher: accountAgent } as UndiciRequestInit) as unknown as Response
-    }
+    if (accountAgent) return accountAgent
   }
-  const agent = getNetworkAgent()
-  if (agent) {
-    return await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+  return getNetworkAgent()
+}
+
+async function fetchThroughDispatcher(url: string, options: RequestInit, agent?: Dispatcher): Promise<Response> {
+  return agent
+    ? await undiciFetch(url, { ...options, dispatcher: agent } as UndiciRequestInit) as unknown as Response
+    : await fetch(url, options)
+}
+
+async function fetchWithAppProxy(url: string, options: RequestInit, overrideProxyUrl?: string): Promise<Response> {
+  return fetchThroughDispatcher(url, options, getAppProxyDispatcher(overrideProxyUrl))
+}
+
+const refreshDispatcherIds = new WeakMap<Dispatcher, string>()
+let refreshDispatcherSequence = 0
+function resolveRefreshTransport(proxyUrl?: string) {
+  const dispatcher = getAppProxyDispatcher(proxyUrl)
+  let routeKey = 'direct'
+  if (dispatcher) {
+    routeKey = getSharedProxyRouteId(dispatcher) || refreshDispatcherIds.get(dispatcher) || `dispatcher:${++refreshDispatcherSequence}`
+    refreshDispatcherIds.set(dispatcher, routeKey)
   }
-  return await fetch(url, options)
+  return { routeKey, fetch: (url: string, init: RequestInit) => fetchThroughDispatcher(url, init, dispatcher) }
 }
 
 // 兼容函数，指向 getNetworkAgent
@@ -678,6 +690,7 @@ function openBrowserInPrivateMode(url: string): void {
 // Shared across all refresh entry points; never replay a refresh POST automatically.
 const tokenRefreshService = new TokenRefreshService({
   fetch: fetchWithAppProxy,
+  resolveTransport: resolveRefreshTransport,
   socialEndpoint: KIRO_AUTH_ENDPOINT,
   socialUserAgent: () => getKiroSocialUserAgent(getCurrentMachineId())
 })
@@ -688,13 +701,14 @@ async function refreshOidcToken(
   clientSecret: string,
   region = 'us-east-1',
   proxyUrl?: string,
-  clientSecretExpiresAt?: number
+  clientSecretExpiresAt?: number,
+  manualRetry: boolean = false
 ): Promise<OidcRefreshResult> {
-  return tokenRefreshService.refresh({ kind: 'IdC', refreshToken, clientId, clientSecret, region, proxyUrl, clientSecretExpiresAt })
+  return tokenRefreshService.refresh({ kind: 'IdC', refreshToken, clientId, clientSecret, region, proxyUrl, clientSecretExpiresAt, manualRetry })
 }
 
-async function refreshSocialToken(refreshToken: string, proxyUrl?: string): Promise<OidcRefreshResult> {
-  return tokenRefreshService.refresh({ kind: 'social', refreshToken, proxyUrl })
+async function refreshSocialToken(refreshToken: string, proxyUrl?: string, manualRetry: boolean = false): Promise<OidcRefreshResult> {
+  return tokenRefreshService.refresh({ kind: 'social', refreshToken, proxyUrl, manualRetry })
 }
 
 // 通用 Token 刷新 - 根据 authMethod 选择刷新方式
@@ -705,7 +719,8 @@ async function refreshTokenByMethod(
   region: string = 'us-east-1',
   authMethod?: string,
   proxyUrl?: string,
-  clientSecretExpiresAt?: number
+  clientSecretExpiresAt?: number,
+  manualRetry: boolean = false
 ): Promise<OidcRefreshResult> {
   let release: (() => void) | undefined
   try { release = instanceAccountOwnership.beginOperation({ refreshToken: token }) }
@@ -716,7 +731,7 @@ async function refreshTokenByMethod(
   let result: OidcRefreshResult
   // 如果是社交登录，使用 Kiro Auth Service 刷新
   if (authMethod === 'social') {
-    result = await refreshSocialToken(token, proxyUrl)
+    result = await refreshSocialToken(token, proxyUrl, manualRetry)
   } else {
   // Older callers may omit the new field; retain a known registration deadline from storage.
   if (clientSecretExpiresAt === undefined) {
@@ -729,7 +744,7 @@ async function refreshTokenByMethod(
     if (deadlines.length) clientSecretExpiresAt = Math.min(...deadlines)
   }
   // 否则使用 OIDC 刷新 (IdC/BuilderId)
-    result = await refreshOidcToken(token, clientId, clientSecret, region, proxyUrl, clientSecretExpiresAt)
+    result = await refreshOidcToken(token, clientId, clientSecret, region, proxyUrl, clientSecretExpiresAt, manualRetry)
   }
   // Always return an upstream rotation, even if local persistence fails. The
   // renderer can retain and retry saving it; never lose the only current token.
@@ -1473,9 +1488,7 @@ const modelPreferences = new KiroModelPreferencesService({
     } | undefined
     if (!data?.accounts || !Object.hasOwn(data.accounts, id)) return undefined
     const account = data.accounts[id]
-    const proxyId = data.accountProxyBindings && Object.hasOwn(data.accountProxyBindings, id) ? data.accountProxyBindings[id] : undefined
-    const proxy = proxyId && data.proxyPool && Object.hasOwn(data.proxyPool, proxyId) ? data.proxyPool[proxyId] : undefined
-    return { ...account, proxyUrl: proxy?.enabled && proxy.status !== 'dead' ? proxy.url : undefined }
+    return { ...account, proxyUrl: resolveAccountProxyUrl(data, id) }
   },
   beginOperation: account => instanceAccountOwnership.beginOperation({ accountId: account.id, ...account.credentials }),
   models: identity => fetchKiroModels(identity as ProxyAccount),
@@ -3106,7 +3119,7 @@ app.whenReady().then(async () => {
   })
 
   // IPC: 刷新账号 Token（支持 IdC 和社交登录）
-  registerUnboundAccountHandler('refresh-account-token', async (_event, account) => {
+  registerUnboundAccountHandler('refresh-account-token', async (_event, account, options?: { manualRetry?: boolean }) => {
     try {
       instanceAccountOwnership.assertAvailable({ accountId: account.id, ...account.credentials })
       const { refreshToken, clientId, clientSecret, region, authMethod, provider } = account.credentials || {}
@@ -3120,10 +3133,8 @@ app.whenReady().then(async () => {
         return { success: false, error: { message: '缺少 OIDC 刷新凭证 (clientId/clientSecret)' } }
       }
 
-      // 查找账号绑定的代理 URL（账号池中已有 proxyUrl 字段）
-      const boundProxyUrl = proxyServer
-        ? (proxyServer.getAccountPool().getAccount(account.id || '')?.proxyUrl)
-        : undefined
+      // Error accounts and filtered accounts may not be present in the runtime pool.
+      const boundProxyUrl = resolveAccountProxyUrl(store?.get('accountData'), account.id)
 
       console.log(`[IPC] Refreshing token (authMethod: ${authMethod || 'IdC'})...${boundProxyUrl ? ' [via bound proxy]' : ''}`)
 
@@ -3136,7 +3147,8 @@ app.whenReady().then(async () => {
         region || 'us-east-1',
         authMethod,
         boundProxyUrl,
-        account.credentials?.clientSecretExpiresAt
+        account.credentials?.clientSecretExpiresAt,
+        options?.manualRetry === true
       )
 
       if (!refreshResult.success || !refreshResult.accessToken) {
@@ -3565,10 +3577,7 @@ app.whenReady().then(async () => {
     try {
       const { accessToken, refreshToken, clientId, clientSecret, region, authMethod: rawAuthMethod, provider } = account.credentials || {}
 
-      // 查询账号绑定的代理（账号池）
-      const boundProxyUrl = proxyServer
-        ? proxyServer.getAccountPool().getAccount(account.id || '')?.proxyUrl
-        : undefined
+      const boundProxyUrl = resolveAccountProxyUrl(store?.get('accountData'), account.id)
 
       // Older saved accounts can carry identity only in top-level idp. Resolve
       // the query header/profile and any one-time refresh route consistently.
@@ -3704,6 +3713,14 @@ app.whenReady().then(async () => {
     
     accounts = accounts.filter(account => !instanceAccountOwnership.isBound({ accountId: account.id, ...account.credentials }))
 
+    // SecureStore.get clones the whole account collection. Snapshot routing once
+    // per invocation and retain only selected URLs while network calls are pending.
+    const accountProxyUrls = new Map<string, string | undefined>()
+    if (accounts.length) {
+      const routingData = store?.get('accountData')
+      for (const account of accounts) accountProxyUrls.set(account.id, resolveAccountProxyUrl(routingData, account.id))
+    }
+
     let completed = 0
     let success = 0
     let failed = 0
@@ -3740,10 +3757,7 @@ app.whenReady().then(async () => {
             const { refreshToken, clientId, clientSecret, region, authMethod, accessToken, provider } = account.credentials
             const needsTokenRefresh = account.needsTokenRefresh !== false // 默认为 true（兼容旧版本）
 
-            // 查询账号绑定的代理（从主进程账号池）
-            const boundProxyUrl = proxyServer
-              ? proxyServer.getAccountPool().getAccount(account.id)?.proxyUrl
-              : undefined
+            const boundProxyUrl = accountProxyUrls.get(account.id)
 
             // 确定正确的 idp
             let idp = 'BuilderId'

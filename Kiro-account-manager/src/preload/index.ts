@@ -72,8 +72,8 @@ const api = {
   },
 
   // 账号管理 - 刷新 Token
-  refreshAccountToken: (account: unknown): Promise<unknown> => {
-    return ipcRenderer.invoke('refresh-account-token', account)
+  refreshAccountToken: (account: unknown, options?: { manualRetry?: boolean }): Promise<unknown> => {
+    return ipcRenderer.invoke('refresh-account-token', account, options)
   },
 
   // 账号管理 - 检查账号状态
