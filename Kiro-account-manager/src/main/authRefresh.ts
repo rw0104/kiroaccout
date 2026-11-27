@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import { resolveOidcRegistrationExpiry } from '../shared/oidcRegistration'
+import { RefreshRouteAdmission, refreshRetryDelayMs } from './refreshAdmission'
 
 const REFRESH_SERVICE_CODES = [
   'invalid_grant', 'expired_token', 'invalid_client', 'unauthorized_client',
@@ -21,6 +22,9 @@ export interface AuthRefreshResult {
   httpStatus?: number
   serviceCode?: RefreshServiceCode
   responseFormat?: 'json' | 'html' | 'unknown'
+  /** This caller reused a failed result or was deferred without sending a POST. */
+  retryDeferred?: boolean
+  retryAfterMs?: number
   /** A refused operation can leave credential validity unconfirmed. */
   preserveStatus?: boolean
   failureKind?: 'temporary' | 'reauth-required' | 'uncertain'
@@ -34,6 +38,8 @@ export interface AuthRefreshInput {
   clientSecretExpiresAt?: number
   region?: string
   proxyUrl?: string
+  /** Only the explicit single-account refresh action may bypass failure cooldown. */
+  manualRetry?: boolean
 }
 interface RefreshResponse {
   ok: boolean
@@ -50,6 +56,8 @@ interface RefreshDependencies {
   /** Upper bound for in-memory rotation aliases; never persisted or logged. */
   maxRetentionMs?: number
   now?: () => number
+  /** Captures the same dispatcher that will send the request; key is an opaque identity. */
+  resolveTransport?: (proxyUrl?: string) => { routeKey: string; fetch(url: string, init: RequestInit): Promise<RefreshResponse> }
 }
 interface RefreshEntry {
   task?: Promise<AuthRefreshResult>
@@ -78,6 +86,8 @@ export function refreshFailureDiagnostic(result: AuthRefreshResult): {
   serviceCode?: RefreshServiceCode
   responseFormat?: AuthRefreshResult['responseFormat']
   preserveStatus: boolean
+  retryDeferred?: boolean
+  retryAfterMs?: number
 } {
   const errorCode = result.errorCode && ['invalid-input', 'invalid-response', 'http', 'timeout', 'network', 'busy'].includes(result.errorCode)
     ? result.errorCode : 'unknown'
@@ -89,6 +99,9 @@ export function refreshFailureDiagnostic(result: AuthRefreshResult): {
     ...(Number.isInteger(result.httpStatus) && result.httpStatus! >= 100 && result.httpStatus! <= 599 ? { httpStatus: result.httpStatus } : {}),
     ...(serviceCode ? { serviceCode } : {}),
     ...(result.responseFormat && ['json', 'html', 'unknown'].includes(result.responseFormat) ? { responseFormat: result.responseFormat } : {}),
+    ...(result.retryDeferred === true ? { retryDeferred: true } : {}),
+    ...(typeof result.retryAfterMs === 'number' && Number.isFinite(result.retryAfterMs) && result.retryAfterMs > 0 && result.retryAfterMs <= 1800000
+      ? { retryAfterMs: Math.ceil(result.retryAfterMs) } : {}),
     preserveStatus: result.preserveStatus === true || result.failureKind !== 'reauth-required'
   }
 }
@@ -129,9 +142,11 @@ export class TokenRefreshService {
   // Hashes only. A lost response may have rotated its input: a new credential
   // generation or reauthorization is required, never an automatic replay.
   private readonly uncertainInputs = new Map<string, AuthRefreshResult>()
+  private readonly failureCooldowns = new Map<string, { attempts: number; until: number; result: AuthRefreshResult; touchedAt: number }>()
+  private readonly routeAdmission: RefreshRouteAdmission
   private readonly now: () => number
   private readonly deps: RefreshDependencies
-  constructor(deps: RefreshDependencies) { this.deps = deps; this.now = deps.now || Date.now }
+  constructor(deps: RefreshDependencies) { this.deps = deps; this.now = deps.now || Date.now; this.routeAdmission = new RefreshRouteAdmission(this.now) }
 
   private key(input: AuthRefreshInput, refreshToken = input.refreshToken): string {
     return createHash('sha256').update(JSON.stringify([input.kind, input.region || 'us-east-1', input.clientId, input.clientSecret, refreshToken])).digest('hex')
@@ -148,6 +163,15 @@ export class TokenRefreshService {
       if (copy.expiresIn <= 0) return failure('invalid-response', '已缓存的凭证已过期，请使用最新刷新凭证或重新登录')
     }
     return copy
+  }
+  private replayResult(entry: RefreshEntry, result: AuthRefreshResult): AuthRefreshResult {
+    return this.markReplayedFailure(this.copyResult(entry, result), this.root(entry).currentKey)
+  }
+  private markReplayedFailure(result: AuthRefreshResult, key: string): AuthRefreshResult {
+    if (result.success) return result
+    const cooldown = this.failureCooldowns.get(key)
+    return { ...result, retryDeferred: true,
+      ...(cooldown && cooldown.until > this.now() ? { retryAfterMs: Math.min(1800000, Math.ceil(cooldown.until - this.now())) } : {}) }
   }
   private drop(entry: RefreshEntry): void {
     for (const key of entry.aliases) if (this.entries.get(key) === entry) this.entries.delete(key)
@@ -179,29 +203,44 @@ export class TokenRefreshService {
     input = { ...input, region }
     const key = this.key(input)
     const uncertain = this.uncertainInputs.get(key)
-    if (uncertain) return { ...uncertain }
+    if (uncertain) return { ...uncertain, retryDeferred: true }
     const replayMs = Math.max(0, this.deps.replayWindowMs ?? 15000)
     const now = this.now()
     for (const entry of this.lineages) if (!entry.task && now >= entry.retainUntil) this.drop(entry)
     const previous = this.entries.get(key)
     const existing = previous && this.root(previous)
     if (existing) {
-      if (existing.task) return this.copyResult(existing, await existing.task)
+      if (existing.task) return this.replayResult(existing, await existing.task)
       // An old consumed token must only hand off the current generation, never be posted again.
       // Even the newest token reuses the freshly issued access token during the short replay window.
       if (existing.result && (key !== existing.currentKey || existing.result.success && now - (existing.completedAt ?? 0) < replayMs)) {
-        return this.copyResult(existing, existing.result)
+        return this.replayResult(existing, existing.result)
       }
+    }
+    for (const [failedKey, failure] of this.failureCooldowns) if (now - failure.touchedAt >= 7200000) this.failureCooldowns.delete(failedKey)
+    const cooldown = this.failureCooldowns.get(key)
+    if (!input.manualRetry && cooldown && now < cooldown.until) {
+      return { ...cooldown.result, retryDeferred: true, retryAfterMs: Math.min(1800000, Math.ceil(cooldown.until - now)) }
     }
     if (this.uncertainInputs.size >= 4096) return failure('busy', '刷新结果待确认的账户较多，请在客户端重新授权并同步最新凭证', 'temporary')
     if (!existing && (this.lineages.size >= 1024 || this.entries.size >= 4096)) return failure('busy', '刷新任务较多，请稍后重试', 'temporary')
     const retentionMs = Math.max(1000, Math.min(3600000, this.deps.maxRetentionMs ?? 3600000))
     const entry: RefreshEntry = existing || { currentKey: key, aliases: new Set(), retainUntil: now + retentionMs }
     if (!existing) { this.lineages.add(entry); this.alias(entry, key) }
-    const task = Promise.resolve().then(() => this.perform(input, region)).then(async result => {
+    const task = Promise.resolve().then(() => this.admittedRefresh(input, region, key,
+      () => this.root(entry) === entry && entry.currentKey === key)).then(async result => {
       if (!result.success && result.failureKind === 'uncertain') this.uncertainInputs.set(key, { ...result })
       const current = this.root(entry)
-      if (current !== entry) return current.task ? await current.task : current.result || failure('busy', '凭证轮换状态已变化，请重新获取最新凭证')
+      if (current !== entry) return this.markReplayedFailure(current.task ? await current.task : current.result || failure('busy', '凭证轮换状态已变化，请重新获取最新凭证'), current.currentKey)
+      if (result.success) this.failureCooldowns.delete(key)
+      else if (!result.retryDeferred && result.failureKind !== 'uncertain') {
+        const attempts = Math.min(63, (this.failureCooldowns.get(key)?.attempts || 0) + 1)
+        const delay = refreshRetryDelayMs(attempts)
+        result = { ...result, retryAfterMs: delay }
+        this.failureCooldowns.delete(key)
+        while (this.failureCooldowns.size >= 4096) this.failureCooldowns.delete(this.failureCooldowns.keys().next().value!)
+        this.failureCooldowns.set(key, { attempts, until: this.now() + delay, result: { ...result }, touchedAt: this.now() })
+      }
       if (result.success && result.refreshToken) {
         const nextKey = this.key(input, result.refreshToken)
         const next = this.entries.get(nextKey)
@@ -212,8 +251,9 @@ export class TokenRefreshService {
           entry.parent = other
           this.lineages.delete(entry)
           for (const alias of entry.aliases) this.alias(other, alias)
-          return other.task ? await other.task : other.result || failure('busy', '凭证轮换状态已变化，请重新获取最新凭证')
+          return this.markReplayedFailure(other.task ? await other.task : other.result || failure('busy', '凭证轮换状态已变化，请重新获取最新凭证'), other.currentKey)
         }
+        this.failureCooldowns.delete(nextKey)
         entry.currentKey = nextKey
         this.alias(entry, nextKey)
         entry.retainUntil = this.now() + Math.min(retentionMs, result.expiresIn! * 1000)
@@ -233,7 +273,38 @@ export class TokenRefreshService {
     return this.copyResult(entry, await task)
   }
 
-  private async perform(input: AuthRefreshInput, region: string): Promise<AuthRefreshResult> {
+  private async admittedRefresh(input: AuthRefreshInput, region: string, key: string, current: () => boolean): Promise<AuthRefreshResult> {
+    if (input.kind !== 'social') return this.perform(input, region)
+    const deferred = (retryAfterMs = 1000): AuthRefreshResult => ({
+      ...failure('busy', '续期请求暂缓，正在等待服务恢复，请稍后重试', 'temporary'),
+      preserveStatus: true, retryDeferred: true, retryAfterMs
+    })
+    try {
+      // Resolve again after waiting: a changed proxy must enter its own route gate.
+      // No POST has been sent while queued, so changing admission is not a retry.
+      for (let routeChange = 0; routeChange < 3; routeChange++) {
+        const transport = this.deps.resolveTransport?.(input.proxyUrl)
+        const routeKey = createHash('sha256').update(JSON.stringify([this.deps.socialEndpoint,
+          transport?.routeKey ?? input.proxyUrl ?? 'default'])).digest('hex')
+        const admission = await this.routeAdmission.acquire(routeKey, key, input.manualRetry === true)
+        if (admission.kind === 'deferred') return deferred(admission.retryAfterMs)
+        let result: AuthRefreshResult | undefined
+        try {
+          if (!current()) return deferred()
+          const selected = this.deps.resolveTransport?.(input.proxyUrl)
+          if (selected?.routeKey !== transport?.routeKey) continue
+          result = await this.perform(input, region, selected)
+          return result
+        } finally { this.routeAdmission.complete(admission, result) }
+      }
+      return deferred()
+    } catch {
+      // Dispatcher selection failed before a request was submitted.
+      return failure('network', '无法准备刷新连接，请检查网络或代理后重试', 'temporary')
+    }
+  }
+
+  private async perform(input: AuthRefreshInput, region: string, transport?: ReturnType<NonNullable<RefreshDependencies['resolveTransport']>>): Promise<AuthRefreshResult> {
     const controller = new AbortController()
     let timedOut = false
     let responseReceived = false
@@ -254,9 +325,10 @@ export class TokenRefreshService {
         const payload = social ? { refreshToken: input.refreshToken } : {
           clientId: input.clientId, clientSecret: input.clientSecret, refreshToken: input.refreshToken, grantType: 'refresh_token'
         }
-        const response = await this.deps.fetch(url, {
+        const init: RequestInit = {
           method: 'POST', headers, body: JSON.stringify(payload), signal: controller.signal, redirect: 'error'
-        }, input.proxyUrl)
+        }
+        const response = transport ? await transport.fetch(url, init) : await this.deps.fetch(url, init, input.proxyUrl)
         responseReceived = true
         if (!response.ok) {
           // Do not return server bodies, URLs, tokens or transport exception text to the UI.

@@ -169,3 +169,18 @@ test('the actual IPC wrapper preserves a local in-flight code without entering t
   assert.equal(requests, 0)
   h.guard.assertCanBind(h.original.id, 'synthetic-instance')
 })
+
+test('the ownership IPC wrapper forwards explicit refresh options without granting a bypass itself', async () => {
+  const h = fixture(), seen = []
+  h.registerUnboundAccountHandler('refresh-account-token', async (_event, account, options) => {
+    seen.push({ account, options })
+    return { success: true }
+  })
+  const account = { accountId: h.original.id, ...h.original.credentials }
+  const options = { manualRetry: true }
+  assert.equal((await h.handlers.get('refresh-account-token')({}, account, options)).success, true)
+  assert.equal(seen[0].account, account)
+  assert.equal(seen[0].options, options)
+  assert.equal((await h.handlers.get('refresh-account-token')({}, account)).success, true)
+  assert.equal(seen[1].options, undefined)
+})

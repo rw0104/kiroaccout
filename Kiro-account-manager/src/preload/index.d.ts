@@ -176,7 +176,7 @@ interface KiroApi {
   // 账号管理
   loadAccounts: () => Promise<AccountData | null>
   saveAccounts: (data: AccountData, updateRequestId?: string, deleteAccountIds?: string[]) => Promise<void>
-  refreshAccountToken: (account: unknown) => Promise<RefreshResult>
+  refreshAccountToken: (account: unknown, options?: { manualRetry?: boolean }) => Promise<RefreshResult>
   checkAccountStatus: (account: unknown) => Promise<StatusResult>
   
   // 后台批量刷新（主进程执行，不阻塞 UI）

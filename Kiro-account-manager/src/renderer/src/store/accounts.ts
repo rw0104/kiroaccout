@@ -416,6 +416,8 @@ interface AccountsState {
   // 自动刷新设置
   autoRefreshEnabled: boolean
   autoRefreshInterval: number // 分钟
+  /** Session-only: credential reloads must not undo an explicit local preference. */
+  autoRefreshPreferenceEdited: boolean
   autoRefreshConcurrency: number // 自动刷新并发数
   autoRefreshSyncInfo: boolean // 刷新时是否同步检测账户信息（用量、订阅、封禁状态）
   statusCheckInterval: number // 分钟
@@ -533,7 +535,7 @@ interface AccountsActions {
 
   // 状态管理
   updateAccountStatus: (id: string, status: AccountStatus | undefined, error?: string) => void
-  refreshAccountToken: (id: string, reportResult?: (result: { success: boolean; error?: string }) => void) => Promise<boolean>
+  refreshAccountToken: (id: string, reportResult?: (result: { success: boolean; error?: string }) => void, manualRetry?: boolean) => Promise<boolean>
   batchRefreshTokens: (ids: string[]) => Promise<BatchOperationResult>
   checkAccountStatus: (id: string) => Promise<void>
   batchCheckStatus: (ids: string[]) => Promise<BatchOperationResult>
@@ -709,6 +711,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   isSyncing: false,
   autoRefreshEnabled: true,
   autoRefreshInterval: 5,
+  autoRefreshPreferenceEdited: false,
   autoRefreshConcurrency: 100,
   autoRefreshSyncInfo: true,
   statusCheckInterval: 60,
@@ -1487,7 +1490,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     }
   },
 
-  refreshAccountToken: async (id, reportResult) => {
+  refreshAccountToken: async (id, reportResult, manualRetry = false) => {
     const { accounts, updateAccountStatus } = get()
     const account = accounts.get(id)
 
@@ -1504,7 +1507,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
 
     try {
       // 通过主进程调用 Kiro API 刷新 Token（避免 CORS）
-      const result = await window.api.refreshAccountToken(account)
+      const result = await window.api.refreshAccountToken(account, { manualRetry })
       const disposition = credentialResultDisposition(get().accounts.get(id), expected, result.success ? result.data : undefined)
       if (disposition === 'duplicate') return finish(true)
       if (disposition === 'stale') return finish(false)
@@ -1930,8 +1933,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           groups: new Map(Object.entries(data.groups ?? {}) as [string, AccountGroup][]),
           tags: new Map(Object.entries(data.tags ?? {}) as [string, AccountTag][]),
           activeAccountId,
-          autoRefreshEnabled: data.autoRefreshEnabled ?? true,
-          autoRefreshInterval: data.autoRefreshInterval ?? 5,
+          ...(get().autoRefreshPreferenceEdited ? {} : {
+            autoRefreshEnabled: data.autoRefreshEnabled ?? true,
+            autoRefreshInterval: data.autoRefreshInterval ?? 5
+          }),
           autoRefreshConcurrency: data.autoRefreshConcurrency ?? 100,
           autoRefreshSyncInfo: data.autoRefreshSyncInfo ?? true,
           statusCheckInterval: data.statusCheckInterval ?? 60,
@@ -2075,7 +2080,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
   setAutoRefresh: (enabled, interval) => {
     set({
       autoRefreshEnabled: enabled,
-      autoRefreshInterval: interval ?? get().autoRefreshInterval
+      autoRefreshInterval: interval ?? get().autoRefreshInterval,
+      autoRefreshPreferenceEdited: true
     })
     get().saveToStorage()
     

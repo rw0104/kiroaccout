@@ -168,7 +168,7 @@ function AccountListRowComponent({
     setTokenRefreshFeedback(null)
     try {
       let error: string | undefined
-      const success = await refreshAccountToken(account.id, result => { error = result.error })
+      const success = await refreshAccountToken(account.id, result => { error = result.error }, true)
       setTokenRefreshFeedback({ success, message: success
         ? (isEn ? 'Access token renewed.' : '访问令牌已续期。')
         : error || (isEn ? 'Token was not renewed. Please retry or sign in again.' : '本次令牌未续期，请重试或重新登录。') })

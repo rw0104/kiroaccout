@@ -10,6 +10,7 @@ import { parseAccountUsage } from '../../src/shared/accountUsage.ts'
 import { normalizeSubscriptionType } from '../../src/shared/accountSubscription.ts'
 import { ControlPlaneError } from '../../src/main/kiroControlPlane.ts'
 import { TokenRefreshService, refreshFailureDiagnostic } from '../../src/main/authRefresh.ts'
+import { resolveAccountProxyUrl } from '../../src/main/accountProxyBinding.ts'
 
 const ts = createRequire(import.meta.url)('typescript')
 const source = readFileSync(new URL('../../src/main/index.ts', import.meta.url), 'utf8')
@@ -40,18 +41,22 @@ const usage = { userInfo: { email: 'synthetic@example.invalid', userId: 'SYNTHET
   usageBreakdownList: [{ resourceType: 'CREDIT', currentUsage: 1, usageLimit: 50 }] }
 
 function fixture(entrypoint, { provider = 'Google', responseProfile = newProfile, activeIde = false,
-  historicalSwitch = false, queryFailure = false, existingProfile = oldProfile, needsTokenRefresh = true, probeError, userInfoError, refreshFailure } = {}) {
+  historicalSwitch = false, queryFailure = false, existingProfile = oldProfile, needsTokenRefresh = true, probeError, userInfoError, refreshFailure,
+  accountData, runtimeAccount, requestOptions } = {}) {
   const social = ['Google', 'Github'].includes(provider)
   const queries = [], writes = [], events = [], refreshes = [], logs = []
+  let storeReads = 0
   const account = { id: 'SYNTHETIC_ACCOUNT', idp: provider, profileArn: existingProfile,
     credentials: { provider, authMethod: social ? 'social' : 'IdC', accessToken: oldAccess,
       refreshToken: oldRefresh, region: 'us-east-1', profileArn: existingProfile,
       ...(!social ? { clientId: 'SYNTHETIC_CLIENT', clientSecret: 'SYNTHETIC_SECRET' } : {}) }, needsTokenRefresh }
   const context = vm.createContext({
-    accountProbeFailure, userInfoFailure, preserveRefreshStatus, refreshFailureDiagnostic,
+    accountProbeFailure, userInfoFailure, preserveRefreshStatus, refreshFailureDiagnostic, resolveAccountProxyUrl,
     Error, Date, Set, Promise, setTimeout, ControlPlaneError, resolveIdentity, normalizeCredentialRecord,
     parseAccountUsage, normalizeSubscriptionType,
-    console: { log: (...args) => logs.push(args), warn: (...args) => logs.push(args), error: (...args) => logs.push(args) }, proxyServer: null,
+    console: { log: (...args) => logs.push(args), warn: (...args) => logs.push(args), error: (...args) => logs.push(args) },
+    proxyServer: runtimeAccount === undefined ? null : { getAccountPool: () => ({ getAccount: () => runtimeAccount }) },
+    store: { get: () => { storeReads++; return accountData } },
     instanceAccountOwnership: { assertAvailable() {}, isBound: () => false, beginOperation: () => () => {} },
     poolRefreshInFlightIds: new Set(), lastSwitchedAccountId: historicalSwitch ? account.id : undefined,
     lastWrittenTokenSignature: undefined, proactiveRenewalEnabled: false,
@@ -83,9 +88,10 @@ function fixture(entrypoint, { provider = 'Google', responseProfile = newProfile
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 }
   }).outputText, context)
   return { account, queries, writes, events, refreshes, logs,
-    run: (items = [account]) => entrypoint === 'batch-check' ? context.run(undefined, items, items.length) : entrypoint === 'background' ? context.run(items, items.length, true)
+    get storeReads() { return storeReads },
+    run: (items = [account], concurrency = items.length) => entrypoint === 'batch-check' ? context.run(undefined, items, concurrency) : entrypoint === 'background' ? context.run(items, concurrency, true)
       : context.run(undefined, entrypoint === 'verify-account-credentials'
-        ? { ...account.credentials, accessToken: undefined } : account) }
+        ? { ...account.credentials, accessToken: undefined } : account, requestOptions) }
 }
 
 test('actual credential verification queries and returns the authenticated Social response profile', async () => {
@@ -102,7 +108,7 @@ test('actual credential verification queries and returns the authenticated Socia
 
 test('actual manual refresh returns Social metadata and preserves the IDE synchronization condition', async () => {
   for (const provider of ['Google', 'Github']) for (const activeIde of [false, true]) {
-    const h = fixture('refresh-account-token', { provider, activeIde })
+    const h = fixture('refresh-account-token', { provider, activeIde, requestOptions: { manualRetry: true } })
     const result = await h.run()
     assert.equal(result.success, true)
     assert.equal(result.data.profileArn, newProfile)
@@ -110,6 +116,15 @@ test('actual manual refresh returns Social metadata and preserves the IDE synchr
     assert.equal(h.writes.length, activeIde ? 1 : 0)
     if (activeIde) assert.equal(h.writes[0].profileArn, newProfile)
     assert.equal(h.refreshes.length, 1)
+    assert.equal(h.refreshes[0][7], true, 'only the explicit manual key action may bypass failure cooldown')
+  }
+})
+
+test('the refresh IPC bypasses cooldown only for an explicit boolean manual-retry option', async () => {
+  for (const requestOptions of [undefined, {}, { manualRetry: false }, { manualRetry: 'true' }, { manualRetry: true }]) {
+    const h = fixture('refresh-account-token', { requestOptions })
+    assert.equal((await h.run()).success, true)
+    assert.equal(h.refreshes[0][7], requestOptions?.manualRetry === true)
   }
 })
 
@@ -123,6 +138,7 @@ test('actual status retry carries Social profile in both successful and failed-q
     assert.equal(result.data.newCredentials.profileArn, newProfile)
     assert.equal(result.data.newCredentials.refreshToken, newRefresh)
     assert.equal(h.refreshes.length, 1)
+    assert.equal(h.refreshes[0][7], undefined, 'status checks must obey the shared cooldown')
     assert.equal(h.writes.length, 0)
   }
 })
@@ -148,6 +164,7 @@ test('actual background refresh carries Social profile into usage, IDE sync and 
     assert.equal(event.expectedAccessToken, oldAccess)
     assert.equal(event.expectedRefreshToken, oldRefresh)
     assert.equal(h.refreshes.length, 1)
+    assert.equal(h.refreshes[0][7], undefined, 'background jobs must obey the shared cooldown')
   }
 })
 
@@ -332,4 +349,56 @@ test('batch diagnostic categories are capped and unknown fields never enter logs
   assert.ok(summary.length <= 33)
   assert.equal(summary.reduce((total, item) => total + item.count, 0), 40)
   assert.doesNotMatch(JSON.stringify(entries), /SYNTHETIC|profile|refreshToken|accessToken|email/)
+})
+
+test('all actual renewal entrypoints use saved proxy bindings independently of the runtime pool', async () => {
+  const savedUrl = 'http://saved-proxy.example.invalid:8080'
+  const accountData = {
+    accountProxyBindings: { SYNTHETIC_ACCOUNT: 'SYNTHETIC_PROXY' },
+    proxyPool: { SYNTHETIC_PROXY: { url: savedUrl, enabled: true, status: 'alive' } }
+  }
+  for (const entrypoint of ['refresh-account-token', 'check-account-status', 'background']) {
+    for (const runtimeAccount of [undefined, null, { proxyUrl: undefined }, { proxyUrl: 'http://stale-proxy.example.invalid:8080' }]) {
+      const h = fixture(entrypoint, { accountData, runtimeAccount })
+      h.account.status = 'error'
+      const result = await h.run()
+      assert.equal(result.success, true)
+      assert.equal(h.refreshes.length, 1)
+      assert.equal(h.refreshes[0][5], savedUrl, `${entrypoint} must not depend on a populated active-account pool`)
+    }
+  }
+})
+
+test('disabled, deleted and unbound saved proxies cannot fall back to a stale runtime binding', async () => {
+  const savedUrl = 'http://saved-proxy.example.invalid:8080'
+  for (const entrypoint of ['refresh-account-token', 'check-account-status', 'background']) {
+    for (const accountData of [
+      { accountProxyBindings: { SYNTHETIC_ACCOUNT: 'SYNTHETIC_PROXY' }, proxyPool: { SYNTHETIC_PROXY: { url: savedUrl, enabled: false, status: 'alive' } } },
+      { accountProxyBindings: { SYNTHETIC_ACCOUNT: 'SYNTHETIC_PROXY' }, proxyPool: { SYNTHETIC_PROXY: { url: savedUrl, enabled: true, status: 'dead' } } },
+      { accountProxyBindings: { SYNTHETIC_ACCOUNT: 'SYNTHETIC_PROXY' }, proxyPool: {} },
+      { accountProxyBindings: {}, proxyPool: { SYNTHETIC_PROXY: { url: savedUrl, enabled: true, status: 'alive' } } }
+    ]) {
+      const h = fixture(entrypoint, { accountData, runtimeAccount: { proxyUrl: savedUrl } })
+      const result = await h.run()
+      assert.equal(result.success, true)
+      assert.equal(h.refreshes.length, 1)
+      assert.equal(h.refreshes[0][5], undefined, `${entrypoint} must honor the saved unbinding or disabled proxy`)
+    }
+  }
+})
+
+test('batch proxy routing reads one account-data snapshot and reloads saved changes for the next invocation', async () => {
+  const accountData = {
+    accountProxyBindings: Object.fromEntries(Array.from({ length: 6 }, (_, i) => [`SYNTHETIC_${i}`, 'SYNTHETIC_PROXY'])),
+    proxyPool: { SYNTHETIC_PROXY: { url: 'http://first-proxy.example.invalid:8080', enabled: true, status: 'alive' } }
+  }
+  const h = fixture('background', { accountData })
+  const accounts = Array.from({ length: 6 }, (_, i) => ({ ...h.account, id: `SYNTHETIC_${i}` }))
+  assert.equal((await h.run(accounts, 2)).successCount, 6)
+  assert.equal(h.storeReads, 1, 'SecureStore.get clones accountData; avoid one full clone per account')
+  assert.ok(h.refreshes.every(args => args[5] === 'http://first-proxy.example.invalid:8080'))
+  accountData.proxyPool.SYNTHETIC_PROXY.url = 'http://second-proxy.example.invalid:8080'
+  assert.equal((await h.run(accounts, 2)).successCount, 6)
+  assert.equal(h.storeReads, 2)
+  assert.ok(h.refreshes.slice(6).every(args => args[5] === 'http://second-proxy.example.invalid:8080'))
 })

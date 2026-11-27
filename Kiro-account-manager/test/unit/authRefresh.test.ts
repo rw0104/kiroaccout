@@ -303,7 +303,7 @@ test('connection setup failures allow a later explicit refresh without automatic
     assert.equal(failed.failureKind, 'temporary')
     assert.doesNotMatch(JSON.stringify(failed), /SYNTHETIC_PRIVATE_CONNECTION/)
     assert.equal(calls, 1, 'the first attempt never automatically retries')
-    assert.equal((await service.refresh(credential)).success, true)
+    assert.equal((await service.refresh({ ...credential, manualRetry: true })).success, true)
     assert.equal(calls, 2, 'the next explicit call can recover in the same process')
   }
 })
@@ -332,7 +332,7 @@ test('real fetch connection refusal recovers in the same service after the local
     assert.equal(delivered, 0)
     await new Promise<void>(resolve => server.listen(port, '127.0.0.1', resolve))
     try {
-      const recovered = await service.refresh(credential)
+      const recovered = await service.refresh({ ...credential, manualRetry: true })
       assert.equal(failed.failureKind, 'temporary')
       assert.equal(recovered.success, true)
       assert.equal(calls, 2)
@@ -457,5 +457,237 @@ test('HTTP refusal diagnostics distinguish JSON from HTML without returning resp
     assert.equal(refreshFailureDiagnostic(result).responseFormat, expected)
     assert.equal(result.preserveStatus, true)
     assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC|<html>|text\/html|charset/)
+  }
+})
+
+test('shared refresh service cools repeated failures while an explicit manual retry remains deliberate', async () => {
+  let now = 1_800_000_000_000, calls = 0
+  const service = new TokenRefreshService({ ...dependencies(async () => { calls++; return response({}, 403) }), now: () => now })
+  const first = await service.refresh(credential)
+  assert.equal(first.success, false)
+  assert.equal(first.retryDeferred, undefined)
+  const deferred = await service.refresh(credential)
+  assert.equal(calls, 1)
+  assert.equal(deferred.retryDeferred, true)
+  assert.equal(deferred.retryAfterMs, 5000)
+  now += 4999
+  assert.equal((await service.refresh(credential)).retryAfterMs, 1)
+  now++
+  assert.equal((await service.refresh(credential)).retryDeferred, undefined)
+  assert.equal(calls, 2)
+  assert.equal((await service.refresh({ ...credential, manualRetry: true })).retryDeferred, undefined)
+  assert.equal(calls, 3)
+})
+
+test('a burst of distinct Social HTML refusals opens a shared route gate and defers queued POSTs', async () => {
+  let calls = 0, active = 0, peak = 0
+  const service = new TokenRefreshService({
+    ...dependencies(async () => {
+      calls++; active++; peak = Math.max(peak, active)
+      await Promise.resolve()
+      active--
+      return { ok: false, status: 403, headers: { get: () => 'text/html' }, json: async () => { throw new Error('SYNTHETIC_HTML') } }
+    }), now: () => 1_800_000_000_000
+  })
+  const results = await Promise.all(Array.from({ length: 300 }, (_, i) => service.refresh({ kind: 'social', refreshToken: `SYNTHETIC_${i}` })))
+  assert.ok(peak <= 4, `peak ${peak}`)
+  assert.ok(calls <= 6, `sent ${calls} POSTs before the shared rejection gate opened`)
+  assert.equal(results.filter(result => result.retryDeferred).length, results.length - calls)
+  assert.ok(results.every(result => result.success === false))
+  assert.ok(results.filter(result => result.retryDeferred).every(result => result.retryAfterMs > 0 && result.retryAfterMs <= 1_800_000))
+  assert.equal((await service.refresh({ kind: 'social', refreshToken: 'SYNTHETIC_LATER' })).retryDeferred, true)
+})
+
+test('one recovery probe can restore a Social route without treating its rejected credential as healthy', async () => {
+  let now = 1_800_000_000_000, calls = 0, reachable = false
+  let releaseProbe: (() => void) | undefined
+  const service = new TokenRefreshService({ ...dependencies(async () => {
+    calls++
+    if (reachable) {
+      if (releaseProbe === undefined) await new Promise<void>(resolve => { releaseProbe = resolve })
+      return response({ error: 'invalid_grant' }, 400)
+    }
+    return { ok: false, status: 403, headers: { get: () => 'text/html' }, json: async () => { throw new Error('SYNTHETIC_HTML') } }
+  }), now: () => now })
+  for (let i = 0; i < 3; i++) await service.refresh({ kind: 'social', refreshToken: `SYNTHETIC_${i}` })
+  const beforeProbe = calls
+  now += 5000; reachable = true
+  const probe = service.refresh({ kind: 'social', refreshToken: 'SYNTHETIC_PROBE' })
+  for (let i = 0; i < 12; i++) await Promise.resolve()
+  const waiting = await service.refresh({ kind: 'social', refreshToken: 'SYNTHETIC_WAITING' })
+  assert.equal(waiting.retryDeferred, true)
+  assert.equal(calls, beforeProbe + 1)
+  assert.ok(releaseProbe)
+  releaseProbe()
+  const rejected = await probe
+  assert.equal(rejected.success, false)
+  assert.equal(rejected.serviceCode, 'invalid_grant')
+  assert.equal((await service.refresh({ kind: 'social', refreshToken: 'SYNTHETIC_PROBE' })).retryDeferred, true)
+  const next = await service.refresh({ kind: 'social', refreshToken: 'SYNTHETIC_NEXT' })
+  assert.equal(next.retryDeferred, undefined)
+  assert.equal(next.success, false)
+  assert.equal(calls, beforeProbe + 2)
+})
+
+test('manual retry never bypasses an uncertain POST or an already consumed credential generation', async () => {
+  let calls = 0
+  const uncertain = new TokenRefreshService(dependencies(async () => { calls++; throw new Error('SYNTHETIC_UNCERTAIN') }))
+  await uncertain.refresh(credential)
+  assert.equal((await uncertain.refresh({ ...credential, manualRetry: true })).failureKind, 'uncertain')
+  assert.equal(calls, 1)
+  let rotatedCalls = 0
+  const rotated = new TokenRefreshService(dependencies(async () => { rotatedCalls++; return response(good) }))
+  await rotated.refresh(credential)
+  assert.equal((await rotated.refresh({ ...credential, manualRetry: true })).refreshToken, good.refreshToken)
+  assert.equal(rotatedCalls, 1)
+})
+
+test('an older success joining a newer failed lineage cannot erase its cooldown or report a fresh rejection', async () => {
+  let now = 1_800_000_000_000, calls = 0
+  let releaseOld: ((value: ReturnType<typeof response>) => void) | undefined
+  const service = new TokenRefreshService({ ...dependencies(async (_url, init) => {
+    calls++
+    const token = JSON.parse(String(init.body)).refreshToken
+    if (token === 'SYNTHETIC_A') return new Promise(resolve => { releaseOld = resolve })
+    if (token === 'SYNTHETIC_B') return response({ ...good, refreshToken: 'SYNTHETIC_C' })
+    return response({}, 403)
+  }), now: () => now })
+  const pending = service.refresh({ ...credential, refreshToken: 'SYNTHETIC_A' })
+  for (let i = 0; i < 8; i++) await Promise.resolve()
+  await service.refresh({ ...credential, refreshToken: 'SYNTHETIC_B' })
+  now += 16000
+  await service.refresh({ ...credential, refreshToken: 'SYNTHETIC_C' })
+  assert.equal((await service.refresh({ ...credential, refreshToken: 'SYNTHETIC_C' })).retryDeferred, true)
+  releaseOld!(response({ ...good, refreshToken: 'SYNTHETIC_C' }))
+  const joined = await pending
+  assert.equal(joined.success, false)
+  assert.equal(joined.retryDeferred, true)
+  assert.equal((await service.refresh({ ...credential, refreshToken: 'SYNTHETIC_C' })).retryDeferred, true)
+  assert.equal(calls, 3)
+})
+
+test('credential cooldown follows the official sequence, caps at 30 minutes, and resets after success', async () => {
+  let now = 1_800_000_000_000, calls = 0, succeed = false
+  const service = new TokenRefreshService({ ...dependencies(async () => { calls++; return succeed ? response({ ...good, refreshToken: credential.refreshToken }) : response({}, 403) }), now: () => now })
+  for (let attempt = 1; attempt <= 65; attempt++) {
+    const result = await service.refresh(credential)
+    const expected = attempt <= 4 ? [5000, 10000, 15000, 30000][attempt - 1] : Math.min((attempt - 3) * 30000, 1800000)
+    assert.equal(result.retryAfterMs, expected)
+    assert.equal((await service.refresh(credential)).retryDeferred, true)
+    assert.equal(calls, attempt)
+    now += expected + 1
+  }
+  succeed = true
+  assert.equal((await service.refresh(credential)).success, true)
+  now += 16000; succeed = false
+  assert.equal((await service.refresh(credential)).retryAfterMs, 5000)
+})
+
+test('throttling, server errors and arbitrary JSON cannot reopen a blocked Social route', async () => {
+  for (const [status, body] of [[429, { error: 'slow_down' }], [503, { error: 'server_error' }],
+    [400, { error: 'slow_down' }], [400, {}], [403, {}], [401, { error: 'temporarily_unavailable' }]] as const) {
+    let now = 1_800_000_000_000, calls = 0, probe = false
+    const service = new TokenRefreshService({ ...dependencies(async () => {
+      calls++
+      return probe ? response(body, status) : { ok: false, status: 403, headers: { get: () => 'text/html' }, json: async () => { throw new Error('SYNTHETIC_HTML') } }
+    }), now: () => now })
+    for (let i = 0; i < 3; i++) await service.refresh({ kind: 'social', refreshToken: `SYNTHETIC_${i}` })
+    now += 5000; probe = true
+    await service.refresh({ kind: 'social', refreshToken: 'SYNTHETIC_PROBE' })
+    const waiting = await Promise.all(Array.from({ length: 100 }, (_, i) => service.refresh({ kind: 'social', refreshToken: `SYNTHETIC_WAITING_${i}` })))
+    assert.equal(calls, 4, `${status}: continued throttling or an unrecognized envelope must keep the gate closed`)
+    assert.ok(waiting.every(result => result.retryDeferred === true))
+  }
+})
+
+test('a proxy change while queued re-enters admission and never sends through the old captured route', async () => {
+  let route = 'route-A'
+  const sent: string[] = [], release: Array<() => void> = []
+  const service = new TokenRefreshService({ ...dependencies(async () => response({})),
+    resolveTransport: () => {
+      const selected = route
+      return { routeKey: selected, fetch: async () => {
+        sent.push(selected)
+        if (sent.length <= 4) await new Promise<void>(resolve => release.push(resolve))
+        return response({ error: 'invalid_grant' }, 400)
+      } }
+    }
+  })
+  const calls = Array.from({ length: 5 }, (_, i) => service.refresh({ kind: 'social', refreshToken: `SYNTHETIC_${i}` }))
+  for (let i = 0; i < 20; i++) await Promise.resolve()
+  assert.equal(sent.length, 4)
+  route = 'route-B'
+  for (const done of release) done()
+  await Promise.all(calls)
+  assert.deepEqual(sent, ['route-A', 'route-A', 'route-A', 'route-A', 'route-B'])
+})
+
+test('queued requests start their timeout only after admission and uncertain generations still cannot replay', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const requests: Array<(value: ReturnType<typeof response>) => void> = []
+  const service = new TokenRefreshService({ ...dependencies(async () => new Promise(resolve => requests.push(resolve))), timeoutMs: 1000 })
+  const calls = Array.from({ length: 5 }, (_, i) => service.refresh({ kind: 'social', refreshToken: `SYNTHETIC_${i}` }))
+  for (let i = 0; i < 20; i++) await Promise.resolve()
+  assert.equal(requests.length, 4)
+  t.mock.timers.tick(1000)
+  for (let i = 0; i < 40; i++) await Promise.resolve()
+  assert.equal(requests.length, 5)
+  requests[4](response(good))
+  const results = await Promise.all(calls)
+  assert.ok(results.slice(0, 4).every(result => result.failureKind === 'uncertain'))
+  assert.equal(results[4].success, true, 'a request that was only queued must not be recorded as an uncertain POST')
+  assert.equal((await service.refresh({ kind: 'social', refreshToken: 'SYNTHETIC_0', manualRetry: true })).retryDeferred, true)
+  assert.equal(requests.length, 5)
+})
+
+test('a manual retry permits one recovery probe while other callers still observe the route cooldown', async () => {
+  let calls = 0, probe = false
+  let release: (() => void) | undefined
+  const service = new TokenRefreshService({ ...dependencies(async () => {
+    calls++
+    if (probe) { await new Promise<void>(resolve => { release = resolve }); return response({ error: 'invalid_grant' }, 401) }
+    return { ok: false, status: 403, headers: { get: () => 'text/html' }, json: async () => { throw new Error('SYNTHETIC_HTML') } }
+  }), now: () => 1_800_000_000_000 })
+  for (let i = 0; i < 3; i++) await service.refresh({ kind: 'social', refreshToken: `SYNTHETIC_${i}` })
+  probe = true
+  const pending = service.refresh({ kind: 'social', refreshToken: 'SYNTHETIC_0', manualRetry: true })
+  for (let i = 0; i < 15; i++) await Promise.resolve()
+  const other = await service.refresh({ kind: 'social', refreshToken: 'SYNTHETIC_OTHER', manualRetry: true })
+  assert.equal(other.retryDeferred, true)
+  assert.equal(calls, 4)
+  release!()
+  assert.equal((await pending).success, false)
+})
+
+test('idle route records expire and the route map rejects overflow without dispatching a POST', async () => {
+  let now = 1_800_000_000_000, calls = 0
+  const transport = async () => { calls++; return response({ error: 'invalid_grant' }, 401) }
+  const service = new TokenRefreshService({ ...dependencies(transport), now: () => now,
+    resolveTransport: proxyUrl => ({ routeKey: proxyUrl || 'direct', fetch: transport }) })
+  for (let i = 0; i < 128; i++) await service.refresh({ kind: 'social', refreshToken: `SYNTHETIC_${i}`, proxyUrl: `route-${i}` })
+  assert.equal(calls, 128)
+  const overflow = { kind: 'social' as const, refreshToken: 'SYNTHETIC_OVERFLOW', proxyUrl: 'route-overflow' }
+  assert.equal((await service.refresh(overflow)).retryDeferred, true)
+  assert.equal(calls, 128)
+  now += 3600001
+  assert.equal((await service.refresh(overflow)).retryDeferred, undefined)
+  assert.equal(calls, 129)
+})
+
+test('safe diagnostics distinguish an actual failed POST from deferred or reused failure observations', async () => {
+  const service = new TokenRefreshService({ ...dependencies(async () => response({}, 403)), now: () => 1_800_000_000_000 })
+  const actual = refreshFailureDiagnostic(await service.refresh(credential))
+  const deferred = refreshFailureDiagnostic(await service.refresh(credential))
+  assert.equal(actual.httpStatus, 403)
+  assert.equal(actual.retryDeferred, undefined)
+  assert.equal(actual.retryAfterMs, 5000)
+  assert.equal(deferred.httpStatus, 403)
+  assert.equal(deferred.retryDeferred, true)
+  assert.equal(deferred.retryAfterMs, 5000)
+  for (const retryAfterMs of [0, -1, Infinity, NaN, 1800001, 'SYNTHETIC_PRIVATE']) {
+    const diagnostic = refreshFailureDiagnostic({ success: false, retryDeferred: 'SYNTHETIC_PRIVATE', retryAfterMs } as unknown as AuthRefreshResult)
+    assert.equal(diagnostic.retryDeferred, undefined)
+    assert.equal(diagnostic.retryAfterMs, undefined)
+    assert.doesNotMatch(JSON.stringify(diagnostic), /SYNTHETIC/)
   }
 })
