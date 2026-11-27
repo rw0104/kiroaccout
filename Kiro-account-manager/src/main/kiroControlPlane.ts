@@ -38,6 +38,7 @@ const SERVICE_CODES: Record<string, { serviceCode: string; reason?: ControlPlane
   unrecognizedclientexception: { serviceCode: 'UnrecognizedClientException', reason: 'token' },
   accessdeniedexception: { serviceCode: 'AccessDeniedException' },
   unauthorizedexception: { serviceCode: 'UnauthorizedException', reason: 'token' },
+  accountsuspendedexception: { serviceCode: 'AccountSuspendedException' },
   throttlingexception: { serviceCode: 'ThrottlingException' }
 }
 const REASON_ADVICE: Record<ControlPlaneFailureReason, string> = {

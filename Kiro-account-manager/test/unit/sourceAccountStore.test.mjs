@@ -87,6 +87,33 @@ const originalCredential = extra => ({ provider: 'Github', email: 'synthetic-ori
 const existingAccount = extra => ({ id: 'existing', email: 'verified@example.invalid', nickname: 'kept-nickname',
   idp: 'Github', machineId: 'f'.repeat(64), subscription: { type: 'Pro' }, credentials: { provider: 'Github', refreshToken: 'SYNTHETIC_REFRESH' }, ...extra })
 
+test('batch status checks pass saved account and credential profiles independently, including legacy records', async () => {
+  const profiles = [
+    { profileArn: 'SYNTHETIC_SELECTED', credentialProfile: 'SYNTHETIC_STORED' },
+    { credentialProfile: 'SYNTHETIC_LEGACY' },
+    {}
+  ]
+  const accounts = new Map(profiles.map(({ profileArn, credentialProfile }, index) => {
+    const id = String(index)
+    return [id, existingAccount({ id, profileArn, credentials: { accessToken: 'SYNTHETIC_ACCESS', profileArn: credentialProfile } })]
+  }))
+  let sent
+  const window = { api: { backgroundBatchCheck: async rows => {
+    sent = rows
+    return { successCount: rows.length, failedCount: 0 }
+  } } }
+  const check = new Function('get', 'window', `return (${stripTypeScriptTypes(property('batchCheckStatus'))})`)(() => ({ accounts }), window)
+  await check([...accounts.keys()])
+  assert.equal(sent.length, accounts.size)
+  for (const row of sent) {
+    const original = accounts.get(row.id)
+    assert.equal(row.profileArn, original.profileArn)
+    assert.equal(row.credentials.profileArn, original.credentials.profileArn)
+    assert.equal(row.machineId, original.machineId)
+    assert.equal(row.idp, original.idp)
+  }
+})
+
 test('real store imports source metadata, excludes it from verification, and searches it after saving and reloading', async () => {
   const ctx = fixture()
   const outcome = await ctx.actions.importAccountPlan(parseAccountImportText(JSON.stringify(originalCredential({ sourceAccountNames: ['prior-source'] }))))

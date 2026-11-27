@@ -342,7 +342,7 @@ const zh = {
     active: '正常',
     error: '异常',
     banned: '已封禁',
-    expired: '已过期',
+    expired: '令牌需刷新',
     unknown: '未知'
   },
 

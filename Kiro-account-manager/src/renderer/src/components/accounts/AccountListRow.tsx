@@ -329,6 +329,11 @@ function AccountListRowComponent({
             getStatusBadgeClass(displayStatus, isUnauthorized)
           )}
         >
+          {account.lastCheckInconclusive && !isAccountOperationPending && (
+            <span title={isEn ? 'Latest check was inconclusive. Showing last known status.' : '本次检查未能确认状态，显示上次结果。'}>
+              {isEn ? 'Last known' : '上次'}
+            </span>
+          )}
           {isAccountOperationPending && <Loader2 className="h-3 w-3 animate-spin" />}
           {isUnauthorized && <AlertCircle className="h-3 w-3" />}
           {isUnauthorized ? (

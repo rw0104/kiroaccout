@@ -1,3 +1,4 @@
+import type { BackgroundAccountResult, CredentialVersion } from '../../../shared/accountCheckResult'
 import { create } from 'zustand'
 import { v4 as uuidv4 } from 'uuid'
 import type {
@@ -140,15 +141,16 @@ function enqueueAccountImport<T>(work: () => Promise<T>): Promise<T> {
   return result
 }
 
-interface CredentialVersion {
-  expectedRefreshToken?: string
-  expectedAccessToken?: string
-}
-interface BackgroundCredentialResult extends CredentialVersion {
-  id: string
-  success: boolean
-  data?: unknown
-  error?: string
+// Metadata edits replace Account objects, but keep their credential generation.
+// A newer health result consumes this marker before the buffered result can run.
+export const pendingRotationHealth = new WeakMap<Account['credentials'], CredentialVersion>()
+function failedCheckHealth(account: Account, result: BackgroundAccountResult) {
+  if (result.preserveStatus) {
+    return { status: account.status, lastError: account.lastError, lastCheckInconclusive: true }
+  }
+  const reported = result.data as { status?: string } | undefined
+  const status: AccountStatus = reported?.status === 'expired' ? 'expired' : 'error'
+  return { status, lastError: result.error, lastCheckInconclusive: undefined }
 }
 function credentialVersion(account: Account): CredentialVersion {
   return { expectedRefreshToken: account.credentials.refreshToken, expectedAccessToken: account.credentials.accessToken }
@@ -165,9 +167,14 @@ function credentialResultDisposition(
   account: Account | undefined,
   expected: CredentialVersion,
   next?: { accessToken?: string; refreshToken?: string }
-): 'input' | 'duplicate' | 'stale' {
+): 'input' | 'published' | 'duplicate' | 'stale' {
   if (!account || typeof expected.expectedRefreshToken !== 'string' && typeof expected.expectedAccessToken !== 'string') return 'stale'
   const current = account.credentials
+  const published = pendingRotationHealth.get(current)
+  if (published && next?.accessToken === current.accessToken &&
+      current.refreshToken === (next?.refreshToken ?? expected.expectedRefreshToken) &&
+      expected.expectedAccessToken === published.expectedAccessToken &&
+      expected.expectedRefreshToken === published.expectedRefreshToken) return 'published'
   if ((expected.expectedRefreshToken === undefined || current.refreshToken === expected.expectedRefreshToken) &&
       (expected.expectedAccessToken === undefined || current.accessToken === expected.expectedAccessToken)) return 'input'
   // A duplicate delivered after another consumer already applied the exact result is a no-op,
@@ -525,7 +532,7 @@ interface AccountsActions {
   importAccountPlan: (plan: ImportPlan, groupId?: string, signal?: AbortSignal) => Promise<ImportOutcome>
 
   // 状态管理
-  updateAccountStatus: (id: string, status: AccountStatus, error?: string) => void
+  updateAccountStatus: (id: string, status: AccountStatus | undefined, error?: string) => void
   refreshAccountToken: (id: string) => Promise<boolean>
   batchRefreshTokens: (ids: string[]) => Promise<BatchOperationResult>
   checkAccountStatus: (id: string) => Promise<void>
@@ -594,12 +601,12 @@ interface AccountsActions {
   checkAndRefreshExpiringTokens: () => Promise<void>
   refreshExpiredTokensOnly: () => Promise<void>
   triggerBackgroundRefresh: () => Promise<void>
-  handleBackgroundRefreshResult: (data: BackgroundCredentialResult) => void
-  handleBackgroundCheckResult: (data: BackgroundCredentialResult) => void
+  handleBackgroundRefreshResult: (data: BackgroundAccountResult) => void
+  handleBackgroundCheckResult: (data: BackgroundAccountResult) => void
   /** 批量处理后台刷新结果：一次 set 应用 N 条结果，消除 N 次 Map 全量复制 */
-  applyBackgroundRefreshResults: (items: BackgroundCredentialResult[]) => void
+  applyBackgroundRefreshResults: (items: BackgroundAccountResult[]) => void
   /** 批量处理后台检查结果：一次 set 应用 N 条结果 */
-  applyBackgroundCheckResults: (items: BackgroundCredentialResult[]) => void
+  applyBackgroundCheckResults: (items: BackgroundAccountResult[]) => void
 
   // 定时自动保存（防止数据丢失）
   startAutoSave: () => void
@@ -773,7 +780,15 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const accounts = new Map(state.accounts)
       const account = accounts.get(id)
       if (account) {
-        accounts.set(id, { ...account, ...updates, subscription: mergeAccountSubscription(account.subscription, updates.subscription) })
+        const updated = { ...account, ...updates, subscription: mergeAccountSubscription(account.subscription, updates.subscription) }
+        const pending = pendingRotationHealth.get(account.credentials)
+        if ('status' in updates || 'lastError' in updates || 'lastCheckInconclusive' in updates || 'lastCheckedAt' in updates) {
+          pendingRotationHealth.delete(account.credentials)
+        } else if (pending && updated.credentials.accessToken === account.credentials.accessToken &&
+                   updated.credentials.refreshToken === account.credentials.refreshToken) {
+          pendingRotationHealth.set(updated.credentials, pending)
+        }
+        accounts.set(id, updated)
       }
       return { accounts }
     })
@@ -1448,10 +1463,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const accounts = new Map(state.accounts)
       const account = accounts.get(id)
       if (account) {
+        pendingRotationHealth.delete(account.credentials)
         accounts.set(id, {
           ...account,
-          status,
-          lastError: error,
+          status: status ?? account.status,
+          lastError: status ? error : account.lastError,
+          lastCheckInconclusive: !status || undefined,
           lastCheckedAt: Date.now()
         })
       }
@@ -1483,7 +1500,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       // 通过主进程调用 Kiro API 刷新 Token（避免 CORS）
       const result = await window.api.refreshAccountToken(account)
       const disposition = credentialResultDisposition(get().accounts.get(id), expected, result.success ? result.data : undefined)
-      if (disposition !== 'input') return disposition === 'duplicate'
+      if (disposition === 'duplicate' || disposition === 'stale') return disposition === 'duplicate'
       if (isDeferredAccountOperation(result)) return false
 
       if (result.success && result.data) {
@@ -1505,6 +1522,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           if (acc) {
             // Only a supplied profile may replace saved identity metadata.
             const resolvedProfileArn = receivedProfileArn(result.data!.profileArn)
+            const suspended = isBannedAccountError(acc.lastError)
             accounts.set(id, {
               ...acc,
               ...(resolvedProfileArn ? { profileArn: resolvedProfileArn } : {}),
@@ -1513,11 +1531,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
                 accessToken: result.data!.accessToken,
                 // 如果返回了新的 refreshToken，更新它
                 refreshToken: result.data!.refreshToken || acc.credentials.refreshToken,
-                expiresAt: Date.now() + result.data!.expiresIn * 1000,
+                expiresAt: disposition === 'published' ? acc.credentials.expiresAt : Date.now() + result.data!.expiresIn * 1000,
                 ...(resolvedProfileArn ? { profileArn: resolvedProfileArn } : {})
               },
-              status: 'active',
-              lastError: undefined,
+              status: suspended ? acc.status : 'active',
+              lastError: suspended ? acc.lastError : undefined,
+              lastCheckInconclusive: undefined,
               lastCheckedAt: Date.now()
             })
           }
@@ -1526,6 +1545,10 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         get().saveToStorage()
         return true
       } else {
+        if (result.preserveStatus) {
+          updateAccountStatus(id, undefined)
+          return false
+        }
         updateAccountStatus(id, 'error', result.error?.message)
         // 触发 webhook：Token 刷新失败
         triggerWebhook('token-expired', {
@@ -1536,9 +1559,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         })
         return false
       }
-    } catch (error) {
+    } catch {
       if (credentialResultDisposition(get().accounts.get(id), expected) !== 'input') return false
-      updateAccountStatus(id, 'error', error instanceof Error ? error.message : 'Unknown error')
+      updateAccountStatus(id, undefined)
       return false
     } finally {
       set(state => ({ accountOperationCounts: accountOperationCountsAfter(state, id, -1) }))
@@ -1614,7 +1637,8 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     try {
       // 通过主进程调用 Kiro API 获取状态（避免 CORS）
       const result = await window.api.checkAccountStatus(account)
-      if (credentialResultDisposition(get().accounts.get(id), expected, result.data?.newCredentials) !== 'input') return
+      const disposition = credentialResultDisposition(get().accounts.get(id), expected, result.data?.newCredentials)
+      if (disposition === 'duplicate' || disposition === 'stale') return
       if (isDeferredAccountOperation(result)) return
 
       if (result.success && result.data) {
@@ -1622,6 +1646,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           const accounts = new Map(state.accounts)
           const acc = accounts.get(id)
           if (acc) {
+            pendingRotationHealth.delete(acc.credentials)
             // 如果 token 被刷新，更新凭证
             const profileArn = receivedProfileArn(result.data!.newCredentials?.profileArn)
             const updatedCredentials = result.data!.newCredentials 
@@ -1629,7 +1654,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
                   ...acc.credentials,
                   accessToken: result.data!.newCredentials.accessToken,
                   refreshToken: result.data!.newCredentials.refreshToken ?? acc.credentials.refreshToken,
-                  expiresAt: result.data!.newCredentials.expiresAt ?? acc.credentials.expiresAt,
+                  expiresAt: disposition === 'published' ? acc.credentials.expiresAt : result.data!.newCredentials.expiresAt ?? acc.credentials.expiresAt,
                   ...(profileArn ? { profileArn } : {})
                 }
               : acc.credentials
@@ -1682,6 +1707,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
               ...(profileArn ? { profileArn } : {}),
               credentials: updatedCredentials,
               lastCheckedAt: Date.now(),
+              lastCheckInconclusive: undefined,
               lastError: undefined
             })
           }
@@ -1709,7 +1735,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
                   ...acc.credentials,
                   accessToken: result.data!.newCredentials!.accessToken,
                   refreshToken: result.data!.newCredentials!.refreshToken ?? acc.credentials.refreshToken,
-                  expiresAt: result.data!.newCredentials!.expiresAt ?? acc.credentials.expiresAt,
+                  expiresAt: disposition === 'published' ? acc.credentials.expiresAt : result.data!.newCredentials!.expiresAt ?? acc.credentials.expiresAt,
                   ...(profileArn ? { profileArn } : {})
                 }
               })
@@ -1720,16 +1746,18 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         }
         // 检查是否是封禁错误
         const isBanned = (result.error as { isBanned?: boolean })?.isBanned
-        if (isBanned) {
+        if (result.preserveStatus) {
+          updateAccountStatus(id, undefined)
+        } else if (isBanned) {
           // 封禁账户：设置错误状态并标记为封禁
           updateAccountStatus(id, 'error', `账户已封禁: ${result.error?.message}`)
         } else {
-          updateAccountStatus(id, 'error', result.error?.message)
+          updateAccountStatus(id, result.data?.status === 'expired' ? 'expired' : 'error', result.error?.message)
         }
       }
-    } catch (error) {
+    } catch {
       if (credentialResultDisposition(get().accounts.get(id), expected) !== 'input') return
-      updateAccountStatus(id, 'error', error instanceof Error ? error.message : 'Unknown error')
+      updateAccountStatus(id, undefined)
     } finally {
       set(state => ({ accountOperationCounts: accountOperationCountsAfter(state, id, -1) }))
     }
@@ -1739,20 +1767,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     const { accounts, autoRefreshConcurrency } = get()
     
     // 收集需要检查的账号（使用批量检查 API，不刷新 Token）
-    const accountsToCheck: Array<{
-      id: string
-      email: string
-      credentials: {
-        accessToken: string
-        refreshToken?: string
-        clientId?: string
-        clientSecret?: string
-        region?: string
-        authMethod?: string
-        provider?: string
-      }
-      idp?: string
-    }> = []
+    const accountsToCheck: Parameters<typeof window.api.backgroundBatchCheck>[0] = []
 
     for (const id of ids) {
       const account = accounts.get(id)
@@ -1761,8 +1776,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       accountsToCheck.push({
         id,
         email: account.email,
+        profileArn: account.profileArn,
+        machineId: account.machineId,
         credentials: {
           accessToken: account.credentials.accessToken,
+          profileArn: account.credentials.profileArn,
           refreshToken: account.credentials.refreshToken,
           clientId: account.credentials.clientId,
           clientSecret: account.credentials.clientSecret,
@@ -2553,18 +2571,19 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const now = Date.now()
 
       for (const data of items) {
-        const { id, success, data: resultData, error } = data
+        const { id, success, data: resultData } = data
         const account = accounts.get(id)
         if (!account) continue
-        const next = success && resultData && typeof resultData === 'object'
+        const next = (success || data.credentialsRefreshed) && resultData && typeof resultData === 'object'
           ? resultData as { accessToken?: string; refreshToken?: string } : undefined
-        if (credentialResultDisposition(account, data, next) !== 'input') continue
+        const disposition = credentialResultDisposition(account, data, next)
+        if (disposition === 'duplicate' || disposition === 'stale') continue
+        pendingRotationHealth.delete(account.credentials)
 
-        if (!success) {
+        if (!success && !data.credentialsRefreshed) {
           accounts.set(id, {
             ...account,
-            status: 'error',
-            lastError: error,
+            ...failedCheckHealth(account, data),
             lastCheckedAt: now
           })
           continue
@@ -2606,8 +2625,13 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       } | undefined
 
       // 检测封禁状态
-      const newStatus = refreshData?.status === 'error' ? 'error' as AccountStatus : 'active' as AccountStatus
-      const newError = refreshData?.errorMessage
+      const tokenOnlyWhileSuspended = !refreshData?.usage && !refreshData?.userInfo && isBannedAccountError(account.lastError)
+      const keepHealth = data.preserveStatus || tokenOnlyWhileSuspended
+      const reportedStatus = refreshData?.status
+      let newStatus: AccountStatus = 'active'
+      if (keepHealth) newStatus = account.status
+      else if (reportedStatus === 'error' || reportedStatus === 'expired') newStatus = reportedStatus
+      const newError = keepHealth ? account.lastError : refreshData?.errorMessage
 
       // 后台刷新时主进程可能返回自动获取的 profileArn，持久化到顶层和 credentials
       const bgProfileArn = receivedProfileArn(refreshData?.profileArn)
@@ -2618,7 +2642,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           ...account.credentials,
           accessToken: refreshData?.accessToken || account.credentials.accessToken,
           refreshToken: refreshData?.refreshToken || account.credentials.refreshToken,
-          expiresAt: refreshData?.expiresIn ? now + refreshData.expiresIn * 1000 : account.credentials.expiresAt,
+          expiresAt: disposition !== 'published' && refreshData?.expiresIn ? now + refreshData.expiresIn * 1000 : account.credentials.expiresAt,
           ...(bgProfileArn ? { profileArn: bgProfileArn } : {})
         },
         usage: refreshData?.usage ? (() => {
@@ -2657,6 +2681,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         userId: refreshData?.userInfo?.userId || account.userId,
         status: newStatus,
         lastError: newError,
+        lastCheckInconclusive: data.preserveStatus || undefined,
         lastCheckedAt: now
       })
       } // end for-loop
@@ -2679,15 +2704,15 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const now = Date.now()
 
       for (const data of items) {
-        const { id, success, data: resultData, error } = data
+        const { id, success, data: resultData } = data
         const account = accounts.get(id)
         if (!account || credentialResultDisposition(account, data) !== 'input') continue
+        pendingRotationHealth.delete(account.credentials)
 
         if (!success) {
           accounts.set(id, {
             ...account,
-            status: 'error',
-            lastError: error,
+            ...failedCheckHealth(account, data),
             lastCheckedAt: now
           })
           continue
@@ -2772,6 +2797,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         userId: checkData?.userInfo?.userId || account.userId,
         status: newStatus,
         lastError: newError,
+        lastCheckInconclusive: data.preserveStatus || undefined,
         lastCheckedAt: now
       })
       } // end for-loop

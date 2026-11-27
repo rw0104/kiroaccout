@@ -1,3 +1,4 @@
+import type { BackgroundAccountResult, AccountCredentialsUpdate } from '../shared/accountCheckResult'
 import type { AccountModelInfo } from '../shared/modelCatalog'
 import type { ClientSwitchApi } from '../shared/clientSwitch'
 import type { ClientModelRepairApi } from '../shared/clientModelRepair'
@@ -67,6 +68,7 @@ interface AccountData {
 
 interface RefreshResult {
   success: boolean
+  preserveStatus?: boolean
   /** Local operation refusal is distinct from an upstream credential failure. */
   code?: string
   data?: {
@@ -113,6 +115,7 @@ interface ResourceDetail {
 
 interface StatusResult {
   success: boolean
+  preserveStatus?: boolean
   /** Local operation refusal is distinct from an upstream credential failure. */
   code?: string
   data?: {
@@ -194,14 +197,17 @@ interface KiroApi {
     }
   }>, concurrency?: number, syncInfo?: boolean) => Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }>
   onBackgroundRefreshProgress: (callback: (data: { completed: number; total: number; success: number; failed: number }) => void) => () => void
-  onBackgroundRefreshResult: (callback: (data: { id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }) => void) => () => void
+  onBackgroundRefreshResult: (callback: (data: BackgroundAccountResult) => void) => () => void
   
   // 后台批量检查账号状态（不刷新 Token）
   backgroundBatchCheck: (accounts: Array<{
     id: string
     email: string
+    profileArn?: string
+    machineId?: string
     credentials: {
       accessToken: string
+      profileArn?: string
       refreshToken?: string
       clientId?: string
       clientSecret?: string
@@ -212,7 +218,7 @@ interface KiroApi {
     idp?: string
   }>, concurrency?: number) => Promise<{ success: boolean; completed: number; successCount: number; failedCount: number }>
   onBackgroundCheckProgress: (callback: (data: { completed: number; total: number; success: number; failed: number }) => void) => () => void
-  onBackgroundCheckResult: (callback: (data: { id: string; success: boolean; expectedRefreshToken?: string; expectedAccessToken?: string; data?: unknown; error?: string }) => void) => () => void
+  onBackgroundCheckResult: (callback: (data: BackgroundAccountResult) => void) => () => void
   
   // 切换账号 - 写入凭证到本地 SSO 缓存
   switchAccount: (credentials: {
@@ -436,7 +442,7 @@ interface KiroApi {
 
   // Every login operation is bound to the caller's session, including cancellation during start.
   kiroInstances: KiroInstancesApi
-  onKiroInstanceAccountUpdate: (callback: (info: { id: string; credentials: Record<string, unknown>; profileArn?: string }) => void) => () => void
+  onKiroInstanceAccountUpdate: (callback: (info: AccountCredentialsUpdate) => void) => () => void
   startPortalLogin: (sessionId: string, privateMode: boolean, expectedProvider?: 'Google' | 'Github' | 'BuilderId' | 'Enterprise') => Promise<LoginResult>
   pollPortalLogin: (sessionId: string) => Promise<LoginResult>
   cancelPortalLogin: (sessionId: string) => Promise<{ success: boolean }>

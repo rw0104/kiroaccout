@@ -131,6 +131,7 @@ export interface Account {
   // 状态
   status: AccountStatus
   lastError?: string
+  lastCheckInconclusive?: boolean
   isActive: boolean // 是否为当前激活账号
 
   // 时间戳

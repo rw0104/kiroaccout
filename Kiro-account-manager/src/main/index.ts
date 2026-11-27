@@ -1,3 +1,4 @@
+import { accountProbeFailure, userInfoFailure, preserveRefreshStatus, type AccountProbeFailure } from './accountProbe'
 import { app, shell, BrowserWindow, ipcMain, dialog, globalShortcut, safeStorage, autoUpdater as nativeAutoUpdater } from 'electron'
 import { autoUpdater } from 'electron-updater'
 import * as machineIdModule from './machineId'
@@ -3139,7 +3140,7 @@ app.whenReady().then(async () => {
       )
 
       if (!refreshResult.success || !refreshResult.accessToken) {
-        return { success: false, error: { message: refreshResult.error || 'Token 刷新失败' } }
+        return { success: false, preserveStatus: preserveRefreshStatus(refreshResult), error: { message: refreshResult.error || 'Token 刷新失败' } }
       }
 
       const newAccess = refreshResult.accessToken
@@ -3209,7 +3210,8 @@ app.whenReady().then(async () => {
     } catch (error) {
       return {
         success: false,
-        error: { message: error instanceof Error ? error.message : 'Unknown error' }
+        preserveStatus: true,
+        error: { message: '本次刷新未能确认账户状态' }
       }
     }
   })
@@ -3507,10 +3509,12 @@ app.whenReady().then(async () => {
         overageEnabled: result.overageConfiguration?.overageStatus === 'ENABLED' || result.overageConfiguration?.overageEnabled === true
       } : undefined
 
+      const failure = userInfoFailure(userInfo?.status)
       return {
-        success: true,
+        success: !failure,
+        error: failure ? { message: failure.message } : undefined,
         data: {
-          status: (!userInfo?.status || userInfo.status === 'Active' || userInfo.status === 'Stale') ? 'active' : 'error',
+          status: failure?.status ?? 'active',
           email: result.userInfo?.email,
           userId: result.userInfo?.userId,
           idp: userInfo?.idp,
@@ -3589,7 +3593,7 @@ app.whenReady().then(async () => {
         const [userInfoResult, usageResult] = await Promise.all([
           getUserInfo(accessToken, idp, accountMachineId, account?.email).catch((err: Error) => {
             // 封禁错误不能吞掉，必须向上抛出
-            if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
+            if (accountProbeFailure(err).status === 'error') {
               throw err
             }
             return undefined
@@ -3598,14 +3602,14 @@ app.whenReady().then(async () => {
         ])
         return parseUsageResponse(usageResult, undefined, userInfoResult)
       } catch (apiError) {
-        const errorMsg = apiError instanceof Error ? apiError.message : ''
+        const probe = accountProbeFailure(apiError)
         
         // 检查是否是明确封禁错误（423 或 AccountSuspendedException）
-        if (errorMsg.includes('AccountSuspendedException') || errorMsg.includes('423')) {
+        if (probe.status === 'error') {
           console.log('[IPC] Account suspended/banned')
           return {
             success: false,
-            error: { message: errorMsg, isBanned: true }
+            error: { message: probe.message, isBanned: true }
           }
         }
         
@@ -3614,10 +3618,7 @@ app.whenReady().then(async () => {
         // consume a refresh token or retry the same malformed request.
         // 社交登录只需要 refreshToken，IdC 登录需要 clientId 和 clientSecret
         const canRefresh = refreshToken && (authMethod === 'social' || (clientId && clientSecret))
-        const tokenError = apiError instanceof ControlPlaneError
-          ? apiError.status === 401 || apiError.reason === 'token'
-          : errorMsg.includes('401')
-        if (tokenError && canRefresh) {
+        if (probe.status === 'expired' && canRefresh) {
           console.log(`[IPC] Token expired, attempting to refresh (authMethod: ${authMethod || 'IdC'})...${boundProxyUrl ? ' [via bound proxy]' : ''}`)
 
           // 尝试刷新 token - 根据 authMethod 选择刷新方式（透传账号代理）
@@ -3644,7 +3645,7 @@ app.whenReady().then(async () => {
               // 用新 token 并行调用 GetUserInfo 和 getUsageAndLimits
               const [userInfoResult, usageResult] = await Promise.all([
                 getUserInfo(refreshResult.accessToken, idp, accountMachineId).catch((err: Error) => {
-                  if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
+                  if (accountProbeFailure(err).status === 'error') {
                     throw err
                   }
                   return undefined
@@ -3658,22 +3659,25 @@ app.whenReady().then(async () => {
               // A successful refresh can rotate the refresh token. Preserve that
               // rotation even when the follow-up status request fails, so the
               // renderer can persist it instead of leaving a now-invalid token.
+              const failure = accountProbeFailure(retryError)
               return {
                 success: false,
-                data: { status: 'error', newCredentials: {
+                preserveStatus: !failure.status,
+                data: { status: failure.status, newCredentials: {
                   accessToken: rotatedCredentials.accessToken,
                   refreshToken: rotatedCredentials.refreshToken,
                   ...(rotatedCredentials.profileArn ? { profileArn: rotatedCredentials.profileArn } : {}),
                   expiresAt: rotatedCredentials.expiresIn ? Date.now() + rotatedCredentials.expiresIn * 1000 : undefined
                 } },
-                error: { message: retryError instanceof Error ? retryError.message : '刷新后的账户查询失败' }
+                error: { message: failure.message }
               }
             }
           } else {
             console.error('[IPC] Token refresh failed:', refreshResult.error)
             return {
               success: false,
-              error: { message: `Token 过期且刷新失败: ${refreshResult.error}` }
+              preserveStatus: preserveRefreshStatus(refreshResult),
+              error: { message: refreshResult.error || '续期失败' }
             }
           }
         }
@@ -3682,10 +3686,13 @@ app.whenReady().then(async () => {
         throw apiError
       }
     } catch (error) {
-      console.error('check-account-status error:', error)
+      const failure = accountProbeFailure(error)
+      console.error('check-account-status error:', failure.message)
       return {
         success: false,
-        error: { message: error instanceof Error ? error.message : 'Unknown error' }
+        preserveStatus: !failure.status,
+        data: { status: failure.status },
+        error: { message: failure.message }
       }
     }
   })
@@ -3768,6 +3775,7 @@ app.whenReady().then(async () => {
               expectedRefreshToken,
               expectedAccessToken,
                   success: false,
+                  preserveStatus: preserveRefreshStatus(refreshResult),
                   error: refreshResult.error
                 })
                 return
@@ -3849,8 +3857,7 @@ app.whenReady().then(async () => {
             } | undefined
             let userInfoData: UserInfoResponse | undefined
             let subscriptionData: { type: string; title: string; rawType?: string; daysRemaining?: number; expiresAt?: number; overageCapability?: string; upgradeCapability?: string; subscriptionManagementTarget?: string } | undefined
-            let status = 'active'
-            let errorMessage: string | undefined
+            let probeFailure: AccountProbeFailure | undefined
 
             if (syncInfo) {
               // 调用 getUsageAndLimits API（根据配置选择 REST 或 CBOR 格式）
@@ -3898,7 +3905,7 @@ app.whenReady().then(async () => {
                   }
                 }
                 console.log(`[BackgroundRefresh] Account ${account.id} machineId: ${account.machineId || 'undefined'}`)
-                const rawUsage = await getUsageAndLimits(newAccessToken, idp, refreshedSocialProfileArn || account.profileArn || account.credentials?.profileArn, account.machineId, region) as UsageResponse
+                const rawUsage = await getUsageAndLimits(newAccessToken, idp, refreshedSocialProfileArn || existingProfileArn || resolvedBgProfileArn, account.machineId, region) as UsageResponse
                 
                 // 解析使用量数据
                 const creditUsage = rawUsage.usageBreakdownList?.find(b => b.resourceType === 'CREDIT')
@@ -3955,27 +3962,20 @@ app.whenReady().then(async () => {
                   subscriptionManagementTarget: rawUsage.subscriptionInfo?.subscriptionManagementTarget
                 }
               } catch (apiError) {
-                const errMsg = apiError instanceof Error ? apiError.message : String(apiError)
-                console.log(`[BackgroundRefresh] Usage API error for ${account.id}:`, errMsg)
-                if (errMsg.includes('AccountSuspendedException') || errMsg.includes('423')) {
-                  status = 'error'
-                  errorMessage = errMsg
-                }
+                probeFailure = accountProbeFailure(apiError)
+                console.log('[BackgroundRefresh] Usage query failed:', probeFailure.message)
               }
-
-              // 调用 GetUserInfo API 获取用户状态
               try {
                 userInfoData = await getUserInfo(newAccessToken, idp, account.machineId)
+                probeFailure = userInfoFailure(userInfoData?.status) ?? probeFailure
               } catch (apiError) {
-                const errMsg = apiError instanceof Error ? apiError.message : String(apiError)
-                if (errMsg.includes('AccountSuspendedException') || errMsg.includes('423')) {
-                  status = 'error'
-                  errorMessage = errMsg
-                }
+                const failure = accountProbeFailure(apiError)
+                if (failure.status === 'error') probeFailure = failure
               }
             }
 
-            success++
+            if (probeFailure) failed++
+            else success++
             completed++
 
             // 通知渲染进程更新账号
@@ -3983,7 +3983,10 @@ app.whenReady().then(async () => {
               id: account.id,
               expectedRefreshToken,
               expectedAccessToken,
-              success: true,
+              success: !probeFailure,
+              credentialsRefreshed: needsTokenRefresh,
+              preserveStatus: !!probeFailure && !probeFailure.status,
+              error: probeFailure?.message,
               data: {
                 accessToken: newAccessToken,
                 refreshToken: newRefreshToken,
@@ -3992,8 +3995,8 @@ app.whenReady().then(async () => {
                 usage: parsedUsage,
                 subscription: subscriptionData,
                 userInfo: syncInfo ? userInfoData : undefined,
-                status,
-                errorMessage
+                status: probeFailure ? probeFailure.status : 'active',
+                errorMessage: probeFailure?.message
               }
             })
           } catch (e) {
@@ -4004,7 +4007,8 @@ app.whenReady().then(async () => {
               expectedRefreshToken,
               expectedAccessToken,
               success: false,
-              error: e instanceof Error ? e.message : 'Unknown error'
+              preserveStatus: true,
+              error: '本次刷新未完成'
             })
           } finally {
             releaseOwnership?.()
@@ -4146,7 +4150,7 @@ app.whenReady().then(async () => {
                 idp?: string
               }>('GetUserInfo', { origin: 'KIRO_IDE' }, accessToken, idp, undefined, account.email).catch((err: Error) => {
                 // 封禁错误不能吞掉，需要在后续逻辑中检测
-                if (err.message.includes('423') || err.message.includes('AccountSuspended')) {
+                if (accountProbeFailure(err).status === 'error') {
                   throw err
                 }
                 return null
@@ -4190,8 +4194,7 @@ app.whenReady().then(async () => {
               userId?: string
               status?: string
             } | null = null
-            let status = 'active'
-            let errorMessage: string | undefined
+            let failure: AccountProbeFailure | undefined
 
             // 处理用量响应
             if (usageRes.status === 'fulfilled') {
@@ -4258,19 +4261,8 @@ app.whenReady().then(async () => {
                 subscriptionManagementTarget: rawUsage.subscriptionInfo?.subscriptionManagementTarget
               }
             } else if (usageRes.status === 'rejected') {
-              // API 调用失败（可能是封禁或 Token 过期）
-              const errorMsg = usageRes.reason?.message || String(usageRes.reason)
-              console.log(`[BackgroundCheck] Usage API failed for ${account.email}:`, errorMsg)
-              if (errorMsg.includes('AccountSuspendedException') || errorMsg.includes('423')) {
-                status = 'error'
-                errorMessage = errorMsg
-              } else if (errorMsg.includes('401')) {
-                status = 'expired'
-                errorMessage = 'Token 已过期，请刷新'
-              } else {
-                status = 'error'
-                errorMessage = errorMsg
-              }
+              failure = accountProbeFailure(usageRes.reason)
+              console.log('[BackgroundCheck] Usage query failed:', failure.message)
             }
 
             // 处理用户信息响应
@@ -4281,21 +4273,14 @@ app.whenReady().then(async () => {
                 userId: rawUserInfo.userId,
                 status: rawUserInfo.status
               }
-              // 检查用户状态（Stale 视为正常，仅 Suspended/Disabled 等视为异常）
-              if (rawUserInfo.status && rawUserInfo.status !== 'Active' && rawUserInfo.status !== 'Stale' && status !== 'error') {
-                status = 'error'
-                errorMessage = `用户状态异常: ${rawUserInfo.status}`
-              }
+              failure = userInfoFailure(rawUserInfo.status) ?? failure
             } else if (userInfoRes.status === 'rejected') {
-              // GetUserInfo 失败（封禁错误会到这里）
-              const errMsg = userInfoRes.reason?.message || String(userInfoRes.reason)
-              if (errMsg.includes('423') || errMsg.includes('AccountSuspended')) {
-                status = 'error'
-                errorMessage = errMsg
-              }
+              const userFailure = accountProbeFailure(userInfoRes.reason)
+              if (userFailure.status === 'error' || !failure) failure = userFailure
             }
 
-            success++
+            if (failure) failed++
+            else success++
             completed++
 
             // 通知渲染进程更新账号
@@ -4303,13 +4288,15 @@ app.whenReady().then(async () => {
               id: account.id,
               expectedRefreshToken,
               expectedAccessToken,
-              success: true,
+              success: !failure,
+              preserveStatus: !!failure && !failure.status,
+              error: failure?.message,
               data: {
                 usage: usageData ? { ...usageData, resourceDetail } : null,
                 subscription: subscriptionData,
                 userInfo: userInfoData,
-                status,
-                errorMessage
+                status: failure ? failure.status : 'active',
+                errorMessage: failure?.message
               }
             })
           } catch (e) {
@@ -4320,7 +4307,8 @@ app.whenReady().then(async () => {
               expectedRefreshToken,
               expectedAccessToken,
               success: false,
-              error: e instanceof Error ? e.message : 'Unknown error'
+              preserveStatus: true,
+              error: '本次检测未完成'
             })
           }
         })

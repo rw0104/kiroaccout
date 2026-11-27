@@ -22,7 +22,8 @@ test('successful Social refresh repairs missing metadata through the real servic
     const result = await serviceFor({ ...rotated, profileArn }).refresh(socialInput)
     assert.equal(result.profileArn, profileArn)
     const applied = applyManagerTokenRotation(input, socialInput.refreshToken, result, now)
-    assert.deepEqual(applied.updates, [{ id: 'selected', profileArn, credentials: {
+    assert.deepEqual(applied.updates, [{ id: 'selected', profileArn,
+      previous: { expectedAccessToken: undefined, expectedRefreshToken: socialInput.refreshToken }, credentials: {
       ...input.accounts.selected.credentials, accessToken: rotated.accessToken,
       refreshToken: rotated.refreshToken, expiresAt: now + 3_600_000, profileArn
     } }])

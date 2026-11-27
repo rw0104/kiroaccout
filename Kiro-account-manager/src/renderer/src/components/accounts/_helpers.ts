@@ -114,7 +114,7 @@ export function getSubscriptionSoftColor(type: string, title?: string, rawType?:
 
 export const StatusLabelsZh: Record<string, string> = {
   active: '正常',
-  expired: '已过期',
+  expired: '令牌需刷新',
   error: '错误',
   refreshing: '刷新中',
   unknown: '未知'
@@ -122,7 +122,7 @@ export const StatusLabelsZh: Record<string, string> = {
 
 export const StatusLabelsEn: Record<string, string> = {
   active: 'Active',
-  expired: 'Expired',
+  expired: 'Token needs refresh',
   error: 'Error',
   refreshing: 'Refreshing',
   unknown: 'Unknown'

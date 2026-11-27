@@ -28,7 +28,8 @@ test('a rotation preserves account metadata, unrelated accounts and input object
   })
   assert.equal(updated.accounts.unrelated, input.accounts.unrelated)
   assert.equal(updated.groups, input.groups)
-  assert.deepEqual(applied.updates, [{ id: 'first', credentials: updated.accounts.first.credentials }])
+  assert.deepEqual(applied.updates, [{ id: 'first', credentials: updated.accounts.first.credentials,
+    previous: { expectedAccessToken: 'SYNTHETIC_OLD_ACCESS', expectedRefreshToken: 'SYNTHETIC_OLD_REFRESH' } }])
   assert.equal(JSON.stringify(input), before)
 })
 
