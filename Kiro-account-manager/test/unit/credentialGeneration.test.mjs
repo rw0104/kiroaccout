@@ -11,7 +11,7 @@ const require = createRequire(import.meta.url)
 const ts = require('typescript')
 const source = readFileSync(new URL('../../src/renderer/src/store/accounts.ts', import.meta.url), 'utf8')
 const tree = ts.createSourceFile('accounts.ts', source, ts.ScriptTarget.Latest, true)
-const names = ['refreshAccountToken', 'checkAccountStatus', 'applyBackgroundRefreshResults', 'applyBackgroundCheckResults', 'updateAccount', 'updateAccountStatus', 'moveAccountsToGroup', 'removeGroup', 'addTagToAccounts', 'removeTagFromAccounts', 'removeTag', 'saveToStorage', 'flushSaveImmediately']
+const names = ['loadFromStorage', 'refreshAccountToken', 'checkAccountStatus', 'applyBackgroundRefreshResults', 'applyBackgroundCheckResults', 'updateAccount', 'updateAccountStatus', 'moveAccountsToGroup', 'removeGroup', 'addTagToAccounts', 'removeTagFromAccounts', 'removeTag', 'saveToStorage', 'flushSaveImmediately']
 const properties = []
 const helpers = []
 function visit(node) {
@@ -31,6 +31,23 @@ function findRotationListener(node) {
 }
 findRotationListener(appTree)
 assert.ok(receiveRotation)
+function uiHandler(relativePath, name) {
+  const uiSource = readFileSync(new URL(relativePath, import.meta.url), 'utf8')
+  const uiTree = ts.createSourceFile(relativePath, uiSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX)
+  let handler
+  const visit = node => {
+    if (ts.isVariableDeclaration(node) && node.name.getText(uiTree) === name) {
+      const value = ts.isCallExpression(node.initializer) ? node.initializer.arguments[0] : node.initializer
+      handler = value.getText(uiTree)
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(uiTree)
+  assert.ok(handler)
+  return handler
+}
+const cardRefreshHandler = uiHandler('../../src/renderer/src/components/accounts/AccountCard.tsx', 'handleRefreshToken')
+const rowRefreshHandler = uiHandler('../../src/renderer/src/components/accounts/AccountListRow.tsx', 'handleRefresh')
 assert.equal(properties.length, names.length)
 const factory = ts.transpileModule(`
 let saveDebounceTimer = null, saveMaxWaitTimer = null, saveInFlight = null, lastSaveError = null;
@@ -47,21 +64,30 @@ function deferred() { let resolve, reject; const promise = new Promise((yes, no)
 function fixture(api = {}) {
   const state = { accounts: new Map([['synthetic', account()]]), accountOperationCounts: new Map(), groups: new Map(), tags: new Map(), proxyPool: new Map() }
   let saves = 0
+  let feedback = null, spinning = false
   const hooks = [], writes = [], timers = new Map()
   let timerId = 0
   let actions
-  const get = () => ({ ...state, ...actions, saveToStorage() { saves++; return actions.saveToStorage() } })
+  const get = () => ({ ...state, ...actions, applyTheme() {}, startAutoSave() {}, saveToStorage() { saves++; return actions.saveToStorage() } })
   const set = value => Object.assign(state, typeof value === 'function' ? value(state) : value)
-  const context = vm.createContext({ pendingRotationHealth: new WeakMap(), get, set, window: { api: { saveAccounts: async data => { writes.push(JSON.parse(JSON.stringify(data))) }, ...api } }, console: { log() {}, warn() {}, error() {} }, Date,
+  const context = vm.createContext({ pendingRotationHealth: new WeakMap(), get, set, window: { api: { saveAccounts: async data => { writes.push(JSON.parse(JSON.stringify(data))) }, getAppVersion: async () => 'synthetic', ...api } }, console: { log() {}, warn() {}, error() {} }, Date,
     mergeAccountSubscription, normalizeAccountSubscription, normalizeSubscriptionType,
+    DEFAULT_PROXY_POOL_CONFIG: {}, generateRandomMachineId: () => 'f'.repeat(64), queueMicrotask() {},
     setTimeout: callback => { const id = ++timerId; timers.set(id, callback); return id }, clearTimeout: id => timers.delete(id),
     triggerWebhook: (...args) => hooks.push(args) })
   vm.runInContext(factory, context)
   actions = vm.runInContext('actions', context)
   context.useAccountsStore = { getState: get }
   context.updateAccount = actions.updateAccount
+  Object.assign(context, { account: account(), isEn: true, isRefreshing: false, isAccountOperationPending: false,
+    refreshAccountToken: actions.refreshAccountToken, checkAccountStatus: actions.checkAccountStatus,
+    setIsRefreshingToken: value => { spinning = value }, setIsRefreshing: value => { spinning = value },
+    setTokenRefreshFeedback: value => { feedback = value } })
+  const compileUi = handler => vm.runInContext(ts.transpileModule('(' + handler + ')', { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context)
+  const cardRefresh = compileUi(cardRefreshHandler)
+  const rowRefresh = () => compileUi(rowRefreshHandler)({ stopPropagation() {} })
   const notify = vm.runInContext(ts.transpileModule('(' + receiveRotation + ')', { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText, context)
-  return { state, actions, hooks, writes, notify, get saves() { return saves }, replace: value => state.accounts.set('synthetic', value), current: () => state.accounts.get('synthetic') }
+  return { state, actions, hooks, writes, notify, cardRefresh, rowRefresh, get feedback() { return feedback }, get spinning() { return spinning }, get saves() { return saves }, replace: value => state.accounts.set('synthetic', value), current: () => state.accounts.get('synthetic') }
 }
 const success = (accessToken = 'SYNTHETIC_ACCESS_1', refreshToken = 'SYNTHETIC_REFRESH_1') => ({ success: true, data: { accessToken, refreshToken, expiresIn: 3600 } })
 const expected = { expectedRefreshToken: 'SYNTHETIC_REFRESH_0', expectedAccessToken: 'SYNTHETIC_ACCESS_0' }
@@ -542,5 +568,154 @@ test('all newer health entry points consume a pending rotation before its older 
     assert.equal(newer.status, 'expired', kind)
     ctx.actions.applyBackgroundRefreshResults([{ id: 'synthetic', ...expected, ...success() }])
     assert.equal(ctx.current(), newer, kind)
+  }
+})
+
+
+test('card key reports the current failed renewal instead of only stopping its spinner', async () => {
+  const rejection = 'HTTP 403: synthetic current refresh refusal'
+  const ctx = fixture({ refreshAccountToken: async () => ({ success: false, preserveStatus: true, error: { message: rejection } }) })
+  ctx.replace({ ...account(), status: 'error', lastError: 'Historical token expiry' })
+  await ctx.cardRefresh()
+  assert.equal(ctx.spinning, false)
+  assert.equal(ctx.feedback?.success, false)
+  assert.equal(ctx.feedback?.message, rejection)
+  assert.equal(ctx.current().lastError, 'Historical token expiry')
+  assert.equal(ctx.current().lastCheckInconclusive, true)
+})
+
+test('list refresh stops after a failed renewal instead of issuing a second status-triggered renewal', async () => {
+  let checks = 0
+  const ctx = fixture({
+    refreshAccountToken: async () => ({ success: false, preserveStatus: true, error: { message: 'HTTP 403: synthetic refusal' } }),
+    checkAccountStatus: async () => { checks++; return { success: false, preserveStatus: true } }
+  })
+  await ctx.rowRefresh()
+  assert.equal(checks, 0)
+  assert.equal(ctx.feedback?.success, false)
+})
+
+test('an inconclusive concurrent check does not discard the card renewal success after credentials were published', async () => {
+  for (const check of ['manual', 'background']) {
+    const wait = deferred()
+    const ctx = fixture({ refreshAccountToken: () => wait.promise, checkAccountStatus: async () => ({ success: false, preserveStatus: true, error: { message: 'Synthetic timeout' } }) })
+    ctx.replace({ ...account(), status: 'error', lastError: 'Historical token expiry' })
+    const pending = ctx.cardRefresh()
+    const { updates } = applyManagerTokenRotation({ accounts: { synthetic: ctx.current() } }, expected.expectedRefreshToken, { success: true, ...success().data })
+    ctx.notify(updates[0])
+    if (check === 'manual') await ctx.actions.checkAccountStatus('synthetic')
+    else ctx.actions.applyBackgroundCheckResults([{
+      id: 'synthetic', expectedAccessToken: ctx.current().credentials.accessToken, expectedRefreshToken: ctx.current().credentials.refreshToken,
+      success: false, preserveStatus: true, error: 'Synthetic timeout'
+    }])
+    wait.resolve(success())
+    await pending
+    assert.equal(ctx.current().lastError, undefined, check)
+    assert.equal(ctx.current().status, 'active', check)
+    assert.equal(ctx.current().credentials.expiresAt, updates[0].credentials.expiresAt)
+    assert.equal(ctx.feedback?.success, true)
+  }
+})
+
+
+test('a storage reload of the same published generation retains the card renewal completion', async () => {
+  const wait = deferred()
+  let stored
+  const ctx = fixture({ refreshAccountToken: () => wait.promise, loadAccounts: async () => stored })
+  ctx.replace({ ...account(), status: 'error', lastError: 'Historical token expiry' })
+  const pending = ctx.cardRefresh()
+  const { updates } = applyManagerTokenRotation({ accounts: { synthetic: ctx.current() } }, expected.expectedRefreshToken, { success: true, ...success().data })
+  ctx.notify(updates[0])
+  stored = JSON.parse(JSON.stringify({ accounts: { synthetic: ctx.current() } }))
+  await ctx.actions.loadFromStorage()
+  wait.resolve(success())
+  await pending
+  assert.equal(ctx.current().lastError, undefined)
+  assert.equal(ctx.current().credentials.expiresAt, updates[0].credentials.expiresAt)
+})
+
+
+test('card feedback describes token renewal without clearing a separately confirmed suspension', async () => {
+  const ctx = fixture({ refreshAccountToken: async () => success() })
+  ctx.replace({ ...account(), status: 'error', lastError: 'HTTP 423: AccountSuspendedException' })
+  await ctx.cardRefresh()
+  assert.equal(ctx.feedback?.success, true)
+  assert.equal(ctx.feedback?.message, 'Access token renewed.')
+  assert.equal(ctx.current().status, 'error')
+  assert.equal(ctx.current().lastError, 'HTTP 423: AccountSuspendedException')
+})
+
+test('card feedback stays attached to its own request when automatic renewal finishes concurrently', async () => {
+  const manual = deferred(), automatic = deferred()
+  let calls = 0
+  const ctx = fixture({ refreshAccountToken: () => ++calls === 1 ? manual.promise : automatic.promise })
+  const clicked = ctx.cardRefresh()
+  const background = ctx.actions.refreshAccountToken('synthetic')
+  manual.resolve({ success: false, preserveStatus: true, error: { message: 'HTTP 403: manual refusal' } })
+  automatic.resolve({ success: false, preserveStatus: true, error: { message: 'HTTP 429: automatic rate limit' } })
+  await Promise.all([clicked, background])
+  assert.equal(ctx.feedback?.success, false)
+  assert.equal(ctx.feedback?.message, 'HTTP 403: manual refusal')
+})
+
+test('a storage reload carrying newer health does not inherit pending rotation completion', async () => {
+  const wait = deferred()
+  let stored
+  const ctx = fixture({ refreshAccountToken: () => wait.promise, loadAccounts: async () => stored })
+  const pending = ctx.cardRefresh()
+  const { updates } = applyManagerTokenRotation({ accounts: { synthetic: ctx.current() } }, expected.expectedRefreshToken, { success: true, ...success().data })
+  ctx.notify(updates[0])
+  stored = JSON.parse(JSON.stringify({ accounts: { synthetic: { ...ctx.current(), status: 'error', lastError: 'HTTP 423: AccountSuspendedException', lastCheckedAt: Date.now() } } }))
+  await ctx.actions.loadFromStorage()
+  const loaded = ctx.current()
+  wait.resolve(success())
+  await pending
+  assert.equal(ctx.current(), loaded)
+  assert.equal(ctx.current().lastError, 'HTTP 423: AccountSuspendedException')
+})
+
+
+test('an older same-generation reload after an inconclusive check retains pending card renewal', async () => {
+  const wait = deferred()
+  let stored
+  const ctx = fixture({ refreshAccountToken: () => wait.promise, loadAccounts: async () => stored,
+    checkAccountStatus: async () => ({ success: false, preserveStatus: true, error: { message: 'Synthetic timeout' } }) })
+  ctx.replace({ ...account(), status: 'error', lastError: 'Historical token expiry', lastCheckedAt: 1000 })
+  const pending = ctx.cardRefresh()
+  const { updates } = applyManagerTokenRotation({ accounts: { synthetic: ctx.current() } }, expected.expectedRefreshToken, { success: true, ...success().data })
+  ctx.notify(updates[0])
+  stored = JSON.parse(JSON.stringify({ accounts: { synthetic: ctx.current() } }))
+  await ctx.actions.checkAccountStatus('synthetic')
+  assert.equal(ctx.current().lastCheckInconclusive, true)
+  assert.ok(ctx.current().lastCheckedAt > stored.accounts.synthetic.lastCheckedAt)
+  await ctx.actions.loadFromStorage()
+  wait.resolve(success())
+  await pending
+  assert.equal(ctx.current().lastError, undefined)
+  assert.equal(ctx.current().status, 'active')
+  assert.equal(ctx.current().credentials.expiresAt, updates[0].credentials.expiresAt)
+})
+
+
+test('reloads with newer confirmed health or different credentials still supersede inconclusive checks', async () => {
+  for (const change of ['newer-health', 'different-credentials']) {
+    const wait = deferred()
+    let stored
+    const ctx = fixture({ refreshAccountToken: () => wait.promise, loadAccounts: async () => stored,
+      checkAccountStatus: async () => ({ success: false, preserveStatus: true, error: { message: 'Synthetic timeout' } }) })
+    ctx.replace({ ...account(), status: 'error', lastError: 'Historical token expiry', lastCheckedAt: 1000 })
+    const pending = ctx.cardRefresh()
+    const { updates } = applyManagerTokenRotation({ accounts: { synthetic: ctx.current() } }, expected.expectedRefreshToken, { success: true, ...success().data })
+    ctx.notify(updates[0])
+    stored = JSON.parse(JSON.stringify({ accounts: { synthetic: ctx.current() } }))
+    await ctx.actions.checkAccountStatus('synthetic')
+    if (change === 'newer-health') stored.accounts.synthetic.lastCheckedAt = ctx.current().lastCheckedAt + 1
+    else stored.accounts.synthetic.credentials.accessToken = 'SYNTHETIC_ACCESS_NEWER'
+    await ctx.actions.loadFromStorage()
+    const newer = ctx.current()
+    wait.resolve(success())
+    await pending
+    assert.equal(ctx.current(), newer, change)
+    assert.equal(ctx.current().lastError, 'Historical token expiry', change)
   }
 })

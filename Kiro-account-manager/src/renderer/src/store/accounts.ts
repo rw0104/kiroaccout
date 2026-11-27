@@ -533,7 +533,7 @@ interface AccountsActions {
 
   // 状态管理
   updateAccountStatus: (id: string, status: AccountStatus | undefined, error?: string) => void
-  refreshAccountToken: (id: string) => Promise<boolean>
+  refreshAccountToken: (id: string, reportResult?: (result: { success: boolean; error?: string }) => void) => Promise<boolean>
   batchRefreshTokens: (ids: string[]) => Promise<BatchOperationResult>
   checkAccountStatus: (id: string) => Promise<void>
   batchCheckStatus: (ids: string[]) => Promise<BatchOperationResult>
@@ -1463,7 +1463,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       const accounts = new Map(state.accounts)
       const account = accounts.get(id)
       if (account) {
-        pendingRotationHealth.delete(account.credentials)
+        if (status !== undefined) pendingRotationHealth.delete(account.credentials)
         accounts.set(id, {
           ...account,
           status: status ?? account.status,
@@ -1487,12 +1487,18 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
     }
   },
 
-  refreshAccountToken: async (id) => {
+  refreshAccountToken: async (id, reportResult) => {
     const { accounts, updateAccountStatus } = get()
     const account = accounts.get(id)
 
     if (!account) return false
     const expected = credentialVersion(account)
+    const finish = (success: boolean, error?: string): boolean => {
+      // Report this invocation's outcome separately from the last confirmed health.
+      // A callback also keeps concurrent automatic results out of manual feedback.
+      reportResult?.({ success, error })
+      return success
+    }
 
     set(state => ({ accountOperationCounts: accountOperationCountsAfter(state, id, 1) }))
 
@@ -1500,8 +1506,9 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
       // 通过主进程调用 Kiro API 刷新 Token（避免 CORS）
       const result = await window.api.refreshAccountToken(account)
       const disposition = credentialResultDisposition(get().accounts.get(id), expected, result.success ? result.data : undefined)
-      if (disposition === 'duplicate' || disposition === 'stale') return disposition === 'duplicate'
-      if (isDeferredAccountOperation(result)) return false
+      if (disposition === 'duplicate') return finish(true)
+      if (disposition === 'stale') return finish(false)
+      if (isDeferredAccountOperation(result)) return finish(false, result.error?.message)
 
       if (result.success && result.data) {
         // 当 refresh 后 main 进程检测到该账号是 IDE 当前激活账号，会自动同步到磁盘 token 文件；
@@ -1543,11 +1550,11 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           return { accounts }
         })
         get().saveToStorage()
-        return true
+        return finish(true)
       } else {
         if (result.preserveStatus) {
           updateAccountStatus(id, undefined)
-          return false
+          return finish(false, result.error?.message)
         }
         updateAccountStatus(id, 'error', result.error?.message)
         // 触发 webhook：Token 刷新失败
@@ -1557,12 +1564,12 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           level: 'warn',
           fields: { 邮箱: account.email, 错误: result.error?.message || '-' }
         })
-        return false
+        return finish(false, result.error?.message)
       }
     } catch {
-      if (credentialResultDisposition(get().accounts.get(id), expected) !== 'input') return false
+      if (credentialResultDisposition(get().accounts.get(id), expected) !== 'input') return finish(false)
       updateAccountStatus(id, undefined)
-      return false
+      return finish(false)
     } finally {
       set(state => ({ accountOperationCounts: accountOperationCountsAfter(state, id, -1) }))
     }
@@ -1883,6 +1890,20 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         // 为没有 machineId 的现有账户生成一个
         let needsSave = false
         for (const [id, account] of accounts) {
+          const current = get().accounts.get(id)
+          const pending = current && pendingRotationHealth.get(current.credentials)
+          // IDE notifications reload storage while manual IPC can still be pending.
+          // A serialized copy of unchanged credentials/health is not a newer result.
+          const sameCheck = current?.lastCheckedAt === account.lastCheckedAt &&
+            current?.lastCheckInconclusive === account.lastCheckInconclusive
+          const olderThanInconclusiveCheck = current?.lastCheckInconclusive === true &&
+            (account.lastCheckedAt ?? 0) < (current.lastCheckedAt ?? 0)
+          if (pending && current.credentials.accessToken === account.credentials.accessToken &&
+              current.credentials.refreshToken === account.credentials.refreshToken &&
+              current.status === account.status && current.lastError === account.lastError &&
+              (sameCheck || olderThanInconclusiveCheck)) {
+            pendingRotationHealth.set(account.credentials, pending)
+          }
           const subscription = normalizeAccountSubscription(account.subscription ?? {})
           if (subscription.type !== account.subscription?.type) {
             account.subscription = subscription
@@ -2578,7 +2599,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
           ? resultData as { accessToken?: string; refreshToken?: string } : undefined
         const disposition = credentialResultDisposition(account, data, next)
         if (disposition === 'duplicate' || disposition === 'stale') continue
-        pendingRotationHealth.delete(account.credentials)
+        if (!data.preserveStatus) pendingRotationHealth.delete(account.credentials)
 
         if (!success && !data.credentialsRefreshed) {
           accounts.set(id, {
@@ -2707,7 +2728,7 @@ export const useAccountsStore = create<AccountsStore>()((set, get) => ({
         const { id, success, data: resultData } = data
         const account = accounts.get(id)
         if (!account || credentialResultDisposition(account, data) !== 'input') continue
-        pendingRotationHealth.delete(account.credentials)
+        if (!data.preserveStatus) pendingRotationHealth.delete(account.credentials)
 
         if (!success) {
           accounts.set(id, {

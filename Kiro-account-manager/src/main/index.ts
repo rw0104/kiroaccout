@@ -73,7 +73,7 @@ import type { ModelPreferencesWrite } from '../shared/modelPreferences'
 import { normalizeProvider, resolveIdentity } from '../shared/authIdentity'
 import { AppUpdateController, UpdatePreparationError, type UpdatePreparationErrorCode, type AppUpdateState, type UpdateEngine } from './appUpdater'
 import { randomUUID } from 'node:crypto'
-import { TokenRefreshService, type AuthRefreshResult } from './authRefresh'
+import { TokenRefreshService, refreshFailureDiagnostic, type AuthRefreshResult } from './authRefresh'
 import { LoginSessionManager } from './loginSessions'
 import { getKiroSocialUserAgent, KIRO_LEGACY_IDENTITY } from '../shared/kiroClientCompatibility'
 import { SecureStoreError } from './secureStore'
@@ -3140,6 +3140,7 @@ app.whenReady().then(async () => {
       )
 
       if (!refreshResult.success || !refreshResult.accessToken) {
+        console.warn('[AccountRefresh] Failed:', JSON.stringify(refreshFailureDiagnostic(refreshResult)))
         return { success: false, preserveStatus: preserveRefreshStatus(refreshResult), error: { message: refreshResult.error || 'Token 刷新失败' } }
       }
 
@@ -3706,6 +3707,17 @@ app.whenReady().then(async () => {
     let completed = 0
     let success = 0
     let failed = 0
+    const failureCounts = new Map<string, number>()
+    const recordFailure = (stage: 'refresh' | 'input' | 'probe' | 'operation', authMethod?: string, result?: AuthRefreshResult): void => {
+      let key = JSON.stringify({
+        stage,
+        authMethod: authMethod === 'social' ? 'social' : authMethod === 'IdC' || authMethod === 'idc' ? 'IdC' : 'unknown',
+        ...(result ? refreshFailureDiagnostic(result) : {})
+      })
+      // Keep a large batch bounded even if upstream statuses vary unexpectedly.
+      if (!failureCounts.has(key) && failureCounts.size >= 32) key = '{"stage":"other"}'
+      failureCounts.set(key, (failureCounts.get(key) || 0) + 1)
+    }
 
     // 串行处理每批，避免并发过高
     for (let i = 0; i < accounts.length; i += concurrency) {
@@ -3751,6 +3763,7 @@ app.whenReady().then(async () => {
               if (!refreshToken) {
                 failed++
                 completed++
+                recordFailure('input', authMethod)
                 return
               }
 
@@ -3769,6 +3782,7 @@ app.whenReady().then(async () => {
               if (!refreshResult.success) {
                 failed++
                 completed++
+                recordFailure('refresh', authMethod, refreshResult)
                 // 通知渲染进程刷新失败
                 mainWindow?.webContents.send('background-refresh-result', {
                   id: account.id,
@@ -3830,6 +3844,7 @@ app.whenReady().then(async () => {
             if (!newAccessToken) {
               failed++
               completed++
+              recordFailure('input', authMethod)
               return
             }
 
@@ -3974,8 +3989,10 @@ app.whenReady().then(async () => {
               }
             }
 
-            if (probeFailure) failed++
-            else success++
+            if (probeFailure) {
+              failed++
+              recordFailure('probe', authMethod)
+            } else success++
             completed++
 
             // 通知渲染进程更新账号
@@ -4002,6 +4019,7 @@ app.whenReady().then(async () => {
           } catch (e) {
             failed++
             completed++
+            recordFailure('operation', account.credentials.authMethod)
             mainWindow?.webContents.send('background-refresh-result', {
               id: account.id,
               expectedRefreshToken,
@@ -4031,6 +4049,11 @@ app.whenReady().then(async () => {
       }
     }
 
+    if (failureCounts.size) {
+      console.warn('[BackgroundRefresh] Failure summary:', JSON.stringify(
+        [...failureCounts].map(([diagnostic, count]) => ({ ...JSON.parse(diagnostic), count }))
+      ))
+    }
     console.log(`[BackgroundRefresh] Completed: ${success} success, ${failed} failed`)
     return { success: true, completed, successCount: success, failedCount: failed }
   }

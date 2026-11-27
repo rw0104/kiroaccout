@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
 import { fetch as undiciFetch } from 'undici'
-import { TokenRefreshService } from '../../src/main/authRefresh'
+import { TokenRefreshService, refreshFailureDiagnostic, type AuthRefreshResult } from '../../src/main/authRefresh'
 
 const credential = { kind: 'IdC' as const, refreshToken: 'SYNTHETIC_REFRESH', clientId: 'SYNTHETIC_CLIENT', clientSecret: 'SYNTHETIC_SECRET', region: 'us-east-1' }
 const good = { accessToken: 'SYNTHETIC_ACCESS', refreshToken: 'SYNTHETIC_ROTATED', expiresIn: 3600 }
@@ -398,5 +398,64 @@ test('other inconclusive HTTP refusals preserve health without changing the expl
   for (const [status, body] of [[401, {}], [400, { error: 'invalid_grant' }], [403, { error: 'invalid_client' }]] as const) {
     const service = new TokenRefreshService(dependencies(async () => response(body, status)))
     assert.equal(!!(await service.refresh(credential)).preserveStatus, false)
+  }
+})
+
+test('refresh failures retain only allowlisted service diagnostics and the actual HTTP status', async () => {
+  for (const [status, body, expectedCode] of [
+    [400, { error: 'invalid_grant', message: 'SYNTHETIC_PRIVATE' }, 'invalid_grant'],
+    [403, { error: 'access_denied', message: 'SYNTHETIC_PRIVATE' }, 'access_denied'],
+    [429, { error: 'slow_down' }, 'slow_down'],
+    [504, { error: 'temporarily_unavailable' }, 'temporarily_unavailable'],
+    [403, { error: 'SYNTHETIC_PRIVATE', message: 'SYNTHETIC_PRIVATE' }, undefined],
+    [403, { error: { code: 'SYNTHETIC_PRIVATE' } }, undefined]
+  ] as const) {
+    let calls = 0
+    const service = new TokenRefreshService(dependencies(async () => { calls++; return response(body, status) }))
+    const result = await service.refresh({ kind: 'social', refreshToken: 'SYNTHETIC_REFRESH' })
+    assert.equal(result.httpStatus, status)
+    assert.equal(result.serviceCode, expectedCode)
+    assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC_PRIVATE|SYNTHETIC_REFRESH/)
+    assert.equal(calls, 1)
+  }
+})
+
+test('safe refresh diagnostics reject malformed metadata and describe effective status preservation', () => {
+  for (const httpStatus of [NaN, Infinity, -1, 600, 403.5, 'SYNTHETIC_PRIVATE']) {
+    const diagnostic = refreshFailureDiagnostic({
+      success: false, httpStatus, errorCode: 'SYNTHETIC_PRIVATE', failureKind: 'SYNTHETIC_PRIVATE',
+      serviceCode: 'SYNTHETIC_PRIVATE', error: 'SYNTHETIC_PRIVATE', accessToken: 'SYNTHETIC_PRIVATE'
+    } as unknown as AuthRefreshResult)
+    assert.equal(diagnostic.httpStatus, undefined)
+    assert.equal(diagnostic.errorCode, 'unknown')
+    assert.equal(diagnostic.failureKind, 'unknown')
+    assert.doesNotMatch(JSON.stringify(diagnostic), /SYNTHETIC_PRIVATE|accessToken|error"/)
+  }
+  assert.equal(refreshFailureDiagnostic({ success: false, errorCode: 'timeout', failureKind: 'uncertain' }).preserveStatus, true)
+  assert.equal(refreshFailureDiagnostic({ success: false, errorCode: 'http', failureKind: 'reauth-required' }).preserveStatus, false)
+})
+
+test('HTTP refusal diagnostics distinguish JSON from HTML without returning response content', async () => {
+  for (const [contentType, parses, expected] of [
+    ['application/json', true, 'json'],
+    ['text/html; charset=utf-8', false, 'html'],
+    ['TEXT/HTML', false, 'html'],
+    ['application/json', false, 'unknown'],
+    ['text/plain; SYNTHETIC_PRIVATE', false, 'unknown'],
+    [null, false, 'unknown']
+  ] as const) {
+    const service = new TokenRefreshService({
+      ...dependencies(async () => response({})),
+      fetch: async () => ({
+        ok: false, status: 403, headers: { get: () => contentType },
+        json: async () => { if (!parses) throw new Error('<html>SYNTHETIC_PRIVATE</html>'); return { error: 'access_denied', message: 'SYNTHETIC_PRIVATE' } }
+      })
+    })
+    const result = await service.refresh({ kind: 'social', refreshToken: 'SYNTHETIC_REFRESH' })
+    assert.equal(result.httpStatus, 403)
+    assert.equal(result.responseFormat, expected)
+    assert.equal(refreshFailureDiagnostic(result).responseFormat, expected)
+    assert.equal(result.preserveStatus, true)
+    assert.doesNotMatch(JSON.stringify(result), /SYNTHETIC|<html>|text\/html|charset/)
   }
 })

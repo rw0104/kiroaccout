@@ -242,10 +242,16 @@ export const AccountCard = memo(function AccountCard({
   }
 
   const [isRefreshingToken, setIsRefreshingToken] = useState(false)
+  const [tokenRefreshFeedback, setTokenRefreshFeedback] = useState<{ success: boolean; message: string } | null>(null)
   const handleRefreshToken = async (): Promise<void> => {
     setIsRefreshingToken(true)
+    setTokenRefreshFeedback(null)
     try {
-      await refreshAccountToken(account.id)
+      let error: string | undefined
+      const success = await refreshAccountToken(account.id, result => { error = result.error })
+      setTokenRefreshFeedback({ success, message: success
+        ? (isEn ? 'Access token renewed.' : '访问令牌已续期。')
+        : error || (isEn ? 'Token was not renewed. Please retry or sign in again.' : '本次令牌未续期，请重试或重新登录。') })
     } finally {
       setIsRefreshingToken(false)
     }
@@ -808,6 +814,12 @@ export const AccountCard = memo(function AccountCard({
                </Button>
             </div>
         </div>
+
+        {tokenRefreshFeedback && (
+          <div role="status" className={cn('text-xs mt-1.5', tokenRefreshFeedback.success ? 'text-success' : 'text-destructive')}>
+            {isEn ? 'Latest renewal: ' : '本次续期：'}{tokenRefreshFeedback.message}
+          </div>
+        )}
 
         {/* Error Message (Non-banned) */}
         {account.lastError && !isUnauthorized && (
